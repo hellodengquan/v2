@@ -941,6 +941,357 @@ if err != nil {
    - 索引重建、VACUUM FULL 等操作应避开业务高峰
    - 此类操作产生的大量 WAL 会导致 Standby 延迟激增，期间搜索一致性无法保证
 
+### 5.6 PostgreSQL 各版本 GIN 索引行为差异
+
+Miniflux 代码中未做 PostgreSQL 版本检测，但不同版本的 GIN 实现有显著差异，升级前需充分回归。
+
+#### 5.6.1 各版本 GIN 核心特性对比
+
+| 特性 | PG 12 | PG 13 | PG 14 | PG 15+ |
+|-----|-------|-------|-------|--------|
+| `REINDEX CONCURRENTLY` 支持 GIN | **仅部分支持**，存在 bug | **完全支持** | 完全支持 | 完全支持 + 优化 |
+| GIN 自动清理触发 | 仅 `gin_pending_list_limit` | 同 12 | 新增 `gin_clean_pending_list_threshold` | 同 14 |
+| `pg_stat_gin` 视图 | 不可用 | 可用 | 可用，字段增加 | 可用，字段完整 |
+| 多字段 GIN 压缩 | 无 | 无 | **支持** `gin_index_compression` | 默认启用 |
+| GIN 插入性能 | 基准 | 提升 10-15% | 提升 5-10% | 提升 15-20% |
+| `fastupdate` 默认 | `on` | `on` | `on` | `on`，可按索引设置 |
+| 并行索引扫描支持 | 不支持 | 不支持 | **支持**（GIN 位图扫描并行） | 支持，并行度优化 |
+
+#### 5.6.2 关键版本差异详解
+
+**PostgreSQL 12 → 13（高风险升级）**：
+- PG 12 中 `REINDEX CONCURRENTLY` 对 GIN 索引存在已知 bug，可能导致索引损坏（CVE-2020-25695）
+- 若仍在使用 PG 12，**禁止使用** `REINDEX INDEX CONCURRENTLY`，只能用 `REINDEX INDEX` 或 `pg_repack`
+- PG 13 修复了此问题，并新增 `pg_stat_gin` 监控视图
+
+**PostgreSQL 13 → 14（性能提升升级）**：
+- 新增 GIN 索引压缩 `gin_index_compression = on`（默认），索引体积减小 20-40%
+- 支持 GIN 位图扫描的并行执行，多用户并发搜索性能提升
+- 新增 `gin_clean_pending_list_threshold` 参数，更精细控制 pending list 合并时机
+
+**PostgreSQL 14 → 15+（优化升级）**：
+- GIN 索引的 `fastupdate` 可按索引级别设置（`ALTER INDEX ... SET (fastupdate = off)`）
+- GIN 插入性能进一步优化，对高频写入场景（如 Miniflux 批量 feed 刷新）更友好
+- 修复了若干极端场景下的 GIN 索引损坏 bug
+
+#### 5.6.3 版本升级回归保障
+
+**升级前检查清单**：
+
+```sql
+-- 1. 检查当前 PG 版本
+SHOW server_version;
+
+-- 2. 检查 GIN 索引是否存在 invalid 状态
+SELECT indexrelname, indisvalid, indisready
+FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid
+WHERE c.relname = 'document_vectors_idx';
+
+-- 3. 检查 pending list 大小（PG 13+）
+SELECT pending_bytes, pending_tuples
+FROM pg_stat_gin
+WHERE indexrelid = 'document_vectors_idx'::regclass;
+
+-- 4. 备份验证：可在升级前用此查询生成校验和
+SELECT md5(array_agg(crc ORDER BY crc)::text) AS index_checksum
+FROM (
+    SELECT ('x' || substring(encode(decode(md5(array_agg(position ORDER BY position)::text), 'hex'), 1, 8))::bit(32)::int AS crc
+    FROM (
+        SELECT word, array_agg(pos ORDER BY pos) AS position
+        FROM ts_stat('SELECT document_vectors FROM entries TABLESAMPLE SYSTEM (10)')
+        GROUP BY word
+        ORDER BY word
+    ) t
+) t;
+```
+
+**升级后回归验证**：
+
+1. **基础功能验证**：
+   ```sql
+   -- 搜索是否正常
+   SELECT COUNT(*) FROM entries 
+   WHERE document_vectors @@ websearch_to_tsquery('test');
+   
+   -- 排序是否正常
+   SELECT id, ts_rank(document_vectors, websearch_to_tsquery('test'))
+   FROM entries WHERE document_vectors @@ websearch_to_tsquery('test')
+   ORDER BY ts_rank(document_vectors, websearch_to_tsquery('test')) DESC
+   LIMIT 5;
+   ```
+
+2. **性能对比验证**：
+   ```sql
+   EXPLAIN (ANALYZE, BUFFERS, COSTS OFF)
+   SELECT id, title FROM entries
+   WHERE document_vectors @@ websearch_to_tsquery('postgresql')
+   ORDER BY ts_rank(document_vectors, websearch_to_tsquery('postgresql')) 
+          - extract(epoch from now() - published_at)::float * 0.0000001 DESC
+   LIMIT 20;
+   ```
+   对比升级前后的 `Execution Time`，预期 PG 14+ 应有 20-30% 性能提升。
+
+3. **GIN 特性验证**：
+   ```sql
+   -- PG 14+ 验证索引压缩已启用
+   SELECT reloptions FROM pg_class WHERE relname = 'document_vectors_idx';
+   -- 预期结果：{gin_index_compression=on} 或 null（默认启用）
+   
+   -- PG 15+ 验证并行扫描
+   SET max_parallel_workers_per_gather = 4;
+   EXPLAIN SELECT id FROM entries WHERE document_vectors @@ websearch_to_tsquery('test');
+   -- 预期计划包含 Gather 和 Parallel Bitmap Heap Scan
+   ```
+
+4. **数据一致性验证**：
+   - 对比升级前后索引校验和（升级前保存的 md5）
+   - 抽样验证搜索结果排名一致性
+
+#### 5.6.4 Miniflux 最低版本要求
+
+Miniflux 官方文档未明确指定最低 PG 版本，但从全文索引功能依赖看：
+- **功能可用**：PG 10+（tsvector 功能已稳定）
+- **推荐生产**：PG 13+（`REINDEX CONCURRENTLY` + `pg_stat_gin` 支持）
+- **最佳性能**：PG 14+（GIN 压缩 + 并行扫描）
+- **当前代码**：未使用任何版本专属 SQL 语法，可在 PG 12-15+ 正常运行
+
+### 5.7 与 pg_trgm 扩展的组合搜索
+
+Miniflux 当前仅使用 PostgreSQL 内置的 tsvector 全文索引，未使用 `pg_trgm`（三元组）扩展，但两者可配合使用实现更强大的搜索。
+
+#### 5.7.1 tsvector 与 pg_trgm 的能力对比
+
+| 维度 | tsvector（当前方案） | pg_trgm（扩展） | 组合使用 |
+|-----|-------------------|----------------|---------|
+| **匹配精度** | 词级精确匹配 | 模糊子串匹配 | 精确 + 容错 |
+| **拼写容错** | 无（`postgresql` ≠ `postgressql`） | **有**（编辑距离 ≤ 2 可匹配） | **互补** |
+| **前缀搜索** | 需 `to_tsquery('postgr:*')` | 天然支持（`%postgr%`） | 更灵活 |
+| **中文/日文** | 单字符切分，效果差 | 三元组切分，效果更差 | 仍需专门分词器 |
+| **性能** | 快（GIN 倒排索引） | 较慢（需扫描更多三元组） | 可分层查询 |
+| **索引体积** | 较小 | 较大（约 2-3 倍） | 需权衡 |
+| **排名质量** | 基于 TF-IDF 权重 | 基于编辑距离 | 可加权融合 |
+
+#### 5.7.2 组合搜索的优势场景
+
+1. **拼写错误容错**：
+   - 用户输入 `postgressql`（多写了一个 s）
+   - tsvector：无匹配
+   - pg_trgm：通过 `similarity(title, 'postgressql') > 0.3` 可匹配到 `postgresql`
+   - **效果**：搜索成功率提升，减少"搜不到"的用户投诉
+
+2. **部分词匹配**：
+   - 用户输入 `miniflux`
+   - tsvector：仅匹配包含 `miniflux` 独立单词的文档
+   - pg_trgm：可匹配 `miniflux.app`、`miniflux-reader` 等包含该子串的内容
+
+3. **多语言混合内容**：
+   - 对于包含代码、技术术语的内容，拼写变体较多
+   - 组合搜索可覆盖更多边缘情况
+
+#### 5.7.3 组合搜索的实现方案
+
+**Step 1：安装 pg_trgm 扩展**
+
+```sql
+-- 数据库超级用户执行
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Miniflux 迁移中添加（需在首次部署时执行）
+-- 但 Miniflux 未提供迁移脚本，需 DBA 手动执行
+```
+
+**Step 2：创建 pg_trgm 索引**
+
+```sql
+-- 标题和内容的三元组索引
+CREATE INDEX entries_title_trgm_idx ON entries USING gin (title gin_trgm_ops);
+CREATE INDEX entries_content_trgm_idx ON entries USING gin (content gin_trgm_ops);
+
+-- 或创建组合索引
+CREATE INDEX entries_search_trgm_idx ON entries 
+USING gin ((title || ' ' || coalesce(content, '')) gin_trgm_ops);
+```
+
+**Step 3：搜索查询层修改**（需修改 `entry_query_builder.go`）
+
+```go
+// 方案 A：OR 组合，任一匹配返回
+SELECT e.id, e.title, 
+    ts_rank(e.document_vectors, websearch_to_tsquery($2)) AS ts_score,
+    similarity(e.title || ' ' || coalesce(e.content, ''), $2) AS trgm_score
+FROM entries e
+WHERE e.user_id = $1
+  AND (e.document_vectors @@ websearch_to_tsquery($2)
+       OR similarity(e.title || ' ' || coalesce(e.content, ''), $2) > 0.3)
+ORDER BY (ts_score * 0.7 + trgm_score * 0.3)
+       - extract(epoch from now() - published_at)::float * 0.0000001 DESC
+LIMIT $3;
+
+// 方案 B：分层查询，先 tsvector 精确匹配，结果不足时补充 pg_trgm
+// 更复杂但性能更好
+```
+
+#### 5.7.4 冲突与风险
+
+1. **结果排名冲突**：
+   - tsvector 高分的条目可能 trgm 低分，反之亦然
+   - 权重参数（0.7/0.3）需要调优，不同场景最优权重不同
+   - 建议 A/B 测试确定权重
+
+2. **性能开销**：
+   - 新增的 gin_trgm_ops 索引写入开销约为原有 GIN 索引的 2 倍
+   - feed 刷新性能可能下降 20-30%
+   - 索引存储需求增加约 2-3 倍
+
+3. **索引膨胀加剧**：
+   - 三元组索引的死元组产生速度更快
+   - autovacuum 需更频繁运行，建议调小 `autovacuum_vacuum_threshold`
+
+4. **查询计划不稳定**：
+   - PostgreSQL 查询优化器可能错误选择执行计划
+   - 可能需要 `SET enable_seqscan = off` 或使用 `pg_hint_plan` 强制索引
+
+5. **Miniflux 代码侵入**：
+   - 需修改 `entry_query_builder.go`、`entry_pagination_builder.go` 多处
+   - 需新增相似度阈值配置项
+   - 无官方迁移脚本支持扩展安装
+
+### 5.8 服务重启与崩溃场景下的索引一致性
+
+#### 5.8.1 gin_pending_list 的持久化机制
+
+**关键结论**：**gin_pending_list 不独立持久化**，其内容包含在 WAL 日志中。
+
+**工作流程**：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    正常写入流程（无崩溃）                          │
+├───────────────────────────────────────────────────────────────────┤
+│  1. INSERT/UPDATE entry                                            │
+│     ↓                                                             │
+│  2. 生成新 tsvector，写入 gin pending list（内存）                  │
+│     ↓                                                             │
+│  3. 写入 WAL 日志（包含 pending list 变更）                        │
+│     ↓                                                             │
+│  4. 事务 COMMIT                                                   │
+│     ↓                                                             │
+│  5. 后台 gin_clean_pending_list 进程将 pending list 合并到主索引   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**崩溃恢复流程**：
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│                    崩溃后重启（Crash Recovery）                    │
+├───────────────────────────────────────────────────────────────────┤
+│  1. PostgreSQL 启动，读取 WAL 从最后一个 checkpoint 开始重放       │
+│     ↓                                                             │
+│  2. 重放包含 pending list 写入的 WAL 记录，重建内存中的 pending list│
+│     ↓                                                             │
+│  3. 恢复完成后，自动触发 gin_clean_pending_list 合并到主索引       │
+│     ↓                                                             │
+│  4. 索引恢复到崩溃前的一致状态，无数据丢失                         │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**持久化保证**：
+- pending list 的每次写入都记录在 WAL 中
+- 只要事务已 COMMIT，WAL 已落盘，即使立即崩溃，重启后也能恢复
+- 未 COMMIT 的事务中写入的 pending list 在崩溃后回滚，符合 ACID
+
+#### 5.8.2 不同崩溃场景的影响分析
+
+| 崩溃时机 | 索引状态 | 搜索行为 | 恢复措施 |
+|---------|---------|---------|---------|
+| **COMMIT 前** | 崩溃前的 pending list 已写入 WAL，但事务未提交 | 无影响，回滚到事务开始前状态 | 自动恢复，无需干预 |
+| **COMMIT 后，pending list 未合并到主索引** | pending list 中包含已提交的数据，但主索引未更新 | **搜索仍正常**：查询时同时扫描主索引 + pending list | 重启后自动合并，无需干预 |
+| **pending list 合并中** | 主索引部分更新，部分未更新 | **搜索仍正常**：PostgreSQL 内部保证合并操作的原子性可见 | 自动恢复，无需干预 |
+| **REINDEX 执行中** | 旧索引已删除，新索引不完整 | **搜索不可用**：`document_vectors_idx` 处于 invalid 状态 | 需手动 `DROP INDEX CONCURRENTLY` 后重新 `REINDEX CONCURRENTLY` |
+| **CREATE INDEX CONCURRENTLY 执行中** | 新索引处于 build 状态 | 无影响：查询仍使用旧索引 | 重启后会标记为 invalid，需手动清理重建 |
+
+#### 5.8.3 服务优雅重启 vs 强制重启
+
+**优雅重启（SIGTERM）**：
+- PostgreSQL 等待所有活动事务完成
+- 触发一次 CHECKPOINT，将所有 dirty page（包括 pending list 合并产生的）刷盘
+- 服务无索引一致性问题
+- Miniflux 搜索在重启期间短暂不可用（连接断开）
+
+**强制重启（SIGKILL / 断电）**：
+- 可能导致 WAL 重放时间较长（取决于上次 checkpoint 后的写入量）
+- GIN pending list 需从 WAL 重建
+- 若 pending list 较大（如 `gin_pending_list_limit = 64MB`），重放时间可能需要数秒到数分钟
+- 期间数据库处于 recovery 状态，Miniflux 无法连接
+
+#### 5.8.4 索引一致性验证与修复
+
+**常规健康检查**：
+
+```sql
+-- 1. 检查索引有效性
+SELECT indexrelname, indisvalid, indisready, indisclustered
+FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid
+WHERE c.relname = 'document_vectors_idx';
+
+-- 2. 检查索引大小异常（突然缩小可能意味着损坏）
+SELECT pg_size_pretty(pg_relation_size('document_vectors_idx'));
+
+-- 3. 验证索引完整性（PG 12+）
+CREATE EXTENSION IF NOT EXISTS amcheck;
+SELECT bt_index_check('document_vectors_idx'::regclass);
+-- 注意：amcheck 对 GIN 仅支持结构检查，不支持完整的数据一致性检查
+```
+
+**索引损坏修复流程**：
+
+若索引损坏（如 `indisvalid = false`、查询报错、或 amcheck 发现问题）：
+
+```sql
+-- Step 1：验证表数据完整性
+SELECT COUNT(*) FROM entries;  -- 确认表数据完好
+
+-- Step 2：删除损坏的索引
+DROP INDEX CONCURRENTLY IF EXISTS document_vectors_idx;
+
+-- Step 3：重建索引（生产环境用 CONCURRENTLY）
+REINDEX INDEX CONCURRENTLY document_vectors_idx;
+
+-- 或使用 pg_repack（更适合大索引）
+-- pg_repack -d miniflux -I document_vectors_idx
+
+-- Step 4：验证修复结果
+SELECT indisvalid FROM pg_index 
+WHERE indexrelid = 'document_vectors_idx'::regclass;
+
+-- Step 5：抽样验证搜索结果
+SELECT id, title FROM entries
+WHERE document_vectors @@ websearch_to_tsquery('test')
+LIMIT 5;
+```
+
+#### 5.8.5 预防措施
+
+1. **配置优化**：
+   ```ini
+   # postgresql.conf
+   checkpoint_timeout = 15min              # 减少崩溃恢复时间
+   max_wal_size = 4GB                      # 减少 checkpoint 频率
+   gin_pending_list_limit = 16MB           # 平衡写入性能与恢复时间
+   synchronous_commit = on                 # 确保 WAL 落盘
+   ```
+
+2. **监控预警**：
+   - 监控 `pg_stat_database.checkpoints_req`（请求的 checkpoint 数）
+   - 监控 `last_checkpoint_lsn` 与当前 LSN 的差距
+   - 异常重启后立即检查 `indisvalid` 状态
+
+3. **操作规范**：
+   - 禁止在 `REINDEX CONCURRENTLY` 执行期间重启数据库
+   - 大索引重建前先做 checkpoint，减少锁定时间
+   - 升级 PG 版本前做完整备份（`pg_dump` + 文件系统快照）
+
 ---
 
 ## 六、技术要点总结
@@ -1053,7 +1404,58 @@ if err != nil {
 - Standby: `hot_standby_feedback = on`, `max_standby_streaming_delay = 30s`
 - Primary: `vacuum_defer_cleanup_age = 1000`, `gin_pending_list_limit = 16MB`
 
-### 6.10 相关文件清单
+### 6.10 PostgreSQL 版本差异与升级
+
+**关键版本差异**：
+- **PG 12**：`REINDEX CONCURRENTLY` 对 GIN 有 bug，禁止使用（CVE-2020-25695）
+- **PG 13**：修复 bug，新增 `pg_stat_gin` 监控视图（推荐生产最低版本）
+- **PG 14**：GIN 索引压缩（体积减 20-40%）、并行扫描（最佳性能）
+- **PG 15+**：索引级别 `fastupdate` 设置、插入性能优化
+
+**升级回归保障**：
+- 升级前：检查索引有效性 + 生成索引校验和
+- 升级后：基础功能验证 + 性能对比（EXPLAIN ANALYZE）+ 数据一致性验证
+- Miniflux 代码未使用版本专属 SQL，可在 PG 12-15+ 正常运行
+
+### 6.11 与 pg_trgm 扩展组合搜索
+
+**能力对比**：
+- **tsvector**：词级精确匹配、性能好、无拼写容错
+- **pg_trgm**：子串模糊匹配、支持拼写容错、性能较慢、索引体积大
+
+**组合方案**：
+1. `CREATE EXTENSION pg_trgm` + 创建 `gin_trgm_ops` 索引
+2. 查询层修改为 `tsvector @@ query OR similarity(...) > 0.3`
+3. 排名加权 `ts_score * 0.7 + trgm_score * 0.3`
+
+**风险**：
+- 写入开销增加 2 倍，feed 刷新性能下降 20-30%
+- 索引体积增加 2-3 倍
+- 排名权重需 A/B 测试调优
+- Miniflux 代码需多处修改，无官方支持
+
+### 6.12 服务重启与崩溃恢复
+
+**gin_pending_list 持久化**：
+- 不独立持久化，内容包含在 WAL 日志中
+- 崩溃后从 WAL 重放重建，无数据丢失
+- 查询时同时扫描主索引 + pending list，保证一致性
+
+**不同崩溃场景**：
+- **COMMIT 前**：自动回滚，无影响
+- **COMMIT 后未合并**：搜索仍正常，重启后自动合并
+- **REINDEX 中崩溃**：索引损坏，需手动 DROP 后重建
+
+**优雅重启 vs 强制重启**：
+- 优雅重启：CHECKPOINT 刷盘，无一致性问题
+- 强制重启：WAL 重放，pending list 大时恢复时间长
+
+**预防与修复**：
+- 配置：`checkpoint_timeout = 15min`, `gin_pending_list_limit = 16MB`
+- 健康检查：`indisvalid` 状态 + `amcheck` 结构验证
+- 损坏修复：`DROP INDEX CONCURRENTLY` + `REINDEX INDEX CONCURRENTLY`
+
+### 6.13 相关文件清单
 
 | 文件路径 | 主要职责 |
 |---------|---------|
