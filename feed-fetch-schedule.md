@@ -641,6 +641,49 @@ type JSONHub struct {
 
 **实际业务建议**：如果需要实时推送，目前只能依赖 Webhook + 缩短拉取间隔的组合方案。
 
+### 11.3 关于 PubSubHubbub Hub 不可达的 fallback 机制
+
+**重要结论**：由于 Miniflux v2 根本不支持 WebSub/PubSubHubbub 订阅，因此也**不存在 Hub 不可达时的 fallback 回退机制**。
+
+但从架构设计角度分析，如果未来实现 WebSub 支持，合理的 fallback 策略应该是怎样的？结合现有拉取调度的设计，可以推断出以下模式：
+
+#### 理论上的 fallback 分层架构
+
+```
+第一层：WebSub 推送（实时）
+   ↓ Hub 不可达 / 订阅过期 / 推送失败
+第二层：拉取轮询（兜底）
+```
+
+#### 现有代码中隐含的"类 fallback"模式
+
+虽然没有 WebSub，但代码中已经存在类似的"协议降级"思路，可以参考：
+
+1. **HTTP 缓存协议的降级**（`response_handler.go:102`）：
+   - 优先使用 ETag（强校验）
+   - ETag 不存在时降级使用 Last-Modified（弱校验）
+   - 都没有时每次全量拉取
+
+2. **TTL/Cache-Control/Expires 的多源取 max**（`handler.go:297`）：
+   - 多个刷新提示同时存在时取最大值
+   - 这不是 fallback，而是叠加，但体现了"多信号融合"的设计思想
+
+#### 如果实现 WebSub，可能的 fallback 设计推断
+
+基于 Miniflux 当前的代码风格，可能会这样实现：
+
+| 场景 | 处理方式 |
+|------|---------|
+| Hub 订阅成功 | 将该 Feed 的轮询间隔拉长（如从 60min 改为 24h），推送为主、轮询兜底 |
+| Hub 返回错误 / 不可达 | 立即回退到正常轮询间隔，不等待订阅过期 |
+| 长时间未收到推送（超过 N 个周期） | 触发一次主动拉取，验证 Feed 是否仍然有效 |
+| 退避期间重新订阅成功 | 恢复拉长的轮询间隔 |
+
+**为什么当前版本不实现 WebSub**：
+- WebSub 需要公网可达的回调 URL，很多私有化部署的 Miniflux 不满足
+- Hub 生态碎片化，不是所有 Feed 源都提供 Hub
+- 拉取模式已经能满足绝大多数场景，实现成本与收益不匹配
+
 ---
 
 ## 12. host-limit 命中时的处理策略与 retry 机制
@@ -760,6 +803,102 @@ interval = max(interval, refreshDelay)  // refreshDelay 就是 retryDelay
 - 如果 `Retry-After` 是过去的时间（HTTP 日期格式），`time.Until(t)` 返回负值，`max()` 会忽略它
 - 429 状态下仍然会执行 `UpdateFeedError()`，持久化新的 `next_check_at`
 
+### 13.3 429 退避对跨 host 调度公平性的影响
+
+当多个 host 同时存在时，429 退避会改变各 host 之间的调度资源分配，对公平性产生复杂影响。
+
+#### 13.3.1 429 的副作用：parsing_error_count 递增
+
+429 不仅会推远 `next_check_at`，还会导致**解析错误计数递增**。
+
+**原因分析**（`handler.go:245` → `handler.go:286`）：
+
+```
+1. IsRateLimited() == true → 更新内存中的 next_check_at
+2. LocalizedError() → 返回 nil（429 是有效 HTTP 响应，不是连接错误）
+3. IsModified() → 返回 true（429 不是 304）
+4. ReadBody() → 读取错误响应体（通常是 HTML 错误页）
+5. ParseFeed() → 解析失败（错误页不是有效的 Feed 格式）
+6. getTranslatedLocalizedError() → parsing_error_count++，持久化
+```
+
+**后果**：
+- 连续 3 次 429 后，`parsing_error_count >= POLLING_PARSING_ERROR_LIMIT`（默认 3）
+- 该 Feed 会被 `WithErrorLimit()` 过滤掉，即使 429 解除了也不会被调度
+- 需要用户手动刷新或重置错误计数才能恢复
+
+这是一个**设计缺陷**：429 是服务端限流，不是 Feed 格式错误，不应该计入解析错误计数。
+
+#### 13.3.2 对跨 host 公平性的影响
+
+**公平性定义**：各 host 获取的调度配额（Worker 时间）与其拥有的到期 Feed 数量成正比。
+
+**场景一：单个 host 遭遇 429**
+
+假设 `POLLING_LIMIT_PER_HOST=5`，两个 host 各有 10 个到期 Feed：
+
+| 阶段 | hostA（正常） | hostB（429） | 说明 |
+|------|-------------|-------------|------|
+| 第 1 轮 | 5 个被选中 | 5 个被选中 → 全部 429 | hostB 的 5 个全部失败 |
+| 第 2 轮（60min 后） | 另外 5 个被选中 | 0 个被选中（next_check_at 被推远） | hostB 完全让出配额 |
+| 第 N 轮（Retry-After 后） | 10 个已全部刷新 | 5 个被选中 | hostB 才恢复 |
+
+**结论**：遭遇 429 的 host 会**主动让出**调度配额给其他 host，从资源分配角度看是"公平的"——因为这个 host 暂时不可用，把配额让给能用的 host 更高效。
+
+**场景二：host 内部分 Feed 遭遇 429**
+
+同一个 host 下，部分 Feed 返回 429，部分正常：
+
+- 由于 `limitPerHost` 是**域名级别的配额**，不是 Feed 级别的
+- 429 的 Feed 的 `next_check_at` 被推远，下一轮不会被选中
+- 同 host 下其他正常的 Feed 会填补这些配额空位
+- 结果是：**host 总配额不变，但内部流量向正常 Feed 倾斜**
+
+这可能导致一个问题：如果某 host 下有 100 个 Feed，其中 95 个被 429，剩下 5 个正常的会每轮都被选中，**相当于该 host 的实际刷新频率提高了**（因为配额没减少但候选池变小了）。
+
+#### 13.3.3 公平性失衡的极端情况
+
+**级联失效风险**：
+
+```
+1. hostA 的一个 Feed 返回 429，Retry-After = 2 小时
+2. 下一轮，这个 Feed 的 next_check_at 还没到，不被选中
+3. 同 host 的另一个 Feed 顶替它的位置被选中
+4. 这个也返回 429
+5. ...
+6. 最终 hostA 下的所有 Feed 都 429 了，parsing_error_count 都超标
+7. hostA 完全从调度中消失，配额全部让给其他 host
+8. 即使 429 解除了，由于 error_count 超标，这些 Feed 仍然无法恢复
+9. 形成"死区"，需要人工干预
+```
+
+#### 13.3.4 现有机制对公平性的补偿
+
+虽然没有显式的公平性调度，但有一些机制间接缓解了问题：
+
+1. **`next_check_at` 的随机化效果**：
+   - 每个 Feed 的 `next_check_at` 基于其上次刷新时间独立计算
+   - 自然形成了错峰，不会所有 Feed 同时到期
+
+2. **`ORDER BY next_check_at ASC`**：
+   - 最久未刷新的 Feed 优先被选中
+   - 确保每个 Feed 最终都能被刷到，防止完全饥饿
+
+3. **多轮迭代的抹平效应**：
+   - 虽然单轮可能有失配，但多轮下来，刷新频率由 `ScheduleNextCheck` 决定
+   - 长期来看，每个 Feed 的平均刷新频率趋近于其计算间隔
+
+#### 13.3.5 公平性改进思路
+
+如果需要更强的公平性保证，可以考虑：
+
+| 改进方向 | 具体方案 |
+|---------|---------|
+| 错误分类 | 将 429 限流错误与解析错误分开计数，限流错误不触发永久禁用 |
+| 配额动态调整 | 根据 host 的健康状况动态调整 `limitPerHost`（健康的 host 给更多配额） |
+| 轮间补偿 | 如果某 host 上一轮有大量 Feed 被 429 跳过，下一轮适当增加其配额 |
+| 指数退避 | 对 429 的 Feed 采用指数退避，而不是固定的 Retry-After |
+
 ---
 
 ## 14. 多实例 HA 部署下的 Feed 去重机制
@@ -827,15 +966,122 @@ T0 + 600ms: 实例 B 完成刷新，执行 UPDATE feeds SET next_check_at = ...�
    - 每条 entry 入库前检查 `entryExists()`，防止重复插入
    - 即使 Feed 被并发刷新，条目也不会重复
 
-### 14.4 HA 部署的实际建议
+### 14.4 SCHEDULER_SERVICE 的默认值与配置
+
+**默认值**：`SCHEDULER_SERVICE` 默认为 **启用**（`true`）。
+
+配置项实际通过 `DISABLE_SCHEDULER_SERVICE` 反义控制（`config/options.go:217`）：
+
+```go
+"DISABLE_SCHEDULER_SERVICE": {
+    parsedBoolValue: false,  // 默认不禁用 → 调度器默认开启
+    rawValue:        "0",
+    valueType:       boolType,
+}
+
+func (c *configOptions) HasSchedulerService() bool {
+    return !c.options["DISABLE_SCHEDULER_SERVICE"].parsedBoolValue
+}
+```
+
+| 配置 | 值 | 调度器状态 |
+|------|-----|-----------|
+| `DISABLE_SCHEDULER_SERVICE` | `0`（默认） | ✅ 启用 |
+| `DISABLE_SCHEDULER_SERVICE` | `1` / `true` | ❌ 禁用 |
+
+**启动判断逻辑**（`daemon.go:32`）：
+
+```go
+if config.Opts.HasSchedulerService() && !config.Opts.HasMaintenanceMode() {
+    runScheduler(store, pool)  // 两个条件都满足才启动调度器
+}
+```
+
+**维护模式的影响**：
+- 即使 `DISABLE_SCHEDULER_SERVICE=0`，如果开启了维护模式（`MAINTENANCE_MODE=true`），调度器也不会启动
+- 维护模式常用于数据库迁移、版本升级等场景
+
+### 14.5 运营如何识别调度仅有一个节点
+
+Miniflux v2 **没有内建**的 leader election、节点注册或调度协调机制。运营需要通过外部手段确保只有一个实例运行调度器。
+
+#### 可观测性手段
+
+1. **Prometheus Metrics**（`internal/metric/metric.go:24`）：
+   - `miniflux_background_feed_refresh_duration_seconds` — 后台刷新耗时直方图
+   - 可以通过这个指标判断哪些实例在执行调度任务
+   - 如果多个实例都有这个指标输出，说明多个实例都在运行调度器
+
+2. **日志关键字**：
+   - 调度器启动日志：`Starting background scheduler...`（`scheduler.go:16`）
+   - 批次创建日志：`Created a batch of feeds`（`batch.go:129`）
+   - 通过日志聚合系统（如 ELK、Loki）可以统计有多少实例输出了这些日志
+
+3. **数据库间接推断**：
+   - 查询 `feeds` 表中 `checked_at` 的更新频率
+   - 如果同一 Feed 在短时间内被多次更新（间隔远小于 `POLLING_FREQUENCY`），可能说明多实例都在调度
+
+#### 部署层面的保障方案
+
+**方案一：环境变量区分角色（推荐）**
+
+```yaml
+# 实例 A — 调度角色
+env:
+  - name: DISABLE_SCHEDULER_SERVICE
+    value: "0"
+
+# 实例 B、C — Web 角色
+env:
+  - name: DISABLE_SCHEDULER_SERVICE
+    value: "1"
+```
+
+**方案二：Kubernetes + 单副本 StatefulSet**
+
+- 调度器单独部署为 1 副本的 StatefulSet
+- Web 服务部署为多副本的 Deployment
+- 通过 Service 暴露 Web 端口，调度器不对外暴露
+
+**方案三：数据库行锁（需二次开发）**
+
+修改 `FetchJobs()` 使用 `SELECT ... FOR UPDATE SKIP LOCKED`：
+
+```sql
+BEGIN;
+SELECT id, user_id, feed_url FROM feeds
+WHERE ...
+ORDER BY next_check_at ASC
+LIMIT 100
+FOR UPDATE SKIP LOCKED;  -- 跳过被其他事务锁定的行
+-- 执行刷新...
+COMMIT;
+```
+
+但这种方案需要在事务中完成整个刷新流程，改造量较大。
+
+#### 多实例都开调度器的风险量化
+
+如果不小心在两个实例上都启用了调度器，影响有多大？
+
+| 风险 | 严重程度 | 说明 |
+|------|---------|------|
+| 重复 HTTP 请求 | ⚠️ 中 | 浪费带宽和源站资源，但有 ETag/304 缓解 |
+| 重复解析入库 | ✅ 低 | 有 entry 去重（hash 检查），不会产生重复条目 |
+| 数据损坏 | ✅ 低 | 都是幂等操作，不会造成数据不一致 |
+| 调度器整体变慢 | ⚠️ 中 | 两个实例同时查询数据库，增加数据库负载 |
+
+**结论**：多实例同时调度不会造成严重故障，主要是资源浪费。但在大规模部署（Feed 数量 > 10,000）时，建议严格控制只有一个调度器实例。
+
+### 14.6 HA 部署的实际建议
 
 **官方推荐**：单实例运行调度器，多实例运行 Web 服务。
 
 **可行的 HA 方案**：
 
 1. **主备模式**：
-   - 只有一个实例启用调度器（`SCHEDULER_SERVICE=true`）
-   - 其他实例只提供 Web UI 和 API（`SCHEDULER_SERVICE=false`）
+   - 只有一个实例启用调度器（`DISABLE_SCHEDULER_SERVICE=0`）
+   - 其他实例只提供 Web UI 和 API（`DISABLE_SCHEDULER_SERVICE=1`）
    - 用外部机制（如 Kubernetes livenessProbe + leader election）实现故障转移
 
 2. **时间偏移**：
@@ -846,7 +1092,7 @@ T0 + 600ms: 实例 B 完成刷新，执行 UPDATE feeds SET next_check_at = ...�
    - 在 `FetchJobs()` 前获取 Redis / etcd 分布式锁
    - 或修改 SQL 添加 `FOR UPDATE SKIP LOCKED`
 
-### 14.5 为什么不启用 `SKIP LOCKED`？
+### 14.7 为什么不启用 `SKIP LOCKED`？
 
 从代码来看，`ArchiveEntries` 已经在使用 `FOR UPDATE SKIP LOCKED`，说明开发团队了解这个特性。`FetchJobs` 不使用可能的原因：
 
@@ -856,7 +1102,7 @@ T0 + 600ms: 实例 B 完成刷新，执行 UPDATE feeds SET next_check_at = ...�
 
 ---
 
-## 15. 关键设计要点总结（补充版）
+## 15. 关键设计要点总结（完整版）
 
 1. **调度与执行解耦**：Scheduler 只负责生产 Job，Worker Pool 只负责消费 Job，通过 channel 连接
 2. **无缓冲 channel 背压**：Pool 的 channel 无缓冲，生产速度受限于消费速度，防止任务堆积
@@ -873,3 +1119,8 @@ T0 + 600ms: 实例 B 完成刷新，执行 UPDATE feeds SET next_check_at = ...�
 13. **host-limit 命中即丢弃**：被过滤的 Feed 不排队，依赖下一轮调度重试，可能导致长尾 Feed 饥饿
 14. **429 协调策略**：`Retry-After` 作为调度间隔下限，与本地计算间隔取最大值
 15. **HA 部署无分布式锁**：多实例部署时可能并发刷新同一 Feed，但 ETag 和条目去重机制降低了负面影响
+16. **调度器默认启用**：`DISABLE_SCHEDULER_SERVICE` 默认 `false`，即调度器默认开启；维护模式下自动禁用
+17. **429 的副作用**：429 不仅会推远 `next_check_at`，还会导致 `parsing_error_count` 递增，可能永久禁用该 Feed（设计缺陷）
+18. **跨 host 公平性**：遭遇 429 的 host 会主动让出配额，长期看由 `ScheduleNextCheck` 保证各 Feed 的刷新频率
+19. **级联失效风险**：同一 host 下大量 Feed 连续 429 可能导致 error_count 全部超标，形成"死区"需人工干预
+20. **运营识别手段**：通过 Prometheus metrics、日志关键字、数据库更新频率可以判断是否有多实例同时调度
