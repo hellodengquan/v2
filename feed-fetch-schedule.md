@@ -568,7 +568,295 @@ func (h *handler) refreshFeed(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 10. 关键设计要点总结
+## 11. Webhook 与 WebSub/PubSubHubbub 推送订阅
+
+### 11.1 Webhook 推送调度链路
+
+Webhook 是**拉取模式的补充**，而非替代。它在拉取完成后，将新条目异步推送到第三方系统。
+
+**触发时机**（`internal/reader/handler/handler.go:338`）：
+
+```go
+if userIntegrations != nil && len(newEntries) > 0 {
+    go integration.PushEntries(originalFeed, newEntries, userIntegrations)
+}
+```
+
+**关键特性**：
+- **异步执行**：使用 `go` 关键字在独立 goroutine 中推送，不阻塞主刷新流程
+- **触发条件**：只有当拉取到**新条目**（`len(newEntries) > 0`）且用户启用了 webhook 时才触发
+- **两种事件类型**（`internal/integration/webhook/webhook.go:24`）：
+  - `new_entries`：批量推送本次刷新发现的所有新条目
+  - `save_entry`：用户点击"保存"按钮时单独推送某个条目
+
+**完整推送链路**：
+
+```
+1. Worker 执行 RefreshFeed()
+   ├── 拉取 Feed 内容
+   ├── 解析并对比，找出 newEntries
+   ├── 持久化条目到数据库
+   └── go integration.PushEntries()  ← 异步触发
+       └── webhook.NewClient().SendNewEntriesWebhookEvent()
+           ├── 构造 JSON payload（Feed + Entries）
+           ├── 计算 X-Miniflux-Signature（HMAC-SHA256，用 webhookSecret）
+           ├── POST 到配置的 webhook URL
+           └── 超时 10 秒，无重试
+```
+
+**与拉取模式的关系**：
+- **互补关系**，而非覆盖
+- 拉取模式负责**获取**内容，Webhook 负责**分发**内容
+- 即使启用了 Webhook，拉取调度仍然正常运行
+- Webhook 推送失败**不影响**拉取流程，只是打日志记录
+
+### 11.2 WebSub/PubSubHubbub 支持现状
+
+**重要结论**：Miniflux v2 **不支持 WebSub/PubSubHubbub 推送订阅**。
+
+代码中仅有的 WebSub 痕迹在 JSON Feed 解析的结构体定义中（`internal/reader/json/json.go:55`）：
+
+```go
+type JSONFeed struct {
+    // ...
+    // Hubs  describes endpoints that can be used to subscribe to real-time notifications
+    // from the publisher of this feed.
+    Hubs []JSONHub `json:"hubs"`
+}
+
+type JSONHub struct {
+    // Type defines the protocol used to talk with the hub: "rssCloud" or "WebSub".
+    Type string `json:"type"`
+    // URL is the location of the hub.
+    URL string `json:"url"`
+}
+```
+
+**缺失的 WebSub 功能**：
+1. ❌ 没有订阅流程（向 Hub 发送 `hub.mode=subscribe` 请求）
+2. ❌ 没有回调接口（`/websub/callback` 路由不存在）
+3. ❌ 没有 Hub 订阅状态管理（订阅有效期、续租等）
+4. ❌ 没有签名验证（`X-Hub-Signature`）
+5. ❌ 没有将解析到的 Hub URL 存入数据库（`feeds` 表无相关字段）
+
+**实际业务建议**：如果需要实时推送，目前只能依赖 Webhook + 缩短拉取间隔的组合方案。
+
+---
+
+## 12. host-limit 命中时的处理策略与 retry 机制
+
+### 12.1 命中时的行为：丢弃而非排队
+
+当 `limitPerHost` 命中时，Feed 会被**直接丢弃**（从当前批次中排除），不会排队等待。
+
+**代码逻辑**（`internal/storage/batch.go:107`）：
+
+```go
+if b.limitPerHost > 0 {
+    feedHostname := urllib.Domain(job.FeedURL)
+    if hosts[feedHostname] >= b.limitPerHost {
+        slog.Debug("Feed host limit reached for this batch", ...)
+        nbSkippedFeeds++
+        continue  // ← 直接跳过，不加入 jobs
+    }
+    hosts[feedHostname]++
+}
+```
+
+**关键细节**：
+- 被跳过的 Feed 仍然满足 `next_check_at < now()`，但**不会更新 `next_check_at`**
+- 这些 Feed 会**在下一轮调度中重新被考虑**
+- `nbSkippedFeeds` 会记录到日志中（`batch.go:132`），方便排查
+
+**示例场景**：
+
+假设 `POLLING_LIMIT_PER_HOST=2`，`BATCH_SIZE=100`，某域名下有 5 个到期 Feed：
+
+| 调度轮次 | 选中的 Feed | 被跳过的 Feed |
+|---------|------------|-------------|
+| 第 1 轮（T0） | F1, F2 | F3, F4, F5 |
+| 第 2 轮（T0+60min） | F3, F4 | F5 |
+| 第 3 轮（T0+120min） | F5 | - |
+
+### 12.2 Retry 策略：依赖下一轮调度
+
+**没有专门的 retry 队列**。被 `limitPerHost` 过滤掉的 Feed，其重试完全依赖下一轮调度的自然重选。
+
+**重试周期**：
+- 最快在下一个 `POLLING_FREQUENCY`（默认 60 分钟）后被重新选中
+- 如果某域名下到期 Feed 很多，可能需要多轮才能全部刷完
+
+**与错误重试的区别**：
+
+| 场景 | 处理方式 | next_check_at 变化 |
+|------|---------|-------------------|
+| `limitPerHost` 过滤 | 跳过，下轮重试 | **不变**，仍满足 `< now()` |
+| HTTP 4xx/5xx 错误 | 跳过，下轮重试 | **更新**，`parsing_error_count++` |
+| 刷新成功 | 正常入库 | **更新**，按策略计算新值 |
+
+**风险**：如果某个域名下有大量 Feed，且 `limitPerHost` 设置较小，可能导致部分 Feed 长期"饿肚子"，因为每次都被排在后面的 Feed 顶替。
+
+---
+
+## 13. HTTP 429 服务端限速与本地调度间隔的协调处理
+
+### 13.1 429 检测与 Retry-After 解析
+
+**检测逻辑**（`internal/reader/fetcher/response_handler.go:98`）：
+
+```go
+func (r *ResponseHandler) IsRateLimited() bool {
+    return r.httpResponse != nil && r.httpResponse.StatusCode == http.StatusTooManyRequests
+}
+```
+
+**Retry-After 解析**（`response_handler.go:82`）支持两种格式：
+
+```go
+func (r *ResponseHandler) ParseRetryDelay() time.Duration {
+    // 1) 整数秒数：Retry-After: 120 → 120 秒
+    if seconds, err := strconv.Atoi(retryAfterHeaderValue); err == nil {
+        return time.Duration(seconds) * time.Second
+    }
+    // 2) HTTP 日期：Retry-After: Wed, 21 Oct 2015 07:28:00 GMT → 计算差值
+    if t, err := time.Parse(time.RFC1123, retryAfterHeaderValue); err == nil {
+        return time.Until(t).Truncate(time.Second)
+    }
+    return 0
+}
+```
+
+### 13.2 与本地调度间隔的协调机制
+
+**处理流程**（`internal/reader/handler/handler.go:245`）：
+
+```go
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()
+    calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+    // 记录日志后直接返回，不解析内容
+}
+```
+
+**核心协调逻辑在 `ScheduleNextCheck`** 中（`model/feed.go:150`）：
+
+```go
+interval = max(interval, refreshDelay)  // refreshDelay 就是 retryDelay
+```
+
+**优先级规则**：`Retry-After` 作为**下限**，确保不会比服务器建议的更频繁。
+
+**不同场景下的最终间隔**：
+
+| 场景 | 本地计算间隔 | Retry-After | 最终间隔 |
+|------|-------------|-------------|---------|
+| 正常刷新 | 60 min | 0 | 60 min |
+| 429，服务器建议 5 分钟 | 60 min | 5 min | 60 min（本地间隔更大） |
+| 429，服务器建议 2 小时 | 60 min | 120 min | 120 min（服务器建议更大） |
+| entry_frequency，高频源 | 15 min | 30 min | 30 min（服务器建议更大） |
+
+**边界情况处理**：
+- 如果 `Retry-After` 解析失败（格式不合法），`ParseRetryDelay()` 返回 0，此时完全使用本地计算的间隔
+- 如果 `Retry-After` 是过去的时间（HTTP 日期格式），`time.Until(t)` 返回负值，`max()` 会忽略它
+- 429 状态下仍然会执行 `UpdateFeedError()`，持久化新的 `next_check_at`
+
+---
+
+## 14. 多实例 HA 部署下的 Feed 去重机制
+
+### 14.1 现状：无显式分布式锁，存在竞态风险
+
+**重要结论**：Miniflux v2 的 `FetchJobs()` 查询**没有使用 `SELECT ... FOR UPDATE SKIP LOCKED`** 来防止多实例并发选中同一 Feed。
+
+**BatchBuilder 的 SQL 查询**（`internal/storage/batch.go:76`）：
+
+```sql
+SELECT id, user_id, feed_url FROM feeds
+WHERE ...
+ORDER BY next_check_at ASC
+LIMIT 100
+```
+
+**对比有锁的查询**（仅在 `ArchiveEntries` 中使用，`entry.go:378`）：
+
+```sql
+SELECT id, feed_id, hash FROM entries
+WHERE ...
+ORDER BY created_at ASC
+FOR UPDATE SKIP LOCKED  -- ← 防止并发修改
+LIMIT $3
+```
+
+### 14.2 竞态场景分析
+
+部署两个实例 A 和 B，连接同一个 PostgreSQL 数据库：
+
+```
+时间线：
+T0: 实例 A 的调度器运行 → 执行 SELECT，读取 Feed F（next_check_at = T0-10min）
+T0 + 1ms: 实例 B 的调度器运行 → 执行 SELECT，也读取 Feed F（next_check_at 仍为 T0-10min）
+T0 + 100ms: 实例 A 的 Worker 开始刷新 F，预更新内存中的 next_check_at = T0 + 60min
+T0 + 200ms: 实例 B 的 Worker 也开始刷新 F，预更新内存中的 next_check_at = T0 + 60min
+T0 + 500ms: 实例 A 完成刷新，执行 UPDATE feeds SET next_check_at = ...
+T0 + 600ms: 实例 B 完成刷新，执行 UPDATE feeds SET next_check_at = ...（覆盖 A 的结果）
+```
+
+**后果**：
+- Feed F 在同一调度周期内被刷新两次
+- 第二次刷新会收到 304 Not Modified（如果源站支持 ETag），但仍浪费了一次 HTTP 请求
+- `next_check_at` 被覆盖，但值相同（因为计算逻辑相同），所以最终结果一致
+- 没有数据损坏，只是浪费了资源
+
+### 14.3 隐性的去重/防护机制
+
+虽然没有显式分布式锁，但有一些机制降低了冲突概率：
+
+1. **`next_check_at` 乐观预更新**：
+   - HTTP 请求前就在内存中更新 `next_check_at`（虽然还没写入数据库）
+   - 但这个更新是实例本地的，对其他实例不可见
+
+2. **ETag / Last-Modified 条件请求**：
+   - 即使同一 Feed 被并发刷新，第二次请求会带上第一次请求获得的 ETag
+   - 源站如果支持，会返回 304 Not Modified，节省了解析和入库的开销
+
+3. **`AnotherFeedURLExists` 检查**（`handler.go:267`）：
+   - 防止同一用户订阅重复的 Feed URL
+   - 但这不防止同一 Feed 被并发刷新
+
+4. **`RefreshFeedEntries` 的条目去重**（`entry.go:329`）：
+   - 每条 entry 入库前检查 `entryExists()`，防止重复插入
+   - 即使 Feed 被并发刷新，条目也不会重复
+
+### 14.4 HA 部署的实际建议
+
+**官方推荐**：单实例运行调度器，多实例运行 Web 服务。
+
+**可行的 HA 方案**：
+
+1. **主备模式**：
+   - 只有一个实例启用调度器（`SCHEDULER_SERVICE=true`）
+   - 其他实例只提供 Web UI 和 API（`SCHEDULER_SERVICE=false`）
+   - 用外部机制（如 Kubernetes livenessProbe + leader election）实现故障转移
+
+2. **时间偏移**：
+   - 多个实例都启用调度器，但设置不同的 `POLLING_FREQUENCY` 偏移
+   - 简单但不严谨，仍有竞态可能
+
+3. **外部分布式锁**（需自行实现）：
+   - 在 `FetchJobs()` 前获取 Redis / etcd 分布式锁
+   - 或修改 SQL 添加 `FOR UPDATE SKIP LOCKED`
+
+### 14.5 为什么不启用 `SKIP LOCKED`？
+
+从代码来看，`ArchiveEntries` 已经在使用 `FOR UPDATE SKIP LOCKED`，说明开发团队了解这个特性。`FetchJobs` 不使用可能的原因：
+
+1. **事务边界问题**：`FOR UPDATE` 需要在事务中使用，但 `FetchJobs` 是只读查询，没有开启事务
+2. **性能权衡**：加锁会增加数据库开销，对于大多数单实例部署是不必要的
+3. **竞态后果轻微**：如前所述，并发刷新只会浪费 HTTP 请求，不会造成数据损坏
+
+---
+
+## 15. 关键设计要点总结（补充版）
 
 1. **调度与执行解耦**：Scheduler 只负责生产 Job，Worker Pool 只负责消费 Job，通过 channel 连接
 2. **无缓冲 channel 背压**：Pool 的 channel 无缓冲，生产速度受限于消费速度，防止任务堆积
@@ -580,3 +868,8 @@ func (h *handler) refreshFeed(w http.ResponseWriter, r *http.Request) {
 8. **无行锁无大事务**：整个刷新流程没有使用 `SELECT ... FOR UPDATE`，也没有全局事务，每次数据库操作独立提交
 9. **无即时重试机制**：刷新失败后不立刻重试，而是通过 `parsing_error_count` 和下一轮调度实现延迟重试
 10. **域名包含端口**：`limitPerHost` 使用完整 Host（含端口），`www.example.com` 和 `example.com` 视为不同主机
+11. **Webhook 是拉取的补充**：异步推送新条目到第三方，不阻塞主流程，失败不影响拉取
+12. **WebSub 不支持**：仅在 JSON Feed 解析中定义了 Hub 结构体，但无实际订阅/回调机制
+13. **host-limit 命中即丢弃**：被过滤的 Feed 不排队，依赖下一轮调度重试，可能导致长尾 Feed 饥饿
+14. **429 协调策略**：`Retry-After` 作为调度间隔下限，与本地计算间隔取最大值
+15. **HA 部署无分布式锁**：多实例部署时可能并发刷新同一 Feed，但 ETag 和条目去重机制降低了负面影响
