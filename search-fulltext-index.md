@@ -386,21 +386,289 @@ func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *stor
 
 ---
 
-## 五、技术要点总结
+## 五、运维与并发场景
 
-### 5.1 索引写入时机
+### 5.1 索引重建（VACUUM / REINDEX）对在线查询的影响
+
+Miniflux 代码中**未显式调用** `VACUUM`、`ANALYZE` 或 `REINDEX`，依赖 PostgreSQL 的 autovacuum 自动维护。
+
+#### 5.1.1 GIN 索引的维护机制
+
+**GIN 索引的特殊性**：
+- GIN 倒排索引的更新代价远高于 B-Tree
+- PostgreSQL 为 GIN 实现了**待处理列表（pending list）**机制：
+  - 小批量写入先进入内存 pending list，不立即合并到主索引
+  - 积累到阈值（`gin_pending_list_limit`，默认 4MB）后批量合并
+  - 查询时同时扫描主索引 + pending list，保证正确性
+
+**对搜索查询的影响**：
+
+| 维护操作 | 锁级别 | 对在线搜索的影响 |
+|---------|-------|---------------|
+| autovacuum（常规） | ShareUpdateExclusiveLock | 几乎无影响，后台并行执行 |
+| `VACUUM FULL entries` | AccessExclusiveLock | **完全阻塞**搜索，需停机维护窗口 |
+| `REINDEX INDEX document_vectors_idx` | ShareLock | 阻塞写入，不阻塞读取，但搜索性能下降 |
+| `REINDEX INDEX CONCURRENTLY document_vectors_idx` | 无长期锁 | 全程不阻塞读写，但耗时 2-3 倍 |
+| `ANALYZE entries` | ShareUpdateExclusiveLock | 几乎无影响，仅更新统计信息 |
+
+#### 5.1.2 何时需要手动重建
+
+触发手动重建的典型场景：
+1. **大量删除后索引膨胀**：GIN 索引不会自动回收空间，`VACUUM` 仅标记死元组
+2. **搜索性能骤降**：可能是 pending list 过大或索引碎片化严重
+3. **PostgreSQL 大版本升级**：pg_upgrade 后建议重建索引
+4. **GIN 损坏**：罕见但可能发生在崩溃恢复后
+
+**推荐操作**：
+
+```sql
+-- 安全优先：使用 CONCURRENTLY，不阻塞读写
+REINDEX INDEX CONCURRENTLY document_vectors_idx;
+
+-- 或同时更新统计信息
+ANALYZE entries;
+
+-- 检查索引膨胀情况
+SELECT
+    pg_size_pretty(pg_relation_size('document_vectors_idx')) AS index_size,
+    pg_size_pretty(pg_relation_size('entries')) AS table_size;
+```
+
+### 5.2 大批清理时的索引处理
+
+#### 5.2.1 清理机制
+
+**清理入口**：`internal/cli/cleanup_tasks.go:16` 的 `runCleanupTasks`
+
+**核心函数**：`ArchiveEntries`（`internal/storage/entry.go:362-404`）
+
+```sql
+WITH to_delete AS (
+    SELECT id, feed_id, hash
+    FROM entries
+    WHERE
+        status=$1 AND
+        starred is false AND
+        share_code='' AND
+        created_at < now() - $2::interval
+    ORDER BY created_at ASC
+    FOR UPDATE SKIP LOCKED    -- ← 关键：跳过已被锁定的行
+    LIMIT $3                   -- ← 分批删除，默认 10000 条
+), deleted AS (
+    DELETE FROM entries
+    USING to_delete
+    WHERE entries.id = to_delete.id
+    RETURNING entries.feed_id, entries.hash
+)
+INSERT INTO entry_tombstones (feed_id, hash)
+SELECT feed_id, hash FROM deleted WHERE hash <> ''
+ON CONFLICT (feed_id, hash) DO NOTHING
+```
+
+#### 5.2.2 锁与并发控制
+
+**关键设计**：
+- `FOR UPDATE SKIP LOCKED`：行级排他锁，但跳过已被其他事务锁定的行
+- `LIMIT $3`：分批删除，默认 `CLEANUP_ARCHIVE_BATCH_SIZE = 10000`
+- **无显式事务**：单条 CTE SQL 原子执行，短事务
+
+**对搜索查询的影响**：
+
+| 阶段 | 搜索可见性 | 说明 |
+|-----|----------|------|
+| DELETE 执行中 | 被删行仍可见 | MVCC 快照保证读一致性，搜索查询看到旧版本 |
+| DELETE 提交后 | 被删行不可见 | 新的搜索快照不再包含已删除条目 |
+| autovacuum 清理前 | 索引仍占空间 | 死元组仍在 GIN 索引中，可能略微拖慢搜索 |
+
+#### 5.2.3 大批清理后的索引维护
+
+大量删除（如一次清理几十万条）后：
+- **GIN 索引产生大量死元组**，搜索查询需要过滤无效指针
+- 搜索性能可能下降 10%-30%，持续到 autovacuum 完成
+- 建议：大批清理后手动执行 `VACUUM ANALYZE entries`，或直接 `REINDEX INDEX CONCURRENTLY`
+
+**配置调优**：
+| 参数 | 默认值 | 建议值（大批量场景） |
+|-----|-------|------------------|
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | 1000 ~ 5000（减小锁持有时间） |
+| `CLEANUP_FREQUENCY_HOURS` | 24 | 12（更频繁小批量清理） |
+
+### 5.3 多 Reader 并发查询的锁竞争与 MVCC
+
+#### 5.3.1 锁竞争分析
+
+**全文搜索查询的锁行为**：
+
+搜索查询是纯 `SELECT` 语句，获取的是最轻量级的 `AccessShareLock`：
+
+```sql
+-- 典型搜索 SQL
+SELECT e.id, e.title, ...
+FROM entries e
+WHERE e.user_id = $1
+  AND e.document_vectors @@ websearch_to_tsquery($2)
+ORDER BY ts_rank(document_vectors, websearch_to_tsquery($2)) 
+       - extract(epoch from now() - published_at)::float * 0.0000001 DESC
+LIMIT $3 OFFSET $4
+```
+
+**与写入操作的锁兼容性**：
+
+| 操作 | 锁级别 | 是否阻塞搜索 | 是否被搜索阻塞 |
+|-----|-------|------------|--------------|
+| 全文搜索（SELECT） | AccessShareLock | - | - |
+| 创建/更新条目（INSERT/UPDATE） | RowExclusiveLock | 否 | 否 |
+| ArchiveEntries 删除 | RowExclusiveLock | 否（SKIP LOCKED） | 否 |
+| CREATE INDEX | ShareLock | 否 | 是 |
+| REINDEX（非并发） | ShareLock | 否 | 是 |
+| VACUUM FULL / ALTER TABLE | AccessExclusiveLock | **是** | **是** |
+
+**结论**：多个 reader 并发搜索 entries 表时**无任何锁竞争**，搜索与常规写入（INSERT/UPDATE/DELETE）也互不阻塞。只有 DDL 级操作（ALTER TABLE、VACUUM FULL、非并发 REINDEX）会阻塞搜索。
+
+#### 5.3.2 PostgreSQL MVCC 对搜索的影响
+
+**快照一致性**：
+- 每个搜索查询获取一个 MVCC 快照（snapshot）
+- 查询期间看到的是快照时刻的数据版本，不受后续并发写入影响
+- 保证单次搜索结果的一致性（不会出现"搜一半出现新条目"）
+
+**可见性规则对搜索结果的影响**：
+| 场景 | 搜索是否可见 | 说明 |
+|-----|------------|------|
+| 已提交的新条目 | 是 | 快照包含提交后的行 |
+| 未提交的新条目 | 否 | 遵循 MVCC 未提交读不可见 |
+| 已提交删除的条目 | 否 | xmax 已提交，被过滤 |
+| 事务中删除未提交 | 是 | xmax 未提交，仍可见 |
+| 正在更新的条目 | 旧版本 | 看到更新前的 tsvector |
+
+**长查询风险**：
+- 搜索查询如果执行时间很长（秒级以上），可能持有旧快照
+- 旧快照阻止 autovacuum 回收死元组，导致表膨胀
+- Miniflux 搜索通常有 `LIMIT`（默认 `EntriesPerPage`，一般 20-100），执行时间通常在毫秒级，风险低
+
+#### 5.3.3 GIN 索引并发更新的性能影响
+
+GIN 索引的并发写入性能特点：
+- **写入放大**：单条 entry 更新可能需要修改倒排索引中几十个 posting list
+- **Pending list**：并发写入时各 session 先写 pending list，后台批量合并
+- **搜索开销**：pending list 越大，搜索越慢（需同时扫描主索引和 pending list）
+- **监控指标**：可通过 `pg_stat_user_indexes.idx_scan` 和 `pg_stat_gin` 观察索引健康度
+
+### 5.4 Schema Migration 时的 document_vectors 回填策略
+
+#### 5.4.1 第 20 次迁移：首次引入全文索引（migrations.go:278-285）
+
+```sql
+-- 单事务内三步操作
+ALTER TABLE entries ADD COLUMN document_vectors tsvector;                                  -- Step 1: 加列
+UPDATE entries SET document_vectors = to_tsvector(                                        -- Step 2: 全表回填
+    substring(title || ' ' || coalesce(content, '') for 1000000));
+CREATE INDEX document_vectors_idx ON entries USING gin(document_vectors);                 -- Step 3: 建 GIN 索引
+```
+
+**过渡期行为**（迁移期间，从 Step 1 完成到整个事务提交）：
+
+| 时间点 | document_vectors 状态 | 新写入条目行为 | 搜索查询行为 |
+|-------|---------------------|--------------|------------|
+| Step 1 前 | 列不存在 | - | 无法使用全文搜索（代码尚未部署） |
+| Step 1 完成，Step 2 执行中 | 旧行 = NULL，正在逐行更新 | INSERT/UPDATE 触发的 `to_tsvector()` 正常写入新行 | 若此时部署新代码搜索，`@@` 匹配 NULL 返回 NULL → 结果为空 |
+| Step 2 完成，Step 3 执行中 | 所有行有值 | 同上 | 但无索引，走全表 seq scan，极慢 |
+| 事务提交完成 | 列有值 + 索引就绪 | 正常 | 正常使用 GIN 索引 |
+
+**风险与缓解**：
+- **迁移时间**：百万级 entries 表可能需要几十分钟到几小时
+- **停机风险**：ALTER TABLE ADD COLUMN（PG 11+）仅需毫秒，全表 UPDATE 是瓶颈
+- **部署顺序**：必须先完成数据库迁移，再部署含搜索功能的代码，否则搜索报错
+
+#### 5.4.2 第 21 次迁移：引入权重分级（migrations.go:292-300）
+
+```sql
+UPDATE entries
+SET document_vectors = 
+    setweight(to_tsvector(substring(coalesce(title, '') for 1000000)), 'A') 
+    || setweight(to_tsvector(substring(coalesce(content, '') for 1000000)), 'B')
+```
+
+**过渡期行为**：
+- 全表重算 document_vectors，单事务执行
+- 执行期间：旧条目使用旧格式（无权重，默认权重 `D`），新写入使用新格式（A/B 权重）
+- 搜索查询兼容两种格式：`ts_rank` 对有权重和无权重的 tsvector 均可正常计算
+- **结果差异**：迁移完成前，标题匹配的条目排名可能偏低（使用默认权重 D 而非 A）
+
+#### 5.4.3 第 75 次迁移：改为部分索引（migrations.go:1400-1414）
+
+```sql
+DROP INDEX document_vectors_idx;
+CREATE INDEX document_vectors_idx
+    ON entries USING gin(document_vectors)
+    WHERE status != 'removed';
+```
+
+**过渡期行为**（DROP 完成到 CREATE 提交之间）：
+- **无索引窗口**：DROP 后 CREATE 前，搜索无索引可用，走全表扫描
+- 若 `entries` 表很大，此窗口可达数十分钟，搜索完全不可用
+- **改进**：应使用 `CREATE INDEX CONCURRENTLY` + 事务外执行
+
+#### 5.4.4 第 77 次迁移：恢复全量索引（migrations.go:1470-1497）
+
+```sql
+-- 先清理 removed 状态的条目
+DELETE FROM entries WHERE status = 'removed';
+
+-- 删除旧部分索引，重建全量索引
+DROP INDEX document_vectors_idx;
+CREATE INDEX document_vectors_idx
+    ON entries USING gin(document_vectors);
+```
+
+**过渡期行为**：
+- 同第 75 次迁移，存在无索引窗口
+- 同时还有 DELETE 操作产生的大量死元组
+- 迁移后建议立即 `VACUUM ANALYZE entries`
+
+#### 5.4.5 迁移的最佳实践（现有代码的不足）
+
+当前迁移实现存在的问题：
+1. **无分批回填**：`UPDATE entries` 单条 SQL 全表更新，长事务可能导致 replication slot 延迟或锁等待
+2. **无 CONCURRENTLY**：索引创建使用普通 `CREATE INDEX`，期间阻塞写入
+3. **无进度跟踪**：无法获知迁移进度，无法预估剩余时间
+4. **无降级策略**：搜索代码未处理 `document_vectors IS NULL` 的情况
+
+**建议的改进**：
+```sql
+-- 替代方案：分批回填（应用层实现）
+-- 1. 加列（快速）
+ALTER TABLE entries ADD COLUMN document_vectors tsvector;
+
+-- 2. 分批更新（每批 1000 条，循环执行）
+UPDATE entries 
+SET document_vectors = setweight(to_tsvector(title), 'A') || setweight(to_tsvector(content), 'B')
+WHERE id IN (
+    SELECT id FROM entries WHERE document_vectors IS NULL ORDER BY id LIMIT 1000
+);
+
+-- 3. 并发建索引（不阻塞读写）
+CREATE INDEX CONCURRENTLY document_vectors_idx 
+    ON entries USING gin(document_vectors);
+```
+
+---
+
+## 六、技术要点总结
+
+### 6.1 索引写入时机
 
 - **同步写入**：索引在条目创建/更新时同步计算并写入
 - **事务保证**：索引写入与数据写入在同一事务中，保证一致性
 
-### 5.2 性能优化
+### 6.2 性能优化
 
 1. **GIN 索引**：使用倒排索引加速全文匹配
 2. **文本截断**：限制索引大小，避免超出 PostgreSQL 限制
 3. **权重分级**：标题权重高于内容，提升搜索准确性
 4. **时间衰减排序**：平衡相关性和时效性
 
-### 5.3 查询边界与安全
+### 6.3 查询边界与安全
 
 **空查询**：
 - `query != ""` 校验，空字符串静默降级为常规查询，不抛错
@@ -415,7 +683,7 @@ func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *stor
 - `websearch_to_tsquery` 语法字符（`"`、`-`、`OR`）保留特殊语义
 - 语法错误（如未闭合引号）返回 500 错误，无友好提示
 
-### 5.4 时间衰减系数
+### 6.4 时间衰减系数
 
 **硬编码位置**：`internal/storage/entry_query_builder.go:55`
 - 系数值：`0.0000001`，注释说明 `0.1 / (seconds_in_a_day)`
@@ -428,7 +696,7 @@ func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *stor
   - 技术博客：`0.0000001`（默认值，平衡质量与时效）
   - 知识库：`0` ~ `0.00000001`（质量优先）
 
-### 5.5 多语言支持现状
+### 6.5 多语言支持现状
 
 **文本搜索配置**：
 - 使用 PostgreSQL 默认配置 `pg_catalog.english`
@@ -441,7 +709,7 @@ func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *stor
 - 需安装第三方扩展：`pg_jieba`（中/日）、`zhparser`（中）、`mecab`（日）
 - Miniflux 未提供自动配置支持
 
-### 5.6 查询语法
+### 6.6 查询语法
 
 使用 PostgreSQL 的 `websearch_to_tsquery`，支持：
 - 简单关键词搜索
@@ -449,14 +717,17 @@ func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *stor
 - OR 操作符
 - 排除（减号前缀）
 
-### 5.7 相关文件清单
+### 6.7 相关文件清单
 
 | 文件路径 | 主要职责 |
 |---------|---------|
 | `internal/database/migrations.go` | 数据库迁移，定义索引结构 |
-| `internal/storage/entry.go` | 索引写入逻辑（创建/更新） |
+| `internal/storage/entry.go` | 索引写入逻辑（创建/更新）、ArchiveEntries 批量清理 |
 | `internal/storage/entry_query_builder.go` | 查询构建，搜索条件与排序 |
 | `internal/storage/entry_pagination_builder.go` | 搜索结果分页导航 |
 | `internal/ui/search.go` | Web UI 搜索页面 |
 | `internal/ui/entry_search.go` | Web UI 搜索条目详情 |
 | `internal/api/entry_handlers.go` | REST API 搜索接口 |
+| `internal/cli/cleanup_tasks.go` | 定期清理任务（批量删除旧条目） |
+| `internal/config/options.go` | 清理批量大小、频率等配置项 |
+| `internal/database/database.go` | 迁移执行入口 |
