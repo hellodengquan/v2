@@ -899,13 +899,403 @@ interval = max(interval, refreshDelay)  // refreshDelay 就是 retryDelay
 | 轮间补偿 | 如果某 host 上一轮有大量 Feed 被 429 跳过，下一轮适当增加其配额 |
 | 指数退避 | 对 429 的 Feed 采用指数退避，而不是固定的 Retry-After |
 
+#### 13.3.6 429 误计入 parsing_error_count 的缺陷补丁方案
+
+**缺陷根因**：429 是服务端限流（可恢复的瞬时故障），但当前代码将其与 Feed 格式错误（不可恢复的永久故障）混为一谈，共用同一个 `parsing_error_count` 计数器。
+
+**推荐补丁方案**：引入 `transient_error_count`（瞬时错误计数）与 `parsing_error_count`（持久错误计数）分开。
+
+##### 方案设计
+
+| 错误类型 | 计数器 | 阈值 | 触发行为 |
+|---------|-------|-----|---------|
+| 429 限流、5xx 错误、网络超时、DNS 失败 | `transient_error_count` | 可配置（如 10 次） | 达到阈值后拉长间隔，但不永久禁用 |
+| 解析失败、格式错误、4xx 错误 | `parsing_error_count` | 3（当前行为） | 达到阈值后永久禁用（从调度中排除） |
+
+##### 代码修改点清单
+
+**1. 数据模型层（`internal/model/feed.go`）**
+
+```go
+type Feed struct {
+    // ... 现有字段 ...
+    ParsingErrorCount   int    `json:"parsing_error_count"`
+    ParsingErrorMsg     string `json:"parsing_error_message"`
++   TransientErrorCount int    `json:"transient_error_count"`  // 新增
++   TransientErrorMsg   string `json:"transient_error_message"` // 新增
+}
+
+// 新增：瞬时错误计数
+func (f *Feed) WithTransientErrorMessage(message string) {
+    f.TransientErrorCount++
+    f.TransientErrorMsg = message
+}
+
+// 修改：重置所有错误计数器
+func (f *Feed) ResetErrorCounter() {
+    f.ParsingErrorCount = 0
+    f.ParsingErrorMsg = ""
++   f.TransientErrorCount = 0
++   f.TransientErrorMsg = ""
+}
+```
+
+**2. 数据库层（`internal/database/migrations.go`）**
+
+```go
+// 新增迁移脚本
+{
+    id: 100,  // 下一个可用的迁移 ID
+    migrate: func(db *sql.DB) error {
+        _, err := db.Exec(`
+            ALTER TABLE feeds
+            ADD COLUMN transient_error_count int default 0,
+            ADD COLUMN transient_error_msg text default ''
+        `)
+        return err
+    },
+},
+```
+
+**3. 调度筛选层（`internal/storage/batch.go`）**
+
+```go
+// 修改 WithErrorLimit，同时考虑两种错误
+func (b *batchBuilder) WithErrorLimit(parsingLimit, transientLimit int) *batchBuilder {
+    if parsingLimit > 0 {
+        b.conditions = append(b.conditions, "parsing_error_count < $"+strconv.Itoa(len(b.args)+1))
+        b.args = append(b.args, parsingLimit)
+    }
+    if transientLimit > 0 {
+        b.conditions = append(b.conditions, "transient_error_count < $"+strconv.Itoa(len(b.args)+1))
+        b.args = append(b.args, transientLimit)
+    }
+    return b
+}
+```
+
+**4. 刷新处理层（`internal/reader/handler/handler.go`）** — 核心修改点
+
+```go
+// 在 handler.go:245 处，检测到 429 时提前返回
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()
+    calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+    // 使用瞬时错误计数，而不是解析错误计数
+    originalFeed.WithTransientErrorMessage(
+        locale.NewLocalizedErrorWrapper(
+            fmt.Errorf("rate limited by server"),
+            "error.http_too_many_requests",
+        ).Translate(user.Language),
+    )
+    store.UpdateFeedError(originalFeed)  // 需要 UpdateFeedError 也处理 transient 字段
+    return nil  // 提前返回，不走后续解析流程
+}
+```
+
+**5. 错误处理函数（`internal/reader/handler/handler.go:30`）**
+
+```go
+func getTranslatedLocalizedError(store *storage.Storage, userID int64, originalFeed *model.Feed, localizedError *locale.LocalizedErrorWrapper) *locale.LocalizedErrorWrapper {
+    user, _ := store.UserByID(userID)
+    message := localizedError.Translate(user.Language)
+
+    // 根据错误类型选择不同的计数器
+    switch localizedError.ErrorKey {
+    case "error.http_too_many_requests",
+         "error.network_operation",
+         "error.network_timeout",
+         "error.http_client_error":
+        originalFeed.WithTransientErrorMessage(message)  // 瞬时错误
+    default:
+        originalFeed.WithTranslatedErrorMessage(message) // 持久错误
+    }
+
+    store.UpdateFeedError(originalFeed)
+    return localizedError
+}
+```
+
+**6. UpdateFeedError（`internal/storage/feed.go:427`）**
+
+```go
+func (s *Storage) UpdateFeedError(feed *model.Feed) (err error) {
+    query := `
+        UPDATE feeds SET
+            parsing_error_msg=$1,
+            parsing_error_count=$2,
++           transient_error_msg=$3,
++           transient_error_count=$4,
+            checked_at=$5,
+            next_check_at=$6
+        WHERE id=$7 AND user_id=$8
+    `
+    _, err = s.db.Exec(query,
+        feed.ParsingErrorMsg,
+        feed.ParsingErrorCount,
++       feed.TransientErrorMsg,
++       feed.TransientErrorCount,
+        time.Now(),
+        feed.NextCheckAt,
+        feed.ID,
+        feed.UserID,
+    )
+    return err
+}
+```
+
+**7. 配置项（`internal/config/options.go`）**
+
+```go
+"POLLING_TRANSIENT_ERROR_LIMIT": {
+    parsedIntValue: 10,  // 默认 10 次
+    rawValue:       "10",
+    valueType:      intType,
+},
+```
+
+##### 回滚方案
+
+如果补丁引入问题，可以快速回滚：
+- 将 `POLLING_TRANSIENT_ERROR_LIMIT` 设为 0，瞬时错误不做限制
+- 或在 `WithErrorLimit` 中不传入 transientLimit 参数，退化为原有行为
+
 ---
 
-## 14. 多实例 HA 部署下的 Feed 去重机制
+## 14. 10K subscribers 规模下的调度延迟与容量推算
 
-### 14.1 现状：无显式分布式锁，存在竞态风险
+### 14.1 基准假设
 
-**重要结论**：Miniflux v2 的 `FetchJobs()` 查询**没有使用 `SELECT ... FOR UPDATE SKIP LOCKED`** 来防止多实例并发选中同一 Feed。
+基于 Miniflux 单实例典型部署和公开的性能数据，我们假设：
+
+| 参数 | 典型值 | 说明 |
+|------|-------|------|
+| Feed 总数 | 10,000 | 10K subscribers 规模 |
+| 活跃用户 | 1,000 | 10% 的订阅付费用户 |
+| 每用户平均订阅数 | 50 | 10K Feed / 200 活跃用户 |
+| 单 Feed 平均刷新耗时 | 3 秒 | 含 DNS、TCP、HTTP 请求、解析、入库 |
+| Worker 并发数 | 16 | 默认 `WORKER_POOL_SIZE=16` |
+| 调度频率 | 60 分钟 | 默认 `POLLING_FREQUENCY=60` |
+| 304 命中率 | 40% | 源站支持条件请求的比例 |
+| 429/错误率 | 5% | 正常网络环境下的失败率 |
+| 单 Feed 平均新条目数 | 0.2 | 每次刷新平均 0.2 条新内容 |
+
+### 14.2 理论容量计算
+
+**单轮调度总耗时**：
+```
+并行耗时 = (Feed 总数 / Worker 数) × 单 Feed 平均耗时
+         = (10,000 / 16) × 3s
+         = 625 × 3s
+         = 1,875 秒 ≈ 31 分钟
+```
+
+**关键结论**：
+- 10K Feed 规模下，单轮调度需要约 **31 分钟** 完成
+- 调度频率为 60 分钟，因此单实例**完全可以支撑** 10K Feed
+- 预留约 29 分钟的空闲时间（~48% 利用率），用于应对峰值和突发流量
+
+**考虑 304 命中率后的实际耗时**：
+```
+304 快速路径耗时：~0.5 秒（无需解析和入库）
+200 正常路径耗时：~4 秒（完整流程）
+
+加权平均耗时 = 40% × 0.5s + 60% × 4s
+             = 0.2s + 2.4s
+             = 2.6 秒/Feed
+
+实际总耗时 = 625 × 2.6s = 1,625 秒 ≈ 27 分钟
+```
+
+考虑 304 后，实际耗时降低到约 **27 分钟**，利用率约 45%。
+
+### 14.3 调度延迟分析
+
+**调度延迟**指的是 Feed 到期到实际被刷新的等待时间。
+
+**最坏情况延迟**：
+```
+如果所有 Feed 同时到期，最后一个 Feed 需要等待：
+(Feed 总数 / Worker 数 - 1) × 单 Feed 耗时
+= 624 × 3s = 1,872 秒 ≈ 31 分钟
+```
+
+**平均延迟**（基于 `ORDER BY next_check_at ASC`）：
+```
+由于 Feed 的 next_check_at 均匀分布，平均等待时间约为单轮耗时的 50%
+= 27 分钟 × 50% ≈ 13.5 分钟
+```
+
+**延迟与调度频率的关系**：
+| 调度频率 | 理论最小平均延迟 | 10K Feed 实际平均延迟 |
+|---------|-----------------|----------------------|
+| 15 分钟 | ~3.75 分钟 | ~13.5 分钟（受限于处理能力） |
+| 30 分钟 | ~7.5 分钟 | ~13.5 分钟 |
+| 60 分钟 | ~15 分钟 | ~13.5 分钟（处理能力足够） |
+| 120 分钟 | ~30 分钟 | ~27 分钟 |
+
+**重要发现**：
+- 当调度频率 ≤ 60 分钟时，10K Feed 规模下**平均延迟由处理能力决定**，不是调度频率
+- 继续缩短调度频率（如从 60 分钟降到 15 分钟）不会显著降低延迟
+- 要降低延迟，需要增加 Worker 并发数或优化单 Feed 处理耗时
+
+### 14.4 资源需求估算
+
+**CPU 需求**：
+- 16 个 Worker 满载时约占用 4-6 个 CPU 核心（解析和哈希计算是 CPU 密集型）
+- 推荐配置：8 核 CPU
+
+**内存需求**：
+- 每个 Worker 处理 Feed 时约占用 10-20MB（主要是 HTTP 响应体和解析树）
+- 16 个 Worker 峰值约 320MB
+- 加上数据库缓存和系统开销，推荐配置：4GB 内存
+
+**网络带宽**：
+- 假设平均每个 Feed 响应体 50KB
+- 10K Feed × 60KB = ~600MB/轮 = ~0.2Mbps 持续流量
+- 峰值（刷新开始时）可能达到 16 × 50KB/s = ~800KB/s = ~6.4Mbps
+- 推荐带宽：10Mbps 上行
+
+**数据库压力**：
+- 每轮调度：10,000 次 Feed 更新 + 平均 2,000 条新条目入库
+- ~每秒 10-15 次数据库写入
+- PostgreSQL 单实例完全可以承受
+
+### 14.5 横向扩展容量模型
+
+| Feed 规模 | 单轮耗时 | 推荐 Worker 数 | 推荐 CPU | 推荐内存 |
+|----------|---------|--------------|---------|---------|
+| 1K | ~3 分钟 | 8 | 4 核 | 2GB |
+| 5K | ~14 分钟 | 16 | 8 核 | 4GB |
+| **10K** | **~27 分钟** | **16** | **8 核** | **4GB** |
+| 20K | ~54 分钟 | 24 | 16 核 | 8GB |
+| 50K | 单实例瓶颈 | 需要多实例分片 | - | - |
+
+**10K 是单实例的舒适区上限**：
+- 超过 20K Feed，单轮耗时将接近或超过 60 分钟的调度间隔
+- 超过 50K Feed，需要采用分片架构（按用户/Feed ID 哈希分片到不同实例）
+
+### 14.6 运营预算参考
+
+| 项目 | 单实例 10K 规模月成本（AWS） |
+|------|---------------------------|
+| EC2（c5.2xlarge，8 核 16GB） | ~$280 |
+| RDS（db.t3.large，2 核 8GB） | ~$120 |
+| EBS 存储（100GB SSD） | ~$10 |
+| 数据传输（100GB/月） | ~$10 |
+| **合计** | **~$420/月** |
+
+**自助式部署（裸金属/私有云）**：
+- 硬件成本：一次性投入 ~$2,000（主流服务器）
+- 电费+带宽：~$50/月
+- 折旧期 3 年：约 **$105/月**
+
+---
+
+## 15. Feed TTL 与本地 next_check_at 的优先级规则
+
+### 15.1 TTL 的来源与提取
+
+**TTL（Time To Live）** 是 RSS 2.0 规范中定义的可选字段，指示 Feed 源希望订阅者缓存多长时间。
+
+**提取位置**（`internal/reader/rss/adapter.go:59`）：
+
+```go
+// Get TTL if defined.
+if r.rss.Channel.TTL != "" {
+    if ttl, err := strconv.Atoi(r.rss.Channel.TTL); err == nil {
+        feed.TTL = time.Duration(ttl) * time.Minute
+    }
+}
+```
+
+**TTL 只在 RSS 中存在**：
+- Atom 1.0 和 JSON Feed 规范中**没有 TTL 字段**
+- 但可以通过 HTTP 头 `Cache-Control` / `Expires` 达到类似效果
+- 解析失败时 `TTL` 为 0，表示未设置
+
+### 15.2 优先级决策链
+
+**核心公式**在 `ScheduleNextCheck`（`model/feed.go:137`）：
+
+```go
+interval = max(interval, refreshDelay)
+```
+
+其中 `refreshDelay` 是多源取最大值（`handler.go:300`）：
+
+```go
+refreshDelay := max(feedTTLValue, cacheControlMaxAgeValue, expiresValue)
+```
+
+**完整优先级决策链**：
+
+```
+1. 先根据调度策略计算本地间隔 interval：
+   - round_robin: interval = SchedulerRoundRobinMinInterval()  默认 60min
+   - entry_frequency: interval = (7*24h) / (weeklyCount * factor) （限幅在 5min~24h）
+
+2. 取 refreshDelay = max(Feed TTL, Cache-Control: max-age, Expires - now, Retry-After)
+   - 4 个来源都可能为 0（未设置）
+   - max() 自动忽略 0 值
+
+3. 取 interval = max(interval, refreshDelay)
+   - ↓ 谁更大谁说了算
+
+4. 最后根据策略限幅：
+   - round_robin: interval = min(interval, 24h)
+   - entry_frequency: interval = min(interval, 24h)
+```
+
+### 15.3 谁说了算？场景分析
+
+| 场景 | 本地计算间隔 | Feed TTL | Cache-Control | 最终间隔 | 谁主导 |
+|------|-------------|----------|--------------|---------|-------|
+| 默认配置，无任何缓存提示 | 60 min | 0 | 0 | 60 min | **本地配置** |
+| Feed 设置了短 TTL（15 min） | 60 min | 15 min | 0 | 60 min | **本地配置**（更大） |
+| Feed 设置了长 TTL（120 min） | 60 min | 120 min | 0 | 120 min | **Feed TTL**（更大） |
+| HTTP 长缓存（max-age=3h） | 60 min | 0 | 180 min | 180 min | **HTTP 头**（更大） |
+| entry_frequency 高频源 | 10 min | 0 | 0 | 10 min | **本地自适应** |
+| entry_frequency + 长 TTL | 10 min | 60 min | 0 | 60 min | **Feed TTL** |
+| 429 Retry-After=2h | 60 min | 0 | 0 | 120 min | **服务器指令** |
+
+**关键结论**：
+- **"谁更长谁说了算"** —— `max()` 策略确保永远不会比任何一方建议的更频繁
+- 本地间隔是**下限保障**，确保不会因为 TTL 为 0 或过短而过载
+- Feed TTL / HTTP 缓存头是**上限建议**，源站可以要求更长的刷新间隔
+- 429 Retry-After 是**强制指令**，优先级最高（因为通常是最大的）
+
+### 15.4 边界情况处理
+
+**TTL 格式不合法**（`rss/adapter.go:61`）：
+- `<ttl>invalid</ttl>` → 解析失败 → TTL = 0 → 被 `max()` 忽略
+- 不会导致错误，静默降级
+
+**TTL 为负值或极大值**：
+- TTL 是 `strconv.Atoi` 解析的整数，负值会被转为负的 `time.Duration`
+- `max()` 会忽略负值，仍使用本地间隔
+- 极大值（如 `<ttl>99999999</ttl>`）会被最后的 `min(interval, 24h)` 限幅
+
+**同时设置 TTL 和 Cache-Control**：
+- 取两者中的较大值
+- 这符合"尊重所有缓存提示中的最保守者"的原则
+
+**成功后清零 TTL**：
+- `updatedFeed.TTL` 是每次从 Feed 内容中重新解析的
+- 如果某次刷新时 TTL 从 120min 变为 0，会立即生效，下一轮使用本地间隔
+
+### 15.5 与 SkipHours / SkipDays 的关系
+
+RSS 2.0 还定义了 `<skipHours>` 和 `<skipDays>` 字段，提示聚合器在某些时段不要拉取。
+
+**Miniflux 的处理**：
+- 解析了这两个字段（`rss.go:79, 83`），但**完全没有在调度逻辑中使用**
+- 没有代码在 `ScheduleNextCheck` 或 `FetchJobs` 中检查 SkipHours/SkipDays
+- 属于"解析但不处理"的字段
+
+---
+
+## 16. 多实例 HA 部署下的 Feed 去重机制
 
 **BatchBuilder 的 SQL 查询**（`internal/storage/batch.go:76`）：
 
@@ -1102,7 +1492,7 @@ COMMIT;
 
 ---
 
-## 15. 关键设计要点总结（完整版）
+## 17. 关键设计要点总结（完整版）
 
 1. **调度与执行解耦**：Scheduler 只负责生产 Job，Worker Pool 只负责消费 Job，通过 channel 连接
 2. **无缓冲 channel 背压**：Pool 的 channel 无缓冲，生产速度受限于消费速度，防止任务堆积
@@ -1124,3 +1514,8 @@ COMMIT;
 18. **跨 host 公平性**：遭遇 429 的 host 会主动让出配额，长期看由 `ScheduleNextCheck` 保证各 Feed 的刷新频率
 19. **级联失效风险**：同一 host 下大量 Feed 连续 429 可能导致 error_count 全部超标，形成"死区"需人工干预
 20. **运营识别手段**：通过 Prometheus metrics、日志关键字、数据库更新频率可以判断是否有多实例同时调度
+21. **transient_error_count 补丁方案**：引入瞬时错误与持久错误分开计数，7 处代码修改点可修复 429 误禁用缺陷
+22. **10K Feed 容量**：单实例 16 Worker 可在 ~27 分钟内刷完 10K Feed，平均延迟 ~13.5 分钟，月成本约 $420（AWS）
+23. **TTL 优先级**：谁更长谁说了算，`max(本地间隔, Feed TTL, Cache-Control, Expires, Retry-After)`，最终限幅 24h
+24. **SkipHours/SkipDays 未使用**：RSS 规范定义的时段跳过字段已解析但未在调度中生效
+25. **单实例舒适区上限**：10K Feed 是单实例舒适区，超过 20K 需增加 Worker，超过 50K 需多实例分片
