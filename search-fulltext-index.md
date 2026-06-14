@@ -434,9 +434,132 @@ SELECT
     pg_size_pretty(pg_relation_size('entries')) AS table_size;
 ```
 
-### 5.2 大批清理时的索引处理
+### 5.2 索引可观测性接入方案
 
-#### 5.2.1 清理机制
+Miniflux 内置 Prometheus 指标（`internal/metric/metric.go`），但**未直接暴露全文索引相关指标**。现有 Grafana Dashboard（`contrib/grafana/dashboard.json`）也未包含搜索性能面板。
+
+#### 5.2.1 现有监控体系
+
+**已暴露的指标**（与索引间接相关）：
+
+| 指标名称 | 说明 | 采集源 |
+|---------|------|-------|
+| `miniflux_db_open_connections` | 数据库连接数 | Go `sql.DBStats` |
+| `miniflux_entries{status}` | 各状态条目总数 | `CountAllEntries()` |
+| `miniflux_archive_entries_duration_seconds` | 归档清理耗时 | Prometheus Histogram |
+
+**缺失的全文索引指标**：
+- GIN 索引扫描次数（`idx_scan`）
+- 索引读取元组数（`idx_tup_read` / `idx_tup_fetch`）
+- 索引膨胀率
+- 搜索查询 P95/P99 响应时间
+- pending list 大小（GIN 特有）
+
+#### 5.2.2 pg_stat_user_indexes 监控接入
+
+通过扩展 `metric/metric.go` 或独立 Prometheus exporter（如 `postgres_exporter`）采集：
+
+```sql
+-- 索引使用率查询
+SELECT
+    idx_scan,           -- 索引扫描次数（持续增长为健康）
+    idx_tup_read,       -- 从索引读取的元组数
+    idx_tup_fetch,      -- 通过索引从表中取到的有效元组数
+    idx_blks_read,      -- 磁盘块读取数（高值意味着缓存命中率低）
+    idx_blks_hit        -- 缓存命中数
+FROM pg_stat_user_indexes
+WHERE indexrelname = 'document_vectors_idx';
+
+-- 索引大小与膨胀估算
+SELECT
+    pg_size_pretty(pg_relation_size('document_vectors_idx')) AS idx_size,
+    pg_size_pretty(pg_indexes_size('entries')) AS total_idx_size,
+    (n_dead_tup::float / NULLIF(n_live_tup + n_dead_tup, 0)) * 100 AS dead_ratio_pct
+FROM pg_stat_user_tables
+WHERE relname = 'entries';
+
+-- GIN 索引 pending list 大小（PG 12+）
+SELECT pending_bytes, pending_tuples
+FROM pg_stat_gin
+WHERE indexrelid = 'document_vectors_idx'::regclass;
+```
+
+**Grafana 建议面板**：
+1. **索引扫描频率**：`rate(idx_scan[5m])` - 监控搜索使用量
+2. **索引效率**：`idx_tup_fetch / idx_tup_read` - 接近 1 为高效，小于 0.5 意味着索引匹配度低
+3. **缓存命中率**：`idx_blks_hit / (idx_blks_hit + idx_blks_read)` - 低于 95% 需增加 `shared_buffers`
+4. **死元组比例**：`dead_ratio_pct` - 超过 20% 需手动 VACUUM
+
+#### 5.2.3 Slow Query Log 捕获搜索慢查询
+
+**PostgreSQL 配置**：
+
+```ini
+log_min_duration_statement = 1000    # 记录超过 1 秒的查询
+log_statement = 'none'               # 不记录所有语句（避免敏感信息）
+log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a '
+```
+
+**搜索相关慢查询特征识别**：
+- 包含 `document_vectors @@ websearch_to_tsquery`
+- 包含 `ts_rank(document_vectors, ...)`
+- 计划中出现 `Bitmap Heap Scan on entries` 但 `Bitmap Index Scan` 行数极少，或出现 `Seq Scan`
+
+**典型慢查询场景**：
+1. **全表扫描**：`EXPLAIN` 显示 `Seq Scan on entries` → 索引未生效
+2. **高选择性词**：搜索高频词（如 `"the"`）匹配百万行，耗时可能达到秒级
+3. **pending list 膨胀**：GIN pending list 超过 `gin_pending_list_limit`，查询被迫合并
+
+**日志分析工具**：
+- `pgBadger`：生成慢查询报告
+- `pg_stat_statements`：
+  ```sql
+  SELECT query, calls, total_time, mean_time, rows
+  FROM pg_stat_statements
+  WHERE query LIKE '%document_vectors%'
+  ORDER BY total_time DESC
+  LIMIT 20;
+  ```
+
+#### 5.2.4 应用层指标扩展方案
+
+通过修改 `internal/metric/metric.go` 新增搜索指标：
+
+```go
+// 新增指标定义（需修改源码）
+var (
+    SearchQueryDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Namespace: "miniflux",
+            Name:      "search_query_duration_seconds",
+            Help:      "Search query processing time",
+            Buckets:   prometheus.DefBuckets,
+        },
+        []string{"status"},
+    )
+    
+    SearchIndexScanCount = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Namespace: "miniflux",
+            Name:      "search_index_scans_total",
+            Help:      "Total number of GIN index scans for search",
+        },
+        []string{"user_id"},
+    )
+)
+```
+
+在 `internal/ui/search.go` 和 `internal/api/entry_handlers.go` 中埋点：
+```go
+startTime := time.Now()
+// ... 执行搜索查询 ...
+duration := time.Since(startTime).Seconds()
+metric.SearchQueryDuration.WithLabelValues("success").Observe(duration)
+```
+
+### 5.3 大批清理时的索引处理
+
+#### 5.3.1 清理机制
 
 **清理入口**：`internal/cli/cleanup_tasks.go:16` 的 `runCleanupTasks`
 
@@ -465,7 +588,7 @@ SELECT feed_id, hash FROM deleted WHERE hash <> ''
 ON CONFLICT (feed_id, hash) DO NOTHING
 ```
 
-#### 5.2.2 锁与并发控制
+#### 5.3.2 锁与并发控制
 
 **关键设计**：
 - `FOR UPDATE SKIP LOCKED`：行级排他锁，但跳过已被其他事务锁定的行
@@ -480,7 +603,7 @@ ON CONFLICT (feed_id, hash) DO NOTHING
 | DELETE 提交后 | 被删行不可见 | 新的搜索快照不再包含已删除条目 |
 | autovacuum 清理前 | 索引仍占空间 | 死元组仍在 GIN 索引中，可能略微拖慢搜索 |
 
-#### 5.2.3 大批清理后的索引维护
+#### 5.3.3 大批清理后的索引维护
 
 大量删除（如一次清理几十万条）后：
 - **GIN 索引产生大量死元组**，搜索查询需要过滤无效指针
@@ -652,6 +775,172 @@ CREATE INDEX CONCURRENTLY document_vectors_idx
     ON entries USING gin(document_vectors);
 ```
 
+#### 5.4.6 索引迁移在线与离线方案对比
+
+索引重建和迁移有多种方案，需根据停机容忍度和数据规模选择：
+
+| 方案 | 工具/语法 | 锁级别 | 停机时间 | 速度 | 适用场景 |
+|-----|----------|-------|---------|------|---------|
+| **离线方案** | `REINDEX INDEX` | ShareLock | 阻塞写入，不阻塞读取 | 最快（1x） | 维护窗口、非高峰时段 |
+| **在线方案 A** | `REINDEX INDEX CONCURRENTLY` | 无长期锁 | **零停机** | 慢（2-3x） | 生产环境、无法停机 |
+| **在线方案 B** | `pg_repack --index` | 无长期锁 | **零停机** | 较快（1.5-2x） | 大索引、需回收空间 |
+| **在线方案 C** | `CREATE INDEX CONCURRENTLY` + 重命名 | 无长期锁 | **零停机** | 慢（2-3x） | 需保留旧索引兜底 |
+| **离线重建表** | `pg_repack --table` 或 `VACUUM FULL` | AccessExclusiveLock | **完全停机** | 最快 | 整表膨胀严重、维护窗口 |
+
+**各方案详细对比**：
+
+| 维度 | `REINDEX`（离线） | `REINDEX CONCURRENTLY` | `pg_repack` |
+|-----|------------------|----------------------|------------|
+| 阻塞写入 | 是 | 否 | 否 |
+| 阻塞读取 | 否 | 否 | 否 |
+| 可中断 | 否（中断则索引损坏） | 是（中断需手动清理） | 是 |
+| 事务内执行 | 是 | 否（特殊实现） | 否 |
+| 额外磁盘空间 | 0 | 约等于索引大小 | 约等于索引大小 |
+| GIN 支持 | 完全支持 | PostgreSQL 12+ 支持 | 完全支持 |
+| 回收空间 | 是（完全重排） | 是（完全重排） | 是（完全重排） |
+| 风险 | 锁等待导致连接堆积 | 失败后残留无效索引 | 扩展需单独安装 |
+
+**生产环境推荐方案决策树**：
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    是否有维护窗口?                   │
+├───────────────┬─────────────────────────────────────┤
+│       是      │  否                                 │
+│               │                                     │
+│   REINDEX     │  ┌──────────────────────────────┐   │
+│   (最快)      │  │   GIN pending list 很大?      │   │
+│               │  ├──────────┬───────────────────┤   │
+│               │  │    是    │ 否                │   │
+│               │  │          │                   │   │
+│               │  │ pg_repack│ REINDEX CONCURRENTLY│ │
+│               │  │ (更快)   │ (简单可靠)         │   │
+└───────────────┴──────────┴──────────────────────┘   │
+                                                         └───────────┘
+```
+
+**`REINDEX CONCURRENTLY` 注意事项**：
+1. 不能在事务块内执行
+2. 若失败会残留 `invalid` 状态的索引，需手动 `DROP INDEX CONCURRENTLY`
+3. 期间表会被扫描两次，I/O 开销翻倍
+4. 需确保 `statement_timeout` 设置足够大（至少数小时）
+
+```sql
+-- 安全的在线重建脚本
+SET statement_timeout = 0;            -- 禁用超时
+SET lock_timeout = 0;
+
+-- 1. 检查是否有无效索引
+SELECT indexrelname, indisvalid 
+FROM pg_index i JOIN pg_class c ON i.indexrelid = c.oid
+WHERE c.relname = 'document_vectors_idx';
+
+-- 2. 执行重建
+REINDEX INDEX CONCURRENTLY document_vectors_idx;
+
+-- 3. 验证结果
+SELECT indisvalid, indisready 
+FROM pg_index WHERE indexrelid = 'document_vectors_idx'::regclass;
+
+-- 4. 更新统计信息
+ANALYZE entries;
+```
+
+### 5.5 多副本 Streaming Replication 部署
+
+Miniflux 代码本身不感知数据库复制拓扑，但部署在多副本架构时需关注 GIN 索引的特殊行为。
+
+#### 5.5.1 GIN 索引在 Standby 上的复制行为
+
+**流式复制机制**：
+- Primary 上的 GIN 索引变更通过 WAL（Write-Ahead Log）复制到 Standby
+- GIN 的 pending list 合并操作会产生大量 WAL 记录
+- Standby 重放 WAL 时会同步更新索引，但有延迟
+
+**GIN 索引的特殊问题**：
+1. **WAL 膨胀风险**：GIN pending list 批量合并会产生大量 WAL，可能导致复制延迟突增
+2. **Hot Standby 查询冲突**：Standby 上运行的长搜索查询可能与 WAL 重放冲突，导致查询被取消（`canceling statement due to conflict with recovery`）
+3. **pending list 状态**：Standby 上的 GIN pending list 是 Primary 的快照，Standby 自身不做合并
+
+#### 5.5.2 搜索一致性与延迟权衡
+
+**读取路由策略**：
+
+| 策略 | 一致性 | 性能 | 搜索延迟表现 |
+|-----|-------|------|-------------|
+| **全部读 Primary** | 强一致 | 读写竞争，Primary 压力大 | 无延迟，实时 |
+| **全部读 Standby** | 最终一致（延迟数 ms 到数 s） | 读写分离，性能好 | 新条目可能搜不到 |
+| **搜索读 Primary，其他读 Standby** | 搜索强一致，其他最终一致 | 均衡 | 搜索无延迟 |
+| **session 绑定**：写后读走 Primary | 会话内一致 | 较好 | 同一用户写后搜索无延迟 |
+
+**典型复制延迟场景的搜索影响**：
+- **正常情况**：延迟 < 100ms，用户几乎感知不到
+- **pending list 合并**：延迟可能突增至 1-5 秒，期间新条目在 Standby 上搜不到
+- **网络波动**：延迟达分钟级，Standby 搜索结果明显陈旧
+
+#### 5.5.3 Hot Standby 冲突处理
+
+**搜索查询被取消的典型原因**：
+1. **清理冲突**：Primary 的 VACUUM 清理了 Standby 搜索查询仍需要的元组
+2. **锁冲突**：Primary 的 `ALTER TABLE` / `DROP INDEX` 在 Standby 重放时与搜索冲突
+
+**缓解配置（`postgresql.conf`）**：
+
+```ini
+# Standby 配置
+hot_standby_feedback = on              # Standby 告知 Primary 正在读取的元组
+max_standby_streaming_delay = 30s       # WAL 重放最多等 30 秒后取消查询
+
+# Primary 配置
+vacuum_defer_cleanup_age = 1000        # 延迟 1000 个事务后再清理死元组
+
+# GIN 特定优化
+gin_pending_list_limit = 16MB           # 减少单次合并的 WAL 量（默认 4MB）
+```
+
+**Miniflux 应用层适配**：
+
+应用代码可捕获特定 SQLSTATE 并重试路由到 Primary：
+
+```go
+// 需修改 internal/storage/entry_query_builder.go
+// 捕获 40001 (serialization_failure) 和 57P01 (admin_shutdown)
+// 以及 standby 取消错误
+if err != nil {
+    if pqErr, ok := err.(*pq.Error); ok {
+        // 40001 = serialization_failure
+        // 57P01 = admin_shutdown (hot standby conflict)
+        if pqErr.Code == "40001" || pqErr.Code == "57P01" {
+            // 重试路由到 Primary 节点
+            return e.runQueryOnPrimary()
+        }
+    }
+}
+```
+
+#### 5.5.4 多副本部署的 GIN 最佳实践
+
+1. **分离搜索负载**：
+   - 对搜索实时性要求高：搜索查询强制路由到 Primary
+   - 可接受秒级延迟：搜索查询分散到 Standby 节点
+
+2. **监控复制延迟**：
+   ```sql
+   -- 监控复制延迟（秒）
+   SELECT EXTRACT(EPOCH FROM now() - pg_last_xact_replay_timestamp()) 
+          AS replication_lag_seconds
+   FROM pg_stat_wal_receiver;
+   ```
+   延迟超过阈值时自动切换到 Primary。
+
+3. **GIN 优化减少复制压力**：
+   - 调大 `gin_pending_list_limit` 减少合并频率，但增大了搜索时扫描 pending list 的开销
+   - 调小 `gin_pending_list_limit` 增加合并频率但减小单次合并的 WAL 量
+
+4. **避免 DDL 高峰期**：
+   - 索引重建、VACUUM FULL 等操作应避开业务高峰
+   - 此类操作产生的大量 WAL 会导致 Standby 延迟激增，期间搜索一致性无法保证
+
 ---
 
 ## 六、技术要点总结
@@ -717,7 +1006,54 @@ CREATE INDEX CONCURRENTLY document_vectors_idx
 - OR 操作符
 - 排除（减号前缀）
 
-### 6.7 相关文件清单
+### 6.7 可观测性与监控
+
+**现有监控**：
+- Miniflux 内置 Prometheus 指标（`internal/metric/metric.go`），但无全文索引专项指标
+- Grafana Dashboard（`contrib/grafana/dashboard.json`）未包含搜索性能面板
+
+**推荐接入方案**：
+1. **数据库层**：通过 `postgres_exporter` 采集 `pg_stat_user_indexes`、`pg_stat_gin` 指标
+2. **慢查询**：启用 PostgreSQL `log_min_duration_statement = 1000`，结合 `pgBadger` 或 `pg_stat_statements` 分析
+3. **应用层扩展**：修改 `internal/metric/metric.go` 新增 `search_query_duration_seconds` Histogram
+
+**关键监控指标**：
+- `idx_scan` 增长速率（索引使用率）
+- `idx_tup_fetch / idx_tup_read` 比率（索引效率，>0.5 健康）
+- `dead_ratio_pct` 死元组比例（>20% 需 VACUUM）
+- GIN `pending_bytes` / `pending_tuples`（pending list 大小）
+
+### 6.8 索引迁移与重建方案
+
+**方案选择**：
+
+| 方案 | 零停机 | 速度 | 适用场景 |
+|-----|-------|------|---------|
+| `REINDEX INDEX` | 否（阻塞写入） | 1x | 维护窗口 |
+| `REINDEX INDEX CONCURRENTLY` | **是** | 0.3-0.5x | 生产环境，PG 12+ |
+| `pg_repack --index` | **是** | 0.5-0.7x | 大索引，需额外安装 |
+| `VACUUM FULL` | 否（完全停机） | 最快 | 整表严重膨胀 |
+
+**`REINDEX CONCURRENTLY` 注意事项**：
+- 不能在事务内执行
+- 失败后残留 `invalid` 索引，需手动清理
+- I/O 开销翻倍，需避开高峰
+
+### 6.9 多副本部署与一致性
+
+**GIN 索引复制特性**：
+- Primary 的 pending list 合并产生大量 WAL，可能导致 Standby 延迟突增
+- Standby 上搜索可能触发 `hot standby conflict` 被取消
+
+**读取路由策略**：
+- **强一致要求**：搜索强制路由到 Primary
+- **可接受延迟**：搜索分散到 Standby，监控延迟超阈值时切回 Primary
+
+**缓解配置**：
+- Standby: `hot_standby_feedback = on`, `max_standby_streaming_delay = 30s`
+- Primary: `vacuum_defer_cleanup_age = 1000`, `gin_pending_list_limit = 16MB`
+
+### 6.10 相关文件清单
 
 | 文件路径 | 主要职责 |
 |---------|---------|
@@ -731,3 +1067,7 @@ CREATE INDEX CONCURRENTLY document_vectors_idx
 | `internal/cli/cleanup_tasks.go` | 定期清理任务（批量删除旧条目） |
 | `internal/config/options.go` | 清理批量大小、频率等配置项 |
 | `internal/database/database.go` | 迁移执行入口 |
+| `internal/metric/metric.go` | Prometheus 指标定义与采集（可扩展搜索指标） |
+| `internal/http/server/metrics.go` | `/metrics` 端点 |
+| `contrib/grafana/dashboard.json` | Grafana 监控面板（可扩展搜索相关图表） |
+| `contrib/grafana/README.md` | Grafana 配置说明 |
