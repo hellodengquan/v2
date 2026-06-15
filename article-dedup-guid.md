@@ -1076,7 +1076,482 @@ ORDER BY published_at DESC
 
 ---
 
-## 十、相关代码文件速查表
+## 十、Scheduler 调度触发链与刷新频率计算
+
+### 10.1 调度器整体架构
+
+Miniflux 的后台调度器由两个独立的 goroutine 组成：
+
+```
+runScheduler(store, pool)
+    ├─ go feedScheduler(...)   ← Feed 刷新调度
+    └─ go cleanupScheduler(...) ← 清理任务调度
+```
+
+位置：`internal/cli/scheduler.go:15-31`
+
+**两个调度器完全独立**，各自有自己的执行频率和逻辑。
+
+### 10.2 Feed 刷新调度触发链
+
+#### 触发源：`feedScheduler`
+
+位置：`internal/cli/scheduler.go:33-51`
+
+```go
+func feedScheduler(store, pool, frequency, batchSize, errorLimit, limitPerHost) {
+    for range time.Tick(frequency) {   // 按 PollingFrequency 周期触发
+        jobs := store.NewBatchBuilder().
+            WithBatchSize(batchSize).
+            WithErrorLimit(errorLimit).
+            WithoutDisabledFeeds().
+            WithNextCheckExpired().     // 只选 next_check_at < now() 的 Feed
+            WithLimitPerHost(limitPerHost).
+            FetchJobs()
+        
+        if len(jobs) > 0 {
+            pool.Push(jobs)  // 推入 Worker 队列
+        }
+    }
+}
+```
+
+**调度周期配置**：`POLLING_FREQUENCY`，默认 60 分钟。
+
+**调度器不保证"精确到分钟"**，它的工作模式是：
+- 每 `frequency` 分钟醒来一次
+- 从数据库抓取一批"已到期"的 Feed
+- 推给 Worker Pool 并发执行
+- Worker 执行完刷新后更新 `next_check_at`
+
+#### 批任务筛选条件
+
+`batchBuilder.FetchJobs()` 的 SQL 条件：
+
+```sql
+SELECT id, user_id, feed_url FROM feeds
+WHERE -- 可配置多个条件
+  next_check_at < now()           -- 已到期
+  AND disabled IS FALSE           -- 未禁用
+  AND parsing_error_count < $N    -- 错误次数未超限
+ORDER BY next_check_at ASC
+LIMIT $batchSize
+```
+
+然后应用 `limitPerHost` 限制（同一主机名最多选 N 个 Feed）。
+
+位置：`internal/storage/batch.go:75-137`
+
+**设计意图**：
+- 按 `next_check_at` 排序，最久未刷新的优先
+- 每个周期只抓一批，避免瞬间产生过多任务
+- `limitPerHost` 防止对同一主机发起大量并发请求
+
+#### Worker 执行
+
+位置：`internal/worker/worker.go:22-42`
+
+```go
+func (w *worker) Run(queue <-chan model.Job, wg *sync.WaitGroup) {
+    for job := range queue {
+        handler.RefreshFeed(w.store, job.UserID, job.FeedID, false)
+    }
+}
+```
+
+- Worker 数量由 `WORKER_POOL_SIZE` 配置，默认 1 个
+- 每个 Worker 串行处理队列中的 Job
+- `forceRefresh=false`，后台刷新永远不强制刷新
+
+### 10.3 每 Feed 的刷新频率计算
+
+每个 Feed 的 `next_check_at` 由 `ScheduleNextCheck()` 方法在每次刷新后计算。
+
+位置：`internal/model/feed.go:122-149`
+
+```go
+func (f *Feed) ScheduleNextCheck(weeklyCount int, refreshDelay time.Duration) time.Duration {
+    interval := config.Opts.SchedulerRoundRobinMinInterval()  // 默认值
+    
+    // 1. 根据调度策略计算基础间隔
+    if config.Opts.PollingScheduler() == SchedulerEntryFrequency {
+        // 基于条目频率的调度
+        if weeklyCount <= 0 {
+            interval = config.Opts.SchedulerEntryFrequencyMaxInterval()
+        } else {
+            interval = (7 * 24h) / (weeklyCount * factor)
+            interval = clamp(interval, minInterval, maxInterval)
+        }
+    }
+    
+    // 2. 受服务端刷新延迟约束（取较大值）
+    interval = max(interval, refreshDelay)
+    
+    // 3. 限制最大值（防止异常 Feed 刷新间隔过长）
+    interval = min(interval, maxIntervalForScheduler)
+    
+    f.NextCheckAt = time.Now().Add(interval)
+    return interval
+}
+```
+
+#### 两种调度策略
+
+| 策略 | 配置值 | 说明 | 适用场景 |
+|------|--------|------|----------|
+| Round Robin（轮询） | `round_robin`（默认） | 所有 Feed 使用相同的刷新间隔 | 简单、可预测 |
+| Entry Frequency（条目频率） | `entry_frequency` | 根据每周条目数动态计算间隔 | 更智能，活跃度高的 Feed 刷得勤 |
+
+**Round Robin 参数**：
+- `SCHEDULER_ROUND_ROBIN_MIN_INTERVAL`：最小间隔，默认 60 分钟
+- `SCHEDULER_ROUND_ROBIN_MAX_INTERVAL`：最大间隔，默认 24 小时
+
+**Entry Frequency 参数**：
+- `SCHEDULER_ENTRY_FREQUENCY_MIN_INTERVAL`：最小间隔，默认 5 分钟
+- `SCHEDULER_ENTRY_FREQUENCY_MAX_INTERVAL`：最大间隔，默认 24 小时
+- `SCHEDULER_ENTRY_FREQUENCY_FACTOR`：频率因子，默认 1（值越大刷新越频繁）
+
+**计算逻辑**：
+```
+每周条目数 × 因子 = 预期每周刷新次数
+7天 / 预期次数 = 平均刷新间隔
+```
+
+例如：每周 7 篇文章 × 因子 1 = 每天 1 次 → 间隔 24 小时
+例如：每周 168 篇文章 × 因子 1 = 每小时 1 篇 → 间隔 1 小时
+
+#### 刷新延迟（refreshDelay）的来源
+
+`refreshDelay` 是来自服务端的刷新建议，取三者中的最大值：
+
+| 来源 | 对应字段 | 说明 |
+|------|----------|------|
+| RSS TTL | `<ttl>` 元素 | Feed 发布者建议的刷新间隔（分钟） |
+| HTTP Cache-Control | `max-age` 指令 | 响应头中的缓存有效期 |
+| HTTP Expires | `Expires` 头 | 响应头中的过期时间 |
+
+位置：`internal/reader/handler/handler.go:295-315`
+
+```go
+feedTTLValue := updatedFeed.TTL
+cacheControlMaxAgeValue := responseHandler.CacheControlMaxAge()
+expiresValue := responseHandler.Expires()
+refreshDelay := max(feedTTLValue, cacheControlMaxAgeValue, expiresValue)
+```
+
+**设计意图**：尊重服务端的缓存建议，避免过度请求。
+
+#### 完整的间隔计算流程
+
+```
+Round Robin 基础间隔 或 Entry Frequency 计算间隔
+                │
+                ▼
+         与 refreshDelay 取最大值
+                │
+                ▼
+         与最大间隔取最小值（上限保护）
+                │
+                ▼
+         next_check_at = now() + interval
+```
+
+### 10.4 其他刷新触发点
+
+除了后台调度器，还有以下方式可以触发 Feed 刷新：
+
+| 触发方式 | 位置 | forceRefresh | 说明 |
+|----------|------|:------------:|------|
+| 后台调度器 | `internal/cli/scheduler.go:33` | false | 周期性批量刷新 |
+| Web UI 单个刷新 | `internal/ui/feed_refresh.go:18-31` | URL 参数控制 | 用户点击单个 Feed 刷新按钮 |
+| Web UI 全部刷新 | `internal/ui/feed_refresh.go:33-68` | 隐式 false | 用户点击"刷新所有"，走 Worker Pool |
+| Web UI 分类刷新 | `internal/ui/category_refresh.go` | 隐式 false | 刷新某分类下的所有 Feed |
+| API 单个刷新 | `internal/api/feed_handlers.go:67` | false | REST API 调用 |
+| CLI 命令 | `internal/cli/refresh_feeds.go:55` | false | 命令行 `miniflux -refresh-feeds` |
+
+---
+
+## 十一、全部刷新限流保护机制
+
+### 11.1 限流闸口位置
+
+全部刷新（以及分类刷新）有**客户端侧的限流保护**，通过 Web Session 中的时间戳实现。
+
+位置：`internal/ui/feed_refresh.go:37-40`
+
+```go
+if time.Since(sess.LastForceRefresh()) < config.Opts.ForceRefreshInterval() {
+    // 拒绝请求，显示错误提示
+} else {
+    // 执行刷新
+    sess.MarkForceRefreshed()
+}
+```
+
+**相同的逻辑也存在于分类刷新中**：
+位置：`internal/ui/category_refresh.go:32-60`
+
+### 11.2 限流存储：Web Session
+
+限流时间戳存储在 Web Session 的 state 中，随 Session 持久化。
+
+**相关方法**：
+- `LastForceRefresh()`：读取上次强制刷新时间
+- `MarkForceRefreshed()`：记录当前时间为上次强制刷新时间
+- 状态序列化/反序列化：`MarshalState()` / `UnmarshalState()`
+
+位置：`internal/model/web_session.go`
+
+**默认值**：零值 `time.Time{}`（即第一次总是可以刷新）
+
+### 11.3 限流参数
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `FORCE_REFRESH_INTERVAL` | 30 分钟 | 两次"全部刷新"之间的最小间隔 |
+
+### 11.4 分类刷新共享同一限流闸口
+
+分类刷新（`refreshCategoryFeeds`）使用**同一个** `LastForceRefresh()` 时间戳。
+
+也就是说：
+- 点击"刷新所有 Feed" → 记录时间戳
+- 然后立即点"刷新分类 A" → 被限流（因为共享同一时间戳）
+- 或者反过来：先刷分类，再刷全部 → 同样被限流
+
+**设计意图**：防止用户通过反复点击不同分类的刷新按钮来绕过限流。
+
+### 11.5 单个 Feed 刷新不受限
+
+单个 Feed 的刷新（`refreshFeed` 处理器）**没有**限流保护。用户可以随意刷新单个 Feed，无论频率多高。
+
+**原因**：
+- 单个 Feed 刷新代价低
+- 用户可能有正当理由频繁刷新某个 Feed
+- 风险可控（最多就是对单个源请求频繁）
+
+### 11.6 限流仅作用于 Web UI
+
+限流保护**只存在于 Web UI**，以下途径不受 `ForceRefreshInterval` 限制：
+
+- 后台调度器（由 `PollingFrequency` 和 `next_check_at` 控制节奏）
+- API 调用（没有限流保护，依赖 API 认证）
+- CLI 命令行刷新
+
+### 11.7 与 forceRefresh 参数的关系
+
+注意：这里的"强制刷新"有两层含义，不要混淆：
+
+| 概念 | 含义 | 控制参数 |
+|------|------|----------|
+| 全部刷新限流 | 控制"全部刷新"按钮的点击频率 | `FORCE_REFRESH_INTERVAL`（session 级） |
+| forceRefresh 参数 | 控制单次刷新是否跳过缓存、是否更新已有条目 | `?forceRefresh=true`（请求级） |
+
+"全部刷新"虽然叫 "force refresh"，但它的 `forceRefresh` 参数实际上是 false，走的是 Worker Pool 的后台刷新模式。它的"强制"体现在**无视 next_check_at，立即刷新所有到期 Feed**。
+
+---
+
+## 十二、Entries 状态转换全生命周期
+
+### 12.1 状态枚举
+
+当前 Miniflux 的条目状态只有两种有效值：
+
+| 状态 | 常量名 | 说明 |
+|------|--------|------|
+| `unread` | `EntryStatusUnread` | 未读，新条目默认状态 |
+| `read` | `EntryStatusRead` | 已读，用户阅读或手动标记后 |
+
+位置：`internal/model/entry.go:10-16`
+
+**历史状态**：`removed`（已移除）—— 在 v47 迁移中被废除，相关条目转为墓碑记录。
+
+数据库枚举类型 `entry_status` 虽然仍然定义为 `enum('unread', 'read', 'removed')`，但 `removed` 已不再使用。
+
+### 12.2 状态转换图
+
+```
+                             ┌─────────────┐
+                             │  新条目创建  │
+                             └──────┬──────┘
+                                    │
+                                    ▼
+                             ┌─────────────┐
+                    ┌────────│   unread    │────────┐
+                    │        └──────┬──────┘        │
+                    │               │                │
+                    ▼               ▼                ▼
+            用户标记已读     阅读自动标记       全部标为已读
+            (SetEntriesStatus) (ShouldMarkAsReadOnView) (MarkAllAsRead)
+                    │               │                │
+                    ▼               ▼                ▼
+                             ┌─────────────┐
+                             │    read     │
+                             └──────┬──────┘
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+                    ▼               ▼               ▼
+          用户标记未读     清空历史        定时归档
+      (SetEntriesStatus) (FlushHistory)  (ArchiveEntries)
+                    │               │               │
+                    │               ▼               ▼
+                    │        ┌─────────────┐  ┌─────────────┐
+                    └───────→│  entry_     │←→│  entry_     │
+                             │  tombstones │  │  tombstones │
+                             └─────────────┘  └─────────────┘
+                                    ▲
+                                    │
+                              被 Feed 刷新重新摄入？
+                                    │
+                                   否（墓碑拦截）
+```
+
+### 12.3 创建时的默认状态
+
+新条目创建时状态为 `unread`，由数据库默认值保证：
+
+```sql
+CREATE TABLE entries (
+    ...
+    status entry_status default 'unread',
+    ...
+);
+```
+
+位置：`internal/database/migrations.go:86`
+
+`createEntry` 的 INSERT 语句**不设置 status 字段**，完全依赖数据库默认值。
+
+### 12.4 状态转换的触发路径
+
+#### 路径 A：用户手动标记
+
+位置：`internal/storage/entry.go:407-423`
+
+```go
+func (s *Storage) SetEntriesStatus(userID int64, entryIDs []int64, status string) error {
+    UPDATE entries SET status=$1, changed_at=now()
+    WHERE user_id=$2 AND id=ANY($3)
+}
+```
+
+**触发场景**：
+- Web UI 点击条目 → 标记为已读/未读
+- API 调用更新条目状态
+- Fever/Google Reader API 兼容接口
+
+#### 路径 B：阅读自动标记
+
+位置：`internal/model/entry.go:60-74`
+
+```go
+func (e *Entry) ShouldMarkAsReadOnView(user *User) bool {
+    if e.Status != EntryStatusUnread {
+        return false  // 已读的不再标记
+    }
+    if user.MarkReadOnMediaPlayerCompletion && e.Enclosures.ContainsAudioOrVideo() {
+        return false  // 有音视频的条目，播放完成时才标记
+    }
+    return user.MarkReadOnView  // 用户设置
+}
+```
+
+**触发场景**：用户在 Web UI 中打开条目详情页时，如果开启了"查看即标为已读"，则自动标记。
+
+#### 路径 C：全部标为已读
+
+位置：`internal/storage/entry.go:510-525`
+
+```go
+func (s *Storage) MarkAllAsRead(userID int64) error {
+    UPDATE entries SET status='read', changed_at=now()
+    WHERE user_id=$1 AND status='unread'
+}
+```
+
+还有一个按日期的版本：`MarkAllAsReadBeforeDate`。
+
+**触发场景**：
+- Web UI "全部标为已读"按钮
+- API / Fever API
+- Google Reader 兼容 API
+
+#### 路径 D：清空历史
+
+位置：`internal/storage/entry.go:491-508`
+
+```sql
+WITH deleted AS (
+    DELETE FROM entries
+    WHERE user_id=$1 AND status='read' AND starred=false AND share_code=''
+    RETURNING feed_id, hash
+)
+INSERT INTO entry_tombstones (feed_id, hash)
+SELECT feed_id, hash FROM deleted WHERE hash <> ''
+ON CONFLICT (feed_id, hash) DO NOTHING
+```
+
+**触发场景**：用户点击"清空历史"（删除所有已读条目）。
+
+#### 路径 E：定时归档
+
+位置：`internal/storage/entry.go:362-404`
+
+与清空历史类似，但是：
+- 按时间窗口删除（超过保留天数的已读/未读条目）
+- 星标和已分享的条目不归档
+- 批量删除（有数量上限）
+- 自动定时执行
+
+### 12.5 状态转换的边界
+
+#### 状态 → 墓碑
+
+当条目被删除（归档 / 清空历史）时：
+1. 从 `entries` 表删除
+2. 在 `entry_tombstones` 表插入墓碑记录
+3. 状态从"存在"变为"被墓碑标记"
+
+这不是状态字段的变更，而是**整条记录的迁移**。
+
+#### 墓碑 → 状态？
+
+**不可能反向恢复**。一旦进入墓碑，条目就永久消失了。下次 Feed 刷新时：
+- `entryExists()` 查不到（因为已删除）
+- `createEntry()` 的 `WHERE NOT EXISTS` 会被墓碑拦截
+- 返回 `ErrEntryTombstoned`，静默丢弃
+
+因此**墓碑是单向的**：条目 → 墓碑，不会回来。
+
+### 12.6 状态变更的副作用
+
+每次状态变更都会更新 `changed_at` 字段：
+
+```sql
+SET status=$1, changed_at=now()
+```
+
+`changed_at` 用于"历史"页面的排序依据（按变更时间倒序）。
+
+### 12.7 状态校验
+
+在 `validator` 包中对状态值进行合法性校验：
+
+位置：`internal/validator/entry.go:25-29`
+
+```go
+case model.EntryStatusRead, model.EntryStatusUnread:
+    // 合法
+default:
+    return fmt.Errorf("invalid entry status, valid status values are: %q and %q", ...)
+```
+
+只接受 `read` 和 `unread`，不接受 `removed`。
+
+---
+
+## 十三、相关代码文件速查表
 
 | 功能 | 文件路径 | 关键行 |
 |------|----------|--------|
@@ -1116,3 +1591,13 @@ ORDER BY published_at DESC
 | Worker Pool | `internal/worker/pool.go` | 13-45 |
 | Worker 执行体 | `internal/worker/worker.go` | 22-42 |
 | 批任务构建（无行锁） | `internal/storage/batch.go` | 75-137 |
+| Feed 下次刷新时间计算 | `internal/model/feed.go` | 122-149 |
+| 调度总入口 | `internal/cli/scheduler.go` | 15-31 |
+| 全部刷新限流（Web UI） | `internal/ui/feed_refresh.go` | 37-40, 63 |
+| 分类刷新限流 | `internal/ui/category_refresh.go` | 32-60 |
+| Session 限流时间戳 | `internal/model/web_session.go` | LastForceRefresh / MarkForceRefreshed |
+| 条目状态枚举 | `internal/model/entry.go` | 10-16 |
+| 设置条目状态（批量） | `internal/storage/entry.go` | 407-449 |
+| 全部标为已读 | `internal/storage/entry.go` | 510-549 |
+| 条目状态校验 | `internal/validator/entry.go` | 25-29 |
+| 阅读自动标已读判断 | `internal/model/entry.go` | 60-74 |
