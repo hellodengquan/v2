@@ -823,9 +823,10 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ### 7.3 为什么是 feed_id + hash 而不是全局唯一？
 
-1. **同源去重**：用户订阅的不同 Feed 可能有相同内容（如转载），这是正常的
-2. **隔离性**：每个用户/Feed 的条目相互独立
+1. **Feed 内去重**：去重范围限定在单个 Feed 内，不同 Feed 的条目天然独立
+2. **隔离性**：每个用户/Feed 的条目相互独立，同一文章在多个 Feed 中各自有独立记录
 3. **性能**：联合索引查询效率高，范围可控
+4. **跨 Feed 不去重**：同一篇文章被多个 Feed 转载时，在各 Feed 中各有一条独立条目（详见第九章）
 
 ### 7.4 墓碑机制的必要性
 
@@ -835,7 +836,247 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ---
 
-## 八、相关代码文件速查表
+## 八、Schema 升级后历史 Entries 的 Hash 复算与回填
+
+### 8.1 核心结论：Hash 从不复算
+
+**代码中没有任何 entry hash 回填/复算逻辑。**
+
+在整个 `migrations.go`（当前 59 个迁移版本）中，与 `entries` 表相关的变更都是**加列、加索引、修改无关字段**，从未出现过 `UPDATE entries SET hash = ...` 语句。
+
+这意味着：**一旦条目入库，其 Hash 值就永久不变**。无论后续 Schema 如何升级，历史条目的 Hash 保持写入时的值。
+
+### 8.2 迁移调用链
+
+```
+程序启动
+    ↓
+database.Migrate(db)
+    ↓
+读取当前 schema_version → currentVersion
+    ↓
+for version := currentVersion; version < schemaVersion:
+    tx, _ := db.Begin()
+    ↓
+    migrations[version](tx)     ← 逐版本执行迁移函数
+    ↓
+    TRUNCATE schema_version
+    INSERT schema_version (version) VALUES (newVersion)
+    ↓
+    tx.Commit()
+```
+
+**关键特性**：
+- 每个迁移在独立事务中执行
+- 迁移失败会回滚，版本号不变
+- 迁移按版本号严格递增，不可跳过
+
+### 8.3 影响 Hash 语义的潜在变更点
+
+虽然 Hash 值本身不会在迁移中被修改，但以下几类 Schema 变更可能**间接影响 Hash 的语义**：
+
+#### 类型 A：适配器 Hash 计算逻辑变更
+
+如果代码修改了某个适配器中 Hash 的计算方式（如 RSS 适配器对重复 GUID 的处理策略），旧条目的 Hash 与新计算出的 Hash 不一致。
+
+**后果**：
+- 旧条目继续以旧 Hash 存在于数据库中
+- 下次 Feed 刷新时，同一逻辑条目被计算出新 Hash
+- `entryExists()` 查不到旧条目（因为用新 Hash 查旧 Hash）
+- 系统认为这是新条目，**导致重复入库**
+
+**代码中没有任何防护措施**：不检测 Hash 变更、不做 Hash 复算、不做旧数据清理。
+
+**实际风险评估**：在 Miniflux 的版本历史中，Hash 计算逻辑在早期版本确立后未发生过变更。如果未来需要变更，需要：
+1. 编写迁移脚本，按新逻辑重算所有条目的 Hash
+2. 更新墓碑表中对应的 Hash
+3. 处理 Hash 冲突（新逻辑下可能出现的重复）
+
+#### 类型 B：URL 清洗/重写规则变更
+
+URL 清洗在 Hash 计算之后执行，因此规则的变更不影响 Hash。
+
+#### 类型 C：Feed 格式解析器变更
+
+如果解析器对同一 Feed 产出的 GUID/ID 发生变化（如修复解析 bug），会导致 Hash 变化，效果同类型 A。
+
+### 8.4 历次迁移中与 Entries 相关的操作清单
+
+| 迁移版本 | 操作 | 是否影响 Hash |
+|:-------:|------|:------------:|
+| v1 | 创建 entries 表，含 `unique(feed_id, hash)` | — 基线 |
+| v4 | 添加 `starred` 列 | ❌ |
+| v8 | 添加 `comments_url` 列 | ❌ |
+| v10 | 添加 `document_vectors` 列，回填全文搜索向量 | ❌ |
+| v11 | 更新 `document_vectors` 权重算法 | ❌ |
+| v14 | 添加 `changed_at` 列，用 `published_at` 回填 | ❌ |
+| v18 | 添加 `share_code` 列 + 唯一索引 | ❌ |
+| v19 | 添加 `next_check_at` 到 feeds 表 | ❌ |
+| v21 | 添加 `reading_time` 列 | ❌ |
+| v22 | 修正 `created_at = published_at` | ❌ |
+| v23 | 添加 `entries_user_feed_idx` 索引 | ❌ |
+| v25 | 添加 `entries_id_user_status_idx` 索引 | ❌ |
+| v27 | 添加 `entries_feed_id_status_hash_idx` 索引 | ❌ |
+| v28 | 添加 `entries_user_id_status_starred_idx` 索引 | ❌ |
+| v30 | 添加 `tags` 列 | ❌ |
+| v34 | 添加 `entries_feed_url_idx` 索引 | ❌ |
+| v41 | 清理空 tags | ❌ |
+| v44 | 删除 `entries_feed_url_idx` 索引（URL 可能超 btree 上限） | ❌ |
+| v47 | 创建 `entry_tombstones` 表，迁移 `removed` 状态条目 | ❌（Hash 值不变，只是搬迁） |
+| v53 | 删除冗余索引 `entries_feed_idx`、`entries_user_status_idx` | ❌ |
+
+**结论**：全部 59 个迁移版本中，**没有任何一个修改过 entries 表的 hash 值**。
+
+### 8.5 Hash 不可变性的设计代价
+
+**优点**：
+- 简单可靠，不需要复杂的回填逻辑
+- 避免回填过程中的数据一致性风险
+- 唯一索引无需重建
+
+**代价**：
+- Hash 计算逻辑一旦确定就不能随意修改
+- 如果必须修改，需要编写一次性迁移脚本
+- 旧 Hash 和新 Hash 可能对应同一条逻辑条目，但系统无法识别
+
+### 8.6 Enclosure Hash 的迁移先例
+
+虽然 entry hash 从未迁移过，但 `enclosures` 表的 URL 唯一索引有过一次 Hash 算法变更的先例：
+
+**问题**：PostgreSQL 18 在 FIPS 模式下禁用 MD5，导致基于 `md5(url)` 的唯一索引不可用。
+
+**迁移 v59**：
+```sql
+DROP INDEX IF EXISTS enclosures_user_entry_url_unique_idx;
+CREATE UNIQUE INDEX enclosures_user_entry_url_unique_idx
+    ON enclosures (user_id, entry_id, encode(sha256(url::bytea), 'hex'));
+```
+
+**关键差异**：enclosure 的唯一索引是**表达式索引**（基于列值的函数计算），不需要回填数据——只需重建索引。而 entry 的 hash 是**存储列**，如果要变更算法，必须回填所有行的 hash 值，代价完全不同。
+
+---
+
+## 九、跨 Feed 同一 Article 的 Dedup 行为
+
+### 9.1 核心结论：跨 Feed 不去重
+
+Miniflux 的去重机制**严格限定在单个 Feed 内**。同一篇文章出现在多个 Feed 中时，每个 Feed 都会独立存储一条条目，不会被合并或去重。
+
+### 9.2 唯一约束的作用范围
+
+```sql
+-- entries 表的唯一约束
+UNIQUE (feed_id, hash)
+```
+
+**含义**：只有当 `feed_id` 和 `hash` 都相同时才视为重复。
+
+| 场景 | feed_id | hash | 是否重复 | 结果 |
+|------|:-------:|:----:|:--------:|------|
+| 同一 Feed 内同一条目 | 相同 | 相同 | ✅ 重复 | 不重复插入 |
+| 不同 Feed，同一文章（相同 GUID/URL） | 不同 | 相同 | ❌ 不重复 | 各自独立存储 |
+| 同一 Feed 内，不同条目 | 相同 | 不同 | ❌ 不重复 | 正常插入 |
+| 不同 Feed，不同条目 | 不同 | 不同 | ❌ 不重复 | 正常插入 |
+
+### 9.3 跨 Feed 重复的具体场景
+
+#### 场景 A：同一 RSS 源被多次订阅（不同 URL）
+
+即使两个 Feed URL 指向同一内容源（如 `https://example.com/feed` 和 `https://example.com/feed?cat=tech`），只要 Feed URL 不同，它们就是不同的 Feed（`feeds` 表有 `unique(user_id, feed_url)` 约束），条目互不影响。
+
+#### 场景 B：不同来源转载同一文章
+
+同一篇文章被多个独立 Feed 转载：
+- Feed A（原文站点）：GUID = `https://original.com/article-1`
+- Feed B（转载站点）：GUID = `https://repost.com/article-1`
+
+两者 GUID 不同，Hash 自然不同，互不干扰。
+
+#### 场景 C：不同来源但 GUID 恰好相同
+
+某些聚合类 Feed 可能直接透传原文的 GUID：
+- Feed A：GUID = `tag:example.com,2024:article-1`
+- Feed B：GUID = `tag:example.com,2024:article-1`
+
+**此时 Hash 完全相同**，但因为 feed_id 不同，唯一约束 `(feed_id, hash)` 不冲突，两条条目**仍然独立存储**。
+
+### 9.4 Feed 层面的唯一性保证
+
+`feeds` 表的唯一约束确保**同一用户不会订阅相同 URL 的 Feed**：
+
+```sql
+-- feeds 表
+UNIQUE (user_id, feed_url)
+```
+
+位置：`internal/storage/feed.go:62-68`
+
+```go
+func (s *Storage) FeedURLExists(userID int64, feedURL string) bool {
+    var result bool
+    query := `SELECT true FROM feeds WHERE user_id=$1 AND feed_url=$2 LIMIT 1`
+    s.db.QueryRow(query, userID, feedURL).Scan(&result)
+    return result
+}
+```
+
+位置：`internal/storage/feed.go:70-76`
+
+```go
+func (s *Storage) AnotherFeedURLExists(userID, feedID int64, feedURL string) bool {
+    var result bool
+    query := `SELECT true FROM feeds WHERE id <> $1 AND user_id=$2 AND feed_url=$3 LIMIT 1`
+    s.db.QueryRow(query, feedID, userID, feedURL).Scan(&result)
+    return result
+}
+```
+
+**调用时机**：`handler.RefreshFeed()` 在解析 Feed 内容之前（`internal/reader/handler/handler.go:267-270`）。
+
+**作用**：防止同一用户订阅了重复 Feed URL 后产生混淆。这**不是条目级去重**，而是 **Feed 级去重**——阻止同一 URL 的 Feed 被订阅两次。
+
+### 9.5 跨 Feed 条目在各查询路径中的表现
+
+#### 条目列表页
+
+用户在"未读"页面看到的条目列表是**跨 Feed 的**：
+
+```sql
+SELECT ... FROM entries
+WHERE user_id = $1 AND status = 'unread'
+ORDER BY published_at DESC
+```
+
+同一文章在不同 Feed 中的条目**都会显示**，用户会看到重复内容。
+
+#### 搜索
+
+全文搜索 `document_vectors` 也是跨 Feed 的，同一文章的不同 Feed 条目**都会被搜索到**。
+
+#### 已读/未读状态
+
+每个条目有独立的 `status` 字段。同一文章在 Feed A 中标为已读，不影响 Feed B 中的未读状态。
+
+### 9.6 跨 Feed 去重为什么没有实现？
+
+1. **语义模糊**：什么算"同一文章"？GUID 相同？URL 相同？内容相似？没有统一标准。
+2. **Hash 不跨 Feed 可比**：不同 Feed 格式的 Hash 计算策略不同，同一文章在不同格式中可能产出不同 Hash。
+3. **URL 不可靠**：同一文章的 URL 可能因 UTM 参数、重定向等原因不同。
+4. **用户预期**：用户可能主动订阅多个来源以获取不同视角的评论/标注。
+5. **复杂度高**：实现跨 Feed 去重需要模糊匹配或语义分析，代价远超收益。
+
+### 9.7 跨 Feed 重复的缓解手段
+
+虽然代码层面没有跨 Feed 去重，但用户可以通过以下方式缓解：
+
+1. **不订阅重复源**：`FeedURLExists` 在订阅时阻止同一 URL 重复添加
+2. **Feed 过滤规则**：使用 `blocklist_rules` / `keeplist_rules` 过滤不需要的条目
+3. **手动标记已读**：在 UI 中批量标记重复条目为已读
+4. **RSS 合并服务**：在上游使用 RSS 合并工具，将多个源合并后再订阅
+
+---
+
+## 十、相关代码文件速查表
 
 | 功能 | 文件路径 | 关键行 |
 |------|----------|--------|
@@ -865,6 +1106,11 @@ storage.RefreshFeedEntries()     # 入库判定
 | API 清空历史 | `internal/api/entry_handlers.go` | 558-562 |
 | Web UI 清空历史 | `internal/ui/history_flush.go` | 13-21 |
 | 墓碑表迁移 | `internal/database/migrations.go` | 迁移 v47 |
+| Enclosure 索引 MD5→SHA256 | `internal/database/migrations.go` | 迁移 v35/v59 |
+| 数据库迁移执行入口 | `internal/database/database.go` | 13-51 |
+| 全部迁移定义 | `internal/database/migrations.go` | 16-1548 |
+| Feed URL 存在性检查 | `internal/storage/feed.go` | 62-68 |
+| Feed URL 跨 Feed 重复检查 | `internal/storage/feed.go` | 70-76 |
 | 数据库连接池 | `internal/database/postgresql.go` | 14-24 |
 | Feed 调度器（批生成） | `internal/cli/scheduler.go` | 33-51 |
 | Worker Pool | `internal/worker/pool.go` | 13-45 |
