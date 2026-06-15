@@ -111,7 +111,58 @@ for _, value := range []string{atomEntry.ID, atomEntry.Links.originalLink()} {
 | 1 | 条目链接 | `SHA256(link)` |
 | 2 | 标题 + 描述 | `SHA256(title + description)` |
 
-### 1.3 Hash 计算的时机与注意事项
+### 1.3 Hash 算法选型与抗冲突边界
+
+#### 为什么选 SHA-256 而不是其他哈希算法？
+
+Miniflux 的条目 Hash 统一使用 SHA-256（`crypto.SHA256`），而非包内另一个可用的 `HashFromBytes()`（FNV-128a）。选择依据：
+
+| 维度 | SHA-256（条目用） | FNV-128a（HashFromBytes 用） |
+|------|:----------------:|:---------------------------:|
+| 类型 | 加密哈希函数 | 非加密哈希函数 |
+| 输出长度 | 256 bit（64 hex 字符） | 128 bit（32 hex 字符） |
+| 抗碰撞性 | 强（密码学安全） | 弱（易构造碰撞） |
+| 计算速度 | 较慢 | 极快 |
+| 适用场景 | 身份标识、去重键 | 非安全场景的快速哈希 |
+
+**选型理由**：
+- **身份标识需要抗碰撞**：条目 Hash 是数据库唯一约束的组成部分，一旦发生碰撞会导致数据错乱（新条目无法入库、错误地覆盖旧条目）。
+- **计算量可忽略**：每个 feed 刷新一次只计算几十个 Hash，SHA-256 的开销完全可以忽略。
+- **统一输出长度**：64 字符十六进制输出，便于索引存储和比较。
+
+#### 抗冲突边界分析
+
+根据**生日悖论**，在 n 个独立样本中发生至少一次碰撞的概率约为：
+
+```
+P(n) ≈ 1 - e^(-n² / (2 * 2^256))
+```
+
+**关键数值参考**：
+
+| 条目数量（单 feed） | 碰撞概率 | 说明 |
+|:------------------:|:--------:|------|
+| 1 万 | ≈ 0 | 可忽略 |
+| 100 万 | ≈ 0 | 可忽略 |
+| 1 亿 | ≈ 10^-32 | 宇宙级小概率 |
+| 10^18 | ≈ 10^-12 | 仍然极低 |
+| 2^128（约 3.4×10^38） | ≈ 50% | 生日边界 |
+
+**实际场景评估**：
+- 假设一个 Feed 有 10,000 条历史条目，碰撞概率约为 4×10^-70，远低于"服务器被陨石击中"的概率。
+- 即使 Miniflux 实例有 10 万个 Feed，每个 Feed 10 万条条目，全局碰撞概率仍然可以忽略不计。
+- **结论**：SHA-256 对于 Miniflux 的条目去重场景来说，抗冲突性有极大的安全余量。
+
+#### 与 FNV-128a 的对比（为什么不用 FNV）
+
+如果使用 FNV-128a（128 位输出），生日边界约为 2^64 ≈ 1.8×10^19 条，看似也够用，但问题在于：
+- FNV 是**非加密哈希**，攻击者可以**故意构造碰撞**（尽管在 RSS 阅读器场景中威胁不大）
+- FNV 的雪崩效应不如 SHA-256 好，相似输入可能产生相似输出
+- 对于几千条/几万条的规模，两者速度差异可以忽略
+
+因此选用 SHA-256 是一个"宁滥勿缺"的保守设计选择。
+
+### 1.4 Hash 计算的时机与注意事项
 
 **关键设计决策**：Hash 计算发生在 **URL 清洗和重写之前**。
 
@@ -507,15 +558,218 @@ if time.Since(sess.LastForceRefresh()) < config.Opts.ForceRefreshInterval() {
 **保证手段**：
 
 1. **Hash 稳定性**：基于 Feed 原始数据的稳定标识（GUID/ID）计算 Hash，不受内容变化影响
-2. **唯一约束**：`(feed_id, hash)` 联合唯一索引，确保不会重复插入
-3. **先查后插**：通过 `entryExists` 找到已有条目，复用其 ID
-4. **事务保护**：检查和插入在同一事务中，避免并发竞态
+2. **唯一约束兜底**：`(feed_id, hash)` 联合唯一索引，数据库层面确保不会重复插入
+3. **先查后插**：通过 `entryExists` 找到已有条目，复用其 ID（常规路径）
+4. **事务批量处理**：逐条事务提交，配合唯一索引保证最终一致性（并发场景下的兜底）
 
 ---
 
-## 五、从 Hash 计算到入库的完整衔接
+## 五、高并发场景下的 Race 行为分析
 
-### 5.1 调用链路总览
+### 5.1 事务隔离级别
+
+Miniflux 使用 Go 标准库 `database/sql` + `github.com/lib/pq` 驱动连接 PostgreSQL，**没有显式设置事务隔离级别**，因此使用 PostgreSQL 默认的 **`READ COMMITTED`** 隔离级别。
+
+位置：`internal/database/postgresql.go:14-24`（连接池创建，无隔离级别设置）
+
+```go
+db, err := sql.Open("postgres", dsn)
+// ...
+db.SetMaxOpenConns(maxConnections)
+db.SetMaxIdleConns(minConnections)
+db.SetConnMaxLifetime(connectionLifetime)
+```
+
+**READ COMMITTED 的关键特性**：
+- 事务中的每条 SQL 语句看到的是语句开始时的数据库快照
+- 同一事务内，不同语句可能看到不同的数据（因为其他事务在中间提交）
+- 不会出现脏读（读取未提交数据）
+- 可能出现不可重复读和幻读
+
+这意味着：`entryExists()` 和后续的 `createEntry()`/`updateEntry()` 虽然在同一事务中，但它们看到的数据可能不一致，因为中间可能有其他事务提交。
+
+### 5.2 同一 Feed 并发刷新的可能性
+
+首先需要回答：**同一 Feed 会被多个 Worker 同时刷新吗？**
+
+#### 场景分析
+
+| 场景 | 是否会并发刷新同一 Feed | 原因 |
+|------|:---------------------:|------|
+| 单实例 + 后台调度器 | ❌ 不会（默认） | `feedScheduler` 是单 goroutine，每次生成一批 jobs 推入队列，同一 feed 在一批中最多出现一次 |
+| 单实例 + 用户手动刷新 | ⚠️ 可能 | 用户在 Web UI 点击刷新时，直接调用 `RefreshFeed()`，可能与后台 Worker 同时刷新同一 Feed |
+| 单实例 + API 调用 | ⚠️ 可能 | API 直接调用 `RefreshFeed()`，可能与后台 Worker 并发 |
+| 多实例部署 | ✅ 很可能 | 多个实例各有自己的调度器，可能同时选中同一 Feed |
+
+**关键代码证据**：
+
+位置：`internal/cli/scheduler.go:33-51`
+
+```go
+func feedScheduler(...) {
+    for range time.Tick(frequency) {
+        jobs, err := store.NewBatchBuilder().
+            WithBatchSize(batchSize).
+            // ...
+            FetchJobs()    // 仅 SELECT，不锁定行
+        
+        if len(jobs) > 0 {
+            pool.Push(jobs)  // 推入 Worker 队列
+        }
+    }
+}
+```
+
+`FetchJobs()` 只是 `SELECT ... WHERE next_check_at < now()`，**没有 `FOR UPDATE` 或 `SKIP LOCKED`**，因此多实例场景下同一 Feed 可能被多个实例同时选中。
+
+### 5.3 单条目并发插入的 Race 场景
+
+即使同一 Feed 被并发刷新，每个条目也有独立的唯一约束保护。但 `entryExists` + `createEntry` 的模式存在 **TOCTOU（Time-Of-Check, Time-Of-Use）** 竞态。
+
+#### Race 时序图
+
+```
+   Worker A 事务                     Worker B 事务
+───────────────────────────────   ───────────────────────────────
+1. entryExists() → false
+2.                                   entryExists() → false
+3. createEntry() 
+   INSERT ... WHERE NOT EXISTS
+   (检查墓碑，不检查 entries)
+4.                                   createEntry()
+                                       INSERT ... WHERE NOT EXISTS
+                                       (检查墓碑，不检查 entries)
+5. 唯一约束检测 → 成功
+6.                                   唯一约束检测 → 失败！
+                                       (23505 unique_violation)
+7. COMMIT
+                                       回滚/报错
+```
+
+#### 代码中的处理
+
+位置：`internal/storage/entry.go:144-149`
+
+```go
+if errors.Is(err, sql.ErrNoRows) {
+    return ErrEntryTombstoned
+}
+if err != nil {
+    return fmt.Errorf(`store: unable to create entry %q (feed #%d): %v`, entry.URL, entry.FeedID, err)
+}
+```
+
+**注意**：代码只处理了 `sql.ErrNoRows`（墓碑拦截），**没有处理 `unique_violation`（SQLSTATE 23505）**。当并发插入导致唯一约束冲突时，会直接返回错误，而不是静默处理为"已存在"。
+
+#### `INSERT ... WHERE NOT EXISTS` 的原子性边界
+
+`createEntry` 中的 `INSERT ... WHERE NOT EXISTS` **只检查墓碑表**，不检查 entries 表本身：
+
+```sql
+INSERT INTO entries (...)
+SELECT ...
+WHERE NOT EXISTS (
+    SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+)
+```
+
+**为什么不检查 entries 表？**
+- 因为有 `entries_feed_id_hash_key` 唯一索引兜底，重复插入会被数据库拒绝
+- 检查 entries 表会增加额外开销
+- 假设并发冲突概率低，错误由上层处理
+
+**实际影响**：
+- 在单实例、单调度器的部署中，冲突概率极低
+- 在多实例部署中，冲突概率增加，但仍然是"异常路径"
+- 冲突时 `RefreshFeedEntries` 会返回错误，导致本次 Feed 刷新失败，下次调度会重试
+
+### 5.4 多 Worker 刷新同一 Feed 的数据一致性
+
+当两个 Worker 同时刷新同一 Feed 时，除了单条目的插入冲突，还需要考虑整体数据一致性。
+
+#### 各操作的原子性
+
+| 操作 | 原子性保证 | 并发风险 |
+|------|-----------|----------|
+| 单条 `createEntry` | 由唯一索引保证原子性 | 冲突时返回错误 |
+| 单条 `updateEntry` | 单条 UPDATE 原子 | 后提交的覆盖先提交的（lost update） |
+| `UpdateFeed`（更新 next_check_at 等） | 单条 UPDATE 原子 | 后提交的覆盖先提交的 |
+| `RefreshFeedEntries` 整体 | ❌ 非原子（逐条事务） | 部分成功部分失败 |
+
+#### Lost Update 问题
+
+`updateEntry` 通过 `(feed_id, hash)` 定位条目，直接更新所有字段：
+
+位置：`internal/storage/entry.go:166-210`
+
+```sql
+UPDATE entries
+SET title=$1, url=$2, ..., tags=$12
+WHERE user_id=$9 AND feed_id=$10 AND hash=$11
+RETURNING id
+```
+
+如果两个 Worker 同时更新同一条目，**后提交的会覆盖先提交的**。但由于两边都是从 Feed 源拉取的最新数据，内容差异通常不大，属于"可以接受的 lost update"。
+
+`UpdateFeed` 也有类似问题：后提交的 `next_check_at` 会覆盖先提交的，可能导致调度时间不准确，但影响有限。
+
+### 5.5 墓碑检查的原子性
+
+位置：`internal/storage/entry.go:83-85`（代码注释）
+
+```go
+// The WHERE NOT EXISTS guard makes the tombstone check atomic with the insert, so a
+// concurrent archive committing between an earlier existence check and this statement
+// cannot bring a deleted entry back as unread.
+```
+
+这段注释点明了设计意图：
+- `entryExists()` 只检查 entries 表，不检查墓碑
+- `createEntry()` 的 `WHERE NOT EXISTS` 原子地检查墓碑
+- 即使在 `entryExists()` 和 `createEntry()` 之间有归档事务提交（写入墓碑），也不会把已删除的条目重新"复活"
+
+**这是设计上精心考虑的一点**：墓碑检查在 INSERT 语句内原子完成，而 entries 表的存在性检查由唯一约束兜底。
+
+### 5.6 抗并发的架构级保障
+
+虽然单条 SQL 层面存在一些理论上的 race，但系统在架构层面有多层保障：
+
+#### 保障 1：Feed 级串行化（隐式）
+
+同一 Feed 即使被并发刷新，由于：
+- 数据库的唯一索引保证条目不会重复插入
+- 更新操作是幂等的（同样的数据覆盖多次结果一样）
+- 刷新失败会在下一个调度周期重试
+
+因此不会出现数据损坏，最多是"浪费了一次刷新"。
+
+#### 保障 2：单实例部署的实际串行化
+
+绝大多数 Miniflux 部署是单实例的，且后台调度器是单 goroutine 的：
+- `feedScheduler` 每次生成一批 jobs 推入队列
+- Worker pool 虽然并发工作，但同一 feed 同一批中只出现一次
+- 除非用户手动刷新，否则不会并发
+
+#### 保障 3：错误重试机制
+
+刷新失败的 Feed 不会被标记为"已检查"（或错误计数增加），下次调度会重试，最终一致性有保障。
+
+### 5.7 如果要进一步增强并发安全性
+
+如果需要在多实例高并发场景下进一步提升安全性，可以考虑：
+
+1. **使用 PostgreSQL advisory lock**：刷新 Feed 前获取 `pg_try_advisory_xact_lock(feed_id)`，拿不到就跳过
+2. **`SELECT ... FOR UPDATE SKIP LOCKED`**：在 `FetchJobs` 时锁定行，避免多实例抢同批
+3. **处理 `unique_violation` 错误**：在 `createEntry` 中捕获 23505 错误，返回"已存在"而不是报错
+4. **乐观锁**：在 entries 表增加 version 字段，更新时检查版本
+
+但以 Miniflux 的应用场景（单用户/小团队 RSS 阅读器）来看，当前设计的并发安全性已经足够，过度设计反而增加复杂度。
+
+---
+
+## 六、从 Hash 计算到入库的完整衔接
+
+### 6.1 调用链路总览
 
 ```
 handler.RefreshFeed()
@@ -535,7 +789,7 @@ storage.RefreshFeedEntries()     # 入库判定
     └─ updateEntry(tx, entry)    # 更新已有条目
 ```
 
-### 5.2 关键衔接点
+### 6.2 关键衔接点
 
 | 阶段 | 模块 | 关键动作 | Hash 是否变化 |
 |------|------|----------|--------------|
@@ -552,28 +806,28 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ---
 
-## 六、设计要点总结
+## 七、设计要点总结
 
-### 6.1 为什么用 Hash 而不是直接用 GUID？
+### 7.1 为什么用 Hash 而不是直接用 GUID？
 
 1. **长度固定**：SHA-256 始终是 64 字符十六进制，便于索引和存储
 2. **统一格式**：不同 Feed 格式的唯一标识格式各异，Hash 后统一
 3. **组合标识**：RSS 重复 GUID 场景需要组合多个字段，Hash 后变成单一值
 4. **避免注入**：原始 GUID 可能包含特殊字符，Hash 后安全
 
-### 6.2 为什么 Hash 不包含内容？
+### 7.2 为什么 Hash 不包含内容？
 
 1. **稳定性优先**：内容经常变化（修复错别字、更新文章），Hash 应保持不变
 2. **身份 vs 内容**：Hash 是**身份标识**，不是**内容摘要**
 3. **更新机制**：内容变化通过 `updateEntry` 更新，不需要改变 Hash
 
-### 6.3 为什么是 feed_id + hash 而不是全局唯一？
+### 7.3 为什么是 feed_id + hash 而不是全局唯一？
 
 1. **同源去重**：用户订阅的不同 Feed 可能有相同内容（如转载），这是正常的
 2. **隔离性**：每个用户/Feed 的条目相互独立
 3. **性能**：联合索引查询效率高，范围可控
 
-### 6.4 墓碑机制的必要性
+### 7.4 墓碑机制的必要性
 
 1. **防止回退**：已删除的条目不应因为 Feed 刷新又"回来"
 2. **归档策略**：配合 `ArchiveEntries` 实现自动清理旧条目
@@ -581,7 +835,7 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ---
 
-## 七、相关代码文件速查表
+## 八、相关代码文件速查表
 
 | 功能 | 文件路径 | 关键行 |
 |------|----------|--------|
@@ -611,3 +865,8 @@ storage.RefreshFeedEntries()     # 入库判定
 | API 清空历史 | `internal/api/entry_handlers.go` | 558-562 |
 | Web UI 清空历史 | `internal/ui/history_flush.go` | 13-21 |
 | 墓碑表迁移 | `internal/database/migrations.go` | 迁移 v47 |
+| 数据库连接池 | `internal/database/postgresql.go` | 14-24 |
+| Feed 调度器（批生成） | `internal/cli/scheduler.go` | 33-51 |
+| Worker Pool | `internal/worker/pool.go` | 13-45 |
+| Worker 执行体 | `internal/worker/worker.go` | 22-42 |
+| 批任务构建（无行锁） | `internal/storage/batch.go` | 75-137 |
