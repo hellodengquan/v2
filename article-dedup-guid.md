@@ -232,9 +232,154 @@ RETURNING id, status, created_at, changed_at
 
 ---
 
-## 三、完整入库流程
+## 三、墓碑的写入时机与生命周期
 
-### 3.1 RefreshFeedEntries：Feed 刷新主流程
+### 3.1 墓碑表结构
+
+```sql
+-- internal/database/migrations.go (迁移 v47)
+CREATE TABLE entry_tombstones (
+    feed_id   bigint NOT NULL REFERENCES feeds(id) ON DELETE CASCADE,
+    hash      text    NOT NULL CHECK (hash <> ''),
+    deleted_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, hash)
+);
+
+CREATE INDEX entry_tombstones_deleted_at_idx ON entry_tombstones (deleted_at);
+```
+
+**关键约束**：
+- **联合主键** `(feed_id, hash)`：同一 Feed 下同一 Hash 只保留一条墓碑
+- **外键级联删除** `REFERENCES feeds(id) ON DELETE CASCADE`：Feed 被删除时，该 Feed 下所有墓碑自动清除
+- **`deleted_at` 索引**：便于按时间查询墓碑（但目前代码中未使用此索引做定期清理）
+
+### 3.2 墓碑写入的三条路径
+
+#### 路径 A：定时归档 — ArchiveEntries
+
+位置：`internal/storage/entry.go:362-404`
+
+**触发时机**：后台清理调度器周期性调用
+
+**调用链**：
+```
+daemon.startDaemon()
+    └─ runScheduler(store, pool)
+           └─ cleanupScheduler(store, cleanupFrequency)       # 每 CLEANUP_FREQUENCY_HOURS 小时触发
+                  └─ runCleanupTasks(store)
+                         ├─ store.ArchiveEntries("read",   CleanupArchiveReadInterval(),   CleanupArchiveBatchSize())
+                         └─ store.ArchiveEntries("unread", CleanupArchiveUnreadInterval(), CleanupArchiveBatchSize())
+```
+
+**归档条件**：
+
+| 状态 | 配置项 | 默认值 | 含义 |
+|------|--------|--------|------|
+| `read` | `CLEANUP_ARCHIVE_READ_DAYS` | 60 天 | 已读条目保留 60 天 |
+| `unread` | `CLEANUP_ARCHIVE_UNREAD_DAYS` | 180 天 | 未读条目保留 180 天 |
+
+**批量控制**：
+
+| 配置项 | 默认值 | 含义 |
+|--------|--------|------|
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | 每轮最多归档条目数 |
+| `CLEANUP_FREQUENCY_HOURS` | 24 小时 | 清理任务执行周期 |
+
+**归档 SQL 的筛选条件**：
+```sql
+WHERE
+    status = $1                           -- 指定状态（read 或 unread）
+    AND starred IS FALSE                  -- 星标条目不归档
+    AND share_code = ''                   -- 已分享条目不归档
+    AND created_at < now() - $2::interval -- 超过保留期
+ORDER BY created_at ASC
+FOR UPDATE SKIP LOCKED                   -- 跳过被锁定的行，避免阻塞
+LIMIT $3                                 -- 批量上限
+```
+
+**设计要点**：
+- `FOR UPDATE SKIP LOCKED`：多个清理进程不会冲突，跳过正在被其他事务处理的行
+- 批量限制：避免单次删除过多行导致长事务和锁争用
+- 星标和分享的条目永不归档
+
+#### 路径 B：手动清空历史 — FlushHistory
+
+位置：`internal/storage/entry.go:491-508`
+
+**触发时机**：用户主动操作
+
+**两个调用入口**：
+1. **Web UI**：`internal/ui/history_flush.go:13-21` — `flushHistory()` 同步执行
+2. **API**：`internal/api/entry_handlers.go:558-562` — `flushHistoryHandler()` 异步执行（`go h.store.FlushHistory(...)`）
+
+**清除条件**：
+```sql
+WHERE user_id = $1 AND status = 'read' AND starred IS FALSE AND share_code = ''
+```
+
+**与归档的区别**：
+- 归档按时间窗口删除，FlushHistory 删除用户**所有**已读条目
+- 归档是系统自动行为，FlushHistory 是用户主动操作
+- 两者都会写入墓碑
+
+#### 路径 C：迁移初始化 — 从旧状态迁移
+
+位置：`internal/database/migrations.go` (迁移 v47)
+
+```sql
+-- 将旧的 "removed" 状态条目转化为墓碑
+INSERT INTO entry_tombstones (feed_id, hash, deleted_at)
+    SELECT feed_id, hash, changed_at
+    FROM entries
+    WHERE status = 'removed' AND hash <> ''
+    ON CONFLICT (feed_id, hash) DO NOTHING;
+
+-- 然后删除所有 "removed" 条目
+DELETE FROM entries WHERE status = 'removed';
+```
+
+这是一次性迁移，将旧版 `removed` 状态条目转为墓碑记录，之后 `removed` 状态不再使用。
+
+### 3.3 墓碑的清除
+
+**当前代码中没有墓碑的定期清除机制**。墓碑一旦写入就会永久存在，除非：
+
+1. **Feed 被删除**：外键 `ON DELETE CASCADE` 自动清除对应墓碑
+2. **用户被删除**：Feed 被级联删除后，墓碑随之清除
+
+**`deleted_at` 索引的存在意义**：为未来可能的墓碑定期清理预留索引支持，但当前版本未实现自动清理。
+
+### 3.4 墓碑在写入路径上的拦截
+
+```
+                         墓碑拦截点
+                             │
+    ┌────────────────────────┤
+    │                        │
+    ▼                        ▼
+IsNewEntry()           createEntry()
+(预检查，轻量)          (入库，原子操作)
+    │                        │
+    │  查 entries            │  INSERT ... WHERE NOT EXISTS
+    │  查 entry_tombstones   │    (SELECT 1 FROM entry_tombstones)
+    │                        │
+    ▼                        ▼
+  用于爬虫决策              若被拦截 → ErrEntryTombstoned
+  跳过全文抓取              → 静默丢弃
+```
+
+**两层检查的职责分工**：
+
+| 函数 | 检查范围 | 调用者 | 目的 |
+|------|----------|--------|------|
+| `IsNewEntry()` | entries + tombstones | processor | 避免对已知条目做昂贵爬虫操作 |
+| `createEntry()` | tombstones (原子) | storage | 入库时的最终防线，防止并发写入 |
+
+---
+
+## 四、完整入库流程
+
+### 4.1 RefreshFeedEntries：Feed 刷新主流程
 
 位置：`internal/storage/entry.go:315-360`
 
@@ -285,21 +430,77 @@ func (s *Storage) RefreshFeedEntries(userID, feedID int64, entries model.Entries
 }
 ```
 
-### 3.2 updateExistingEntries 参数的控制
+### 4.2 updateExistingEntries 在不同刷新场景下的取值
 
-位置：`internal/reader/handler/handler.go:323-324`
+位置：`internal/reader/handler/handler.go:323`
 
 ```go
-// 只有在非爬虫模式、非忽略更新、或强制刷新时才更新现有条目
 updateExistingEntries := forceRefresh || (!originalFeed.Crawler && !originalFeed.IgnoreEntryUpdates)
 ```
 
-**设计意图**：
-- **爬虫模式**：只抓取新条目，不更新已有条目（避免覆盖用户阅读状态）
-- **忽略更新**：Feed 配置了忽略条目更新时不更新
-- **强制刷新**：强制刷新时总是更新
+此值由三个因子决定：`forceRefresh`（调用方传入）、`Crawler`（Feed 配置）、`IgnoreEntryUpdates`（Feed 配置）。
 
-### 3.3 稳定 ID 的保证机制
+#### 所有调用方及其传入的 forceRefresh 值
+
+| 调用方 | 文件 | forceRefresh | 典型场景 |
+|--------|------|:----------:|----------|
+| Worker 后台消费 | `internal/worker/worker.go:40` | `false` | 定时调度刷新 |
+| CLI `refresh-feeds` | `internal/cli/refresh_feeds.go:55` | `false` | 命令行手动批量刷新 |
+| API 单个刷新 | `internal/api/feed_handlers.go:67` | `false` | REST API 调用 |
+| Web UI 单个刷新 | `internal/ui/feed_refresh.go:21` | URL 参数 `?forceRefresh=true` | 用户在界面上点击刷新 |
+| Web UI 全部刷新 | `internal/ui/feed_refresh.go:61` | N/A (走 worker pool) | 用户点击"刷新所有"，受 `ForceRefreshInterval` 限流 |
+
+#### updateExistingEntries 真值表
+
+| 场景 | forceRefresh | Crawler | IgnoreEntryUpdates | updateExistingEntries | 说明 |
+|------|:----------:|:-------:|:------------------:|:-------------------:|------|
+| 后台定时刷新 (普通 Feed) | F | F | F | **T** | 最常见场景，正常更新 |
+| 后台定时刷新 (爬虫模式 Feed) | F | T | F | **F** | 爬虫模式只抓新条目，不覆盖已有 |
+| 后台定时刷新 (忽略更新 Feed) | F | F | T | **F** | 用户选择不更新已有条目 |
+| 后台定时刷新 (爬虫+忽略) | F | T | T | **F** | 双重跳过 |
+| API 刷新 (同上 Feed 配置) | F | * | * | 同上 | 与后台刷新逻辑一致 |
+| UI 强制刷新 (forceRefresh=true) | T | * | * | **T** | 无论 Feed 配置如何，总是更新 |
+| UI 普通刷新 (forceRefresh=false) | F | * | * | 同后台刷新 | 无 query 参数时走默认逻辑 |
+
+**`forceRefresh=true` 的额外效果**（不仅影响 updateExistingEntries）：
+
+位置：`internal/reader/handler/handler.go:235-236`
+
+```go
+ignoreHTTPCache := originalFeed.IgnoreHTTPCache || forceRefresh
+```
+
+| 效果 | forceRefresh=false | forceRefresh=true |
+|------|:-:|:-:|
+| 跳过 HTTP 缓存 (ETag/Last-Modified) | 取决于 Feed 配置 | 强制跳过 |
+| 触发全文爬虫（对已有条目） | 否（仅新条目） | 是 |
+| 更新已有条目内容 | 取决于 Feed 配置 | 强制更新 |
+| 强制刷新 Feed 图标 | 否 | 是 |
+| 更新 Feed 图标 | 仅缺失时创建 | 强制更新或创建 |
+
+#### Web UI 中 forceRefresh 的传递方式
+
+位置：`internal/ui/feed_refresh.go:20`
+
+```go
+forceRefresh := request.QueryBoolParam(r, "forceRefresh", false)
+```
+
+用户在 Web UI 点击"刷新"按钮时，URL 中可以携带 `?forceRefresh=true` 参数。不带此参数时等同于普通刷新。
+
+#### 全部刷新的限流保护
+
+位置：`internal/ui/feed_refresh.go:38`
+
+```go
+if time.Since(sess.LastForceRefresh()) < config.Opts.ForceRefreshInterval() {
+    // 拒绝请求，提示"刷新过于频繁"
+}
+```
+
+用户点击"刷新所有 Feed"时受 `ForceRefreshInterval` 限流保护，避免误操作导致大量请求。
+
+### 4.3 稳定 ID 的保证机制
 
 **稳定 ID 的含义**：同一逻辑条目在数据库中的主键 ID 保持不变。
 
@@ -312,9 +513,9 @@ updateExistingEntries := forceRefresh || (!originalFeed.Crawler && !originalFeed
 
 ---
 
-## 四、从 Hash 计算到入库的完整衔接
+## 五、从 Hash 计算到入库的完整衔接
 
-### 4.1 调用链路总览
+### 5.1 调用链路总览
 
 ```
 handler.RefreshFeed()
@@ -334,7 +535,7 @@ storage.RefreshFeedEntries()     # 入库判定
     └─ updateEntry(tx, entry)    # 更新已有条目
 ```
 
-### 4.2 关键衔接点
+### 5.2 关键衔接点
 
 | 阶段 | 模块 | 关键动作 | Hash 是否变化 |
 |------|------|----------|--------------|
@@ -351,28 +552,28 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ---
 
-## 五、设计要点总结
+## 六、设计要点总结
 
-### 5.1 为什么用 Hash 而不是直接用 GUID？
+### 6.1 为什么用 Hash 而不是直接用 GUID？
 
 1. **长度固定**：SHA-256 始终是 64 字符十六进制，便于索引和存储
 2. **统一格式**：不同 Feed 格式的唯一标识格式各异，Hash 后统一
 3. **组合标识**：RSS 重复 GUID 场景需要组合多个字段，Hash 后变成单一值
 4. **避免注入**：原始 GUID 可能包含特殊字符，Hash 后安全
 
-### 5.2 为什么 Hash 不包含内容？
+### 6.2 为什么 Hash 不包含内容？
 
 1. **稳定性优先**：内容经常变化（修复错别字、更新文章），Hash 应保持不变
 2. **身份 vs 内容**：Hash 是**身份标识**，不是**内容摘要**
 3. **更新机制**：内容变化通过 `updateEntry` 更新，不需要改变 Hash
 
-### 5.3 为什么是 feed_id + hash 而不是全局唯一？
+### 6.3 为什么是 feed_id + hash 而不是全局唯一？
 
 1. **同源去重**：用户订阅的不同 Feed 可能有相同内容（如转载），这是正常的
 2. **隔离性**：每个用户/Feed 的条目相互独立
 3. **性能**：联合索引查询效率高，范围可控
 
-### 5.4 墓碑机制的必要性
+### 6.4 墓碑机制的必要性
 
 1. **防止回退**：已删除的条目不应因为 Feed 刷新又"回来"
 2. **归档策略**：配合 `ArchiveEntries` 实现自动清理旧条目
@@ -380,7 +581,7 @@ storage.RefreshFeedEntries()     # 入库判定
 
 ---
 
-## 六、相关代码文件速查表
+## 七、相关代码文件速查表
 
 | 功能 | 文件路径 | 关键行 |
 |------|----------|--------|
@@ -397,4 +598,16 @@ storage.RefreshFeedEntries()     # 入库判定
 | 更新条目 | `internal/storage/entry.go` | 166-210 |
 | Feed 刷新入库 | `internal/storage/entry.go` | 315-360 |
 | 归档+墓碑 | `internal/storage/entry.go` | 362-404 |
+| 清空历史+墓碑 | `internal/storage/entry.go` | 491-508 |
+| 清理任务入口 | `internal/cli/cleanup_tasks.go` | 16-58 |
+| 清理调度器 | `internal/cli/scheduler.go` | 53-56 |
+| 守护进程启动 | `internal/cli/daemon.go` | 32-34 |
 | Handler 刷新流程 | `internal/reader/handler/handler.go` | 195-372 |
+| Worker 后台刷新 | `internal/worker/worker.go` | 40 |
+| CLI 批量刷新 | `internal/cli/refresh_feeds.go` | 55 |
+| API 单个刷新 | `internal/api/feed_handlers.go` | 67 |
+| Web UI 单个刷新 | `internal/ui/feed_refresh.go` | 18-31 |
+| Web UI 全部刷新 | `internal/ui/feed_refresh.go` | 33-68 |
+| API 清空历史 | `internal/api/entry_handlers.go` | 558-562 |
+| Web UI 清空历史 | `internal/ui/history_flush.go` | 13-21 |
+| 墓碑表迁移 | `internal/database/migrations.go` | 迁移 v47 |
