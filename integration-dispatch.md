@@ -1061,3 +1061,457 @@ Session 轮换时保留 CSRF token 以确保进行中的表单仍然有效，但
 | Session 轮换 | `internal/model/web_session.go` | 68 (`Rotate`) |
 | i18n 资源 | `internal/locale/catalog.go` | 20 (`embed.FS` 翻译包) |
 | 唯一索引 | `internal/database/migrations.go` | 88 (`unique (feed_id, hash)`) |
+
+## 十二、边界场景深度分析
+
+### 12.1 Abandoned Plugin 检测机制
+
+**当前实现状态：不存在专门的 Plugin 机制，但有 Orphan 资源清理**
+
+Miniflux 没有插件系统，因此不存在 abandoned plugin 检测。但存在类似的 **Orphan（孤立）资源清理机制**：
+
+**Orphan Icons 清理**（`internal/storage/icon.go:149-166`）：
+```go
+// CleanupOrphanIcons removes icons that are no longer associated with any
+// feed. Such rows accumulate when feeds are deleted (the cascade only removes
+// the feed_icons mapping, not the dedup-by-hash icons row) or when a feed's
+// icon is replaced by StoreFeedIcon.
+func (s *Storage) CleanupOrphanIcons() (int64, error) {
+    result, err := s.db.Exec(`
+        DELETE FROM icons
+        WHERE NOT EXISTS (
+            SELECT 1 FROM feed_icons WHERE feed_icons.icon_id = icons.id
+        )
+    `)
+    n, _ := result.RowsAffected()
+    return n, nil
+}
+```
+
+**清理任务调度**（`internal/cli/cleanup_tasks.go:16-58`）：
+```go
+func runCleanupTasks(store *storage.Storage) {
+    // 1. 清理过期 Web Sessions
+    store.CleanOldWebSessions(config.Opts.CleanupRemoveSessionsInterval())
+    // 2. 归档已读条目
+    store.ArchiveEntries(model.EntryStatusRead, ...)
+    // 3. 归档未读条目
+    store.ArchiveEntries(model.EntryStatusUnread, ...)
+    // 4. 清理孤立图标
+    store.CleanupOrphanIcons()
+}
+```
+
+**已废弃配置检测**（`internal/config/parser.go:163-171`）：
+```go
+if key == "FILTER_ENTRY_MAX_AGE_DAYS" {
+    slog.Warn("Configuration option FILTER_ENTRY_MAX_AGE_DAYS is deprecated; use user filter rule max-age:<duration> instead")
+}
+// Ignore unknown configuration keys to avoid parsing unrelated environment variables.
+return nil
+```
+
+**时区废弃映射**（`internal/database/migrations.go:1184-1358`）：
+```go
+// This migration replaces deprecated timezones by their equivalent on Debian Trixie.
+var deprecatedTimeZoneMap = map[string]string{
+    "Africa/Asmera": "Africa/Asmara",
+    "America/Argentina/ComodRivadavia": "America/Argentina/Catamarca",
+    "America/Buenos_Aires": "America/Argentina/Buenos_Aires",
+    // ... 40+ 个废弃时区映射
+}
+```
+
+**仍缺失的能力**：
+- 没有渠道/集成健康检查（检测不再响应的集成）
+- 没有长期未使用的集成配置自动检测
+- 没有集成 API 凭证过期提醒
+
+### 12.2 LayeredResolution 热更新层级混乱
+
+**当前实现状态：完全不存在热更新机制**
+
+Miniflux 所有配置和资源都是**启动时一次性加载**，不支持运行时热更新：
+
+```go
+// 配置加载：启动时 parse 环境变量，无运行时重载
+parser := config.NewConfigParser()
+config.Opts, err = parser.ParseEnvironmentVariables()
+
+// i18n 资源：启动时通过 embed.FS 加载到内存
+//go:embed translations/*.json
+var translationFiles embed.FS
+
+// 集成渠道：编译时静态 import，无法增删
+import (
+    "miniflux.app/v2/internal/integration/telegrambot"
+    "miniflux.app/v2/internal/integration/slack"
+    "miniflux.app/v2/internal/integration/webhook"
+)
+```
+
+**层级混乱风险不存在，但有多层配置覆盖**：
+- **Feed 级配置**：每个 Feed 可单独设置 UserAgent、Cookie、Proxy 等（优先级最高）
+- **用户级配置**：每个用户可单独设置 Theme、Language、Filter Rules
+- **全局配置**：环境变量/配置文件（优先级最低）
+
+**配置覆盖示例**：
+```go
+// Feed 级 Webhook 覆盖全局 Webhook
+// integration.go:542-553
+if feed.WebhookURL != "" {
+    webhookURL = feed.WebhookURL
+}
+if feed.WebhookSecret != "" {
+    webhookSecret = feed.WebhookSecret
+}
+```
+
+**缺失的能力**：
+- 没有配置热重载（SIGHUP 或 API 触发）
+- 没有配置变更版本追踪
+- 没有多租户配置隔离冲突检测
+- 没有 i18n 翻译包运行时更新
+
+### 12.3 ExponentialBackoff 最大重投次数
+
+**当前实现状态：集成推送无重试，Feed 抓取有错误计数但无指数退避**
+
+**Feed 抓取错误计数**（`internal/model/feed.go:100-110`）：
+```go
+// 仅线性计数，无指数退避
+func (f *Feed) WithTranslatedErrorMessage(message string) {
+    f.ParsingErrorCount++          // 每次失败 +1
+    f.ParsingErrorMsg = message
+}
+
+func (f *Feed) ResetErrorCounter() {
+    f.ParsingErrorCount = 0         // 成功直接归零
+    f.ParsingErrorMsg = ""
+}
+```
+
+**调度器错误过滤**（`internal/cli/scheduler.go:36-42`）：
+```go
+WithErrorLimit(errorLimit)  // POLLING_PARSING_ERROR_LIMIT = 3（固定阈值）
+```
+
+**限流延迟处理**（`internal/reader/handler/handler.go:245-255`）：
+```go
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()  // 只解析 Retry-After
+    calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+}
+```
+
+**Retray-After 解析**（`internal/reader/fetcher/response_handler.go:80-96`）：
+```go
+func (r *ResponseHandler) ParseRetryDelay() time.Duration {
+    retryAfterHeaderValue := r.httpResponse.Header.Get("Retry-After")
+    // 支持秒数格式
+    if seconds, err := strconv.Atoi(retryAfterHeaderValue); err == nil {
+        return time.Duration(seconds) * time.Second
+    }
+    // 支持 HTTP-date 格式
+    if t, err := time.Parse(time.RFC1123, retryAfterHeaderValue); err == nil {
+        return time.Until(t).Truncate(time.Second)
+    }
+    return 0
+}
+```
+
+**缺失的能力**：
+- 没有指数退避算法（如 `delay = base * 2^attempt`）
+- 没有最大重试次数限制（超过错误计数阈值直接禁用，无重投恢复）
+- 没有抖动（Jitter）防止惊群效应
+- 没有推送层面的任何重试机制
+
+### 12.4 Priority Inheritance 死锁检测
+
+**当前实现状态：完全不存在**
+
+Miniflux 使用 Go 并发原语，但没有死锁检测或优先级继承：
+
+```go
+// Worker 池：简单 goroutine + channel
+type Pool struct {
+    queue chan model.Job  // 无缓冲 channel，无优先级
+    wg    sync.WaitGroup
+}
+
+// Feed 处理：无锁设计（每个 Feed 独立处理）
+func RefreshFeed(store *storage.Storage, userID, feedID int64, force bool) error {
+    // 每个 Feed 独立操作，不需要分布式锁
+    // 数据库级别的事务隔离提供一致性
+}
+```
+
+**并发安全机制**：
+- 使用 Go channel 进行 worker 间通信，避免显式锁
+- 数据库使用 `BEGIN` 事务处理读写一致性
+- 每个 Feed 的刷新是独立的，不同 Feed 之间不共享资源
+- 推送使用独立 goroutine，无共享状态
+
+**缺失的能力**：
+- 没有 `sync.Mutex` 或 `sync.RWMutex` 的死锁检测
+- 没有优先级继承协议（Priority Inheritance Protocol）
+- 没有优先级天花板协议（Priority Ceiling Protocol）
+- 没有 goroutine 泄漏检测或监控
+
+### 12.5 BloomFilter False Positive 阈值动态调整
+
+**当前实现状态：完全不存在 Bloom Filter**
+
+Miniflux 未使用布隆过滤器，去重完全依赖数据库唯一索引：
+
+```go
+// 条目去重：基于 (feed_id, hash) 唯一索引
+func (s *Storage) entryExists(tx *sql.Tx, entry *model.Entry) (bool, error) {
+    err := tx.QueryRow(`SELECT true FROM entries WHERE feed_id=$1 AND hash=$2 LIMIT 1`,
+        entry.FeedID, entry.Hash).Scan(&result)
+}
+
+// RSS 适配器 GUID 碰撞兜底：哈希算法选择
+// - SHA-256（加密安全哈希）用于 RSS GUID 去重
+// - FNV-128a（非加密快速哈希）用于存储层条目去重
+```
+
+**去重策略对比**：
+| 方案 | 假阳性 | 内存 | 速度 | Miniflux 是否使用 |
+|------|--------|------|------|-------------------|
+| 布隆过滤器 | 可调（如 0.1%） | O(n) 极小 | 极快 | ❌ |
+| 数据库唯一索引 | 0（精确） | 数据库存储 | SQL 查询 | ✅ |
+| FNV-128a 哈希 | 极低（理论） | 128 bits | 快 | ✅（存储层） |
+| SHA-256 哈希 | 可忽略 | 256 bits | 中等 | ✅（RSS 适配层） |
+
+**缺失的能力**：
+- 没有内存级快速去重前置过滤
+- 没有假阳性阈值动态调整
+- 没有计数布隆过滤器支持删除操作
+- 没有分层缓存（内存 → 数据库）的去重优化
+
+### 12.6 Token Bucket 极端流量退化
+
+**当前实现状态：不存在 Token Bucket 限流算法，但有被动限流处理**
+
+**被动限流（消费方驱动）**（`internal/reader/fetcher/response_handler.go:98-100`）：
+```go
+func (r *ResponseHandler) IsRateLimited() bool {
+    return r.httpResponse != nil && r.httpResponse.StatusCode == http.StatusTooManyRequests
+}
+```
+
+**调度层面的限流**（`internal/cli/scheduler.go:36-42`）：
+```go
+jobs, err := store.NewBatchBuilder().
+    WithBatchSize(batchSize).              // BATCH_SIZE = 100
+    WithErrorLimit(errorLimit).              // POLLING_PARSING_ERROR_LIMIT = 3
+    WithoutDisabledFeeds().
+    WithLimitPerHost(limitPerHost).          // POLLING_LIMIT_PER_HOST = 0（不限制）
+    WithNextCheckExpired().
+    FetchJobs()
+```
+
+**Worker 池自然限流**（`internal/worker/pool.go:33-43`）：
+```go
+// 固定 16 个 worker，超过则阻塞在 channel 写入
+func NewPool(store *storage.Storage, nbWorkers int) *Pool {
+    queue := make(chan model.Job)  // 无缓冲 channel = 自然背压
+    for i := range nbWorkers {     // WORKER_POOL_SIZE = 16
+        go worker.Run(queue, &wg)
+    }
+}
+```
+
+**推送层面的限流缺失**：
+- 没有客户端侧 Token Bucket 限流
+- 没有每渠道 QPS 限制（如 Telegram Bot API 限 30 条/秒）
+- 没有突发流量退避策略
+- 没有熔断机制（连续失败后暂停推送）
+
+**极端流量下的退化行为**：
+- 大量 Feed 同时刷新 → Worker 池满 → channel 阻塞 → 调度器阻塞（可接受）
+- 大量新条目产生 → 启动大量推送 goroutine → 内存和 FD 压力增大（潜在风险）
+- 第三方 API 限流 → 推送失败 → 日志记录 → 消息丢失（主要风险）
+
+### 12.7 HMAC Dual-Active Period 审计追踪
+
+**当前实现状态：不存在密钥轮换和双活期，无审计日志**
+
+**Webhook HMAC 现状**（`internal/integration/webhook/webhook.go:134`）：
+```go
+request.Header.Set("X-Miniflux-Signature",
+    crypto.GenerateSHA256Hmac(c.webhookSecret, requestBody))
+// 只有一个密钥，无版本号，无双活期
+```
+
+**可参考的 Session 审计**（`internal/storage/web_session.go:130-159`）：
+```go
+func (s *Storage) RotateWebSession(oldID string, session *model.WebSession) error {
+    err = s.db.QueryRow(`
+        UPDATE web_sessions
+        SET id=$2, secret_hash=$3, user_id=$4, state=$5, created_at=now()
+        WHERE id=$1
+        RETURNING created_at
+    `, oldID, session.ID, session.SecretHash, ...).Scan(&session.CreatedAt)
+}
+```
+
+**缺失的 HMAC 安全能力**：
+- 没有 `X-Miniflux-Key-Version` 头标识密钥版本
+- 没有双活期（Dual-Active Period）支持新旧密钥同时验证
+- 没有密钥轮换操作日志
+- 没有 Webhook 请求审计追踪（请求体、时间、结果）
+- 没有 `crypto/rand` 强制生成密钥的校验
+
+**数据库存储现状**：
+- `integrations` 表中 `webhook_secret` 为普通 `text` 字段
+- 无 `webhook_secret_version`、`webhook_secret_rotated_at`、`webhook_secret_expires_at` 字段
+- 无 `webhook_audit_log` 表记录每次 Webhook 请求
+
+### 12.8 Virtualized List 滚动跳转精确定位
+
+**当前实现状态：实现了 DOM 列表滚动定位，但不是真正的虚拟列表**
+
+**滚动定位函数**（`internal/ui/static/js/app.js:50-64`）：
+```javascript
+function scrollPageTo(element, evenIfOnScreen) {
+    const windowScrollPosition = window.scrollY;
+    const windowHeight = document.documentElement.clientHeight;
+    const viewportPosition = windowScrollPosition + windowHeight;
+    const itemBottomPosition = element.offsetTop + element.offsetHeight;
+
+    if (evenIfOnScreen || viewportPosition - itemBottomPosition < 0 || viewportPosition - element.offsetTop > windowHeight) {
+        window.scrollTo(0, element.offsetTop - 10);
+    }
+}
+```
+
+**列表项跳转**（`internal/ui/static/js/app.js:389-435`）：
+```javascript
+function goToListItem(offset) {
+    const items = getVisibleEntries();  // 获取所有可见 .items .item
+    const currentItem = document.querySelector(".current-item");
+    const currentIndex = items.indexOf(currentItem);
+
+    // 支持 TOP（首页）/ BOTTOM（末页）/ 数字偏移
+    let newIndex;
+    if (offset === TOP) {
+        newIndex = 0;
+    } else if (offset === BOTTOM) {
+        newIndex = items.length - 1;
+    } else {
+        newIndex = (currentIndex + offset + items.length) % items.length;  // 环形循环
+    }
+
+    // 切换选中状态并滚动
+    currentItem.classList.remove("current-item");
+    newItem.classList.add("current-item");
+    newItem.focus();
+    scrollPageTo(newItem);
+}
+```
+
+**导航入口**（`internal/ui/static/js/app.js:294-332`）：
+```javascript
+function goToPreviousPage(offset) {
+    if (isListView()) {
+        goToListItem(offset);  // 列表视图：在条目间跳转
+    } else {
+        goToPage("previous");   // 条目视图：翻页
+    }
+}
+```
+
+**真实虚拟列表缺失**：
+- 没有 `virtualized-list` 组件（GitHub 使用的那种）
+- 没有 DOM 回收（只渲染视口内元素）
+- 没有行高预估和动态调整
+- 没有滚动到指定 ID 或日期的精确定位（只能按偏移量跳转）
+- 没有大数据量（万条以上）性能优化
+
+**当前实现的局限**：
+- 一次渲染所有条目，条目数多时 DOM 节点过多影响性能
+- 使用 `offsetTop` 计算位置，嵌套布局下可能不准确
+- 预留 10px 顶部间距，无动态计算 header 高度
+
+## 十三、架构总结（最终版）
+
+### 13.1 设计优点
+
+1. **解耦清晰**：Feed 刷新与集成推送完全分离，通过 goroutine 异步执行
+2. **容错性好**：单个渠道或单个 Feed 失败不影响整体系统
+3. **配置灵活**：每个用户可独立配置多个渠道，支持 Feed 级 Webhook 覆盖
+4. **背压机制**：Worker 池 + 无缓冲 channel 实现自然限流
+5. **安全考虑**：Webhook 签名验证、私有网络访问控制
+6. **安全哈希**：条目基于 FNV-128a 哈希去重，Webhook 使用 HMAC-SHA256 防伪造
+7. **调度智能**：支持基于条目频率的自适应调度间隔
+8. **碰撞兜底**：RSS GUID 重复时有分级 fallback 策略（GUID → GUID+URL → GUID+position）
+9. **数据库保障**：`(feed_id, hash)` 唯一索引从存储层面防止重复
+10. **资源清理**：Orphan Icons、过期 Session、旧条目归档定期清理
+11. **废弃兼容**：配置项废弃有警告日志，时区废弃有自动迁移映射
+
+### 13.2 潜在改进点（已验证的缺失功能，共26项）
+
+1. **推送无重试**：集成推送失败后不会重试，可能导致消息丢失
+2. **推送无队列**：大量 Feed 同时刷新时，可能产生大量推送 goroutine
+3. **无速率限制**：对第三方 API 的调用速率没有限制（如 Telegram 的每分钟消息限制）
+4. **批量不一致**：Webhook 批量推送 vs Telegram/Slack 单条推送，策略不统一
+5. **无动态扩展**：添加新渠道需要修改核心代码，不支持插件
+6. **无消息模板**：推送格式硬编码，用户无法自定义
+7. **无 DLQ**：失败消息无法追溯和重放
+8. **无优先级队列**：高优先级消息无法插队处理
+9. **无推送去重**：多渠道同时启用时同一条消息会重复推送
+10. **无进度可视化**：没有推送状态追踪和 UI 展示
+11. **无插件接口**：没有 `IntegrationPluginInterface` 或插件市场
+12. **无推送 i18n**：推送消息不支持国际化
+13. **无 DLQ 重投策略**：没有指数退避、最大重试次数等策略
+14. **无优先级反转检测**：没有 PriorityChannel 或优先级继承
+15. **无主动碰撞检测**：FNV-128a 哈希碰撞时没有告警
+16. **无自适应批组合并**：没有 BatchCoalescer 或滑动窗口合并
+17. **无 HMAC 密钥轮换**：Webhook 密钥无法安全轮换
+18. **无 DispatchTracker**：没有 in-flight 请求追踪和 UI 优化
+19. **无集成健康检查**：没有检测不再响应的集成配置
+20. **无配置热重载**：配置变更需重启服务
+21. **无指数退避重试**：失败重试是固定阈值，无抖动和退避
+22. **无死锁检测**：并发原语无监控
+23. **无布隆过滤器**：内存级快速去重缺失
+24. **无客户端限流**：无 Token Bucket 控制第三方 API 调用速率
+25. **无密钥审计**：HMAC 操作无日志追踪
+26. **无虚拟列表**：前端大数据量渲染性能未优化
+
+### 13.3 关键代码位置（最终版，31个模块）
+
+| 模块 | 文件路径 | 核心行号 |
+|------|----------|----------|
+| 推送入口 | `internal/integration/integration.go` | 511 (`PushEntries`) |
+| 触发点 | `internal/reader/handler/handler.go` | 338 (`go integration.PushEntries`) |
+| Worker 池 | `internal/worker/pool.go` | 33 (`NewPool`) |
+| 调度器 | `internal/cli/scheduler.go` | 33 (`feedScheduler`) |
+| Telegram 实现 | `internal/integration/telegrambot/telegrambot.go` | 16 (`PushEntry`) |
+| Slack 实现 | `internal/integration/slack/slack.go` | 34 (`SendSlackMsg`) |
+| Webhook 实现 | `internal/integration/webhook/webhook.go` | 73 (`SendNewEntriesWebhookEvent`) |
+| 配置模型 | `internal/model/integration.go` | 7 (`Integration` 结构体) |
+| 错误重试 | `internal/model/feed.go` | 100-149 |
+| 条目去重 | `internal/storage/entry.go` | 213 (`entryExists`) |
+| FNV 哈希 | `internal/crypto/crypto.go` | 18 (`HashFromBytes`) |
+| SHA256 哈希 | `internal/crypto/crypto.go` | 26 (`SHA256`) |
+| HMAC 签名 | `internal/crypto/crypto.go` | 48 (`GenerateSHA256Hmac`) |
+| 恒定时间比较 | `internal/crypto/crypto.go` | 59 (`ConstantTimeCmp`) |
+| Ntfy 优先级 | `internal/integration/ntfy/ntfy.go` | 54 (`Priority: c.ntfyPriority`) |
+| Pushover 优先级 | `internal/integration/pushover/pushover.go` | 88 (`Priority: c.priority`) |
+| 指标监控 | `internal/metric/metric.go` | 24 (`BackgroundFeedRefreshDuration`) |
+| GUID 碰撞兜底 | `internal/reader/rss/adapter.go` | 116-139 |
+| 自适应调度 | `internal/model/feed.go` | 122 (`ScheduleNextCheck`) |
+| Session 轮换 | `internal/model/web_session.go` | 68 (`Rotate`) |
+| i18n 资源 | `internal/locale/catalog.go` | 20 (`embed.FS` 翻译包) |
+| 唯一索引 | `internal/database/migrations.go` | 88 (`unique (feed_id, hash)`) |
+| Orphan 清理 | `internal/storage/icon.go` | 149 (`CleanupOrphanIcons`) |
+| 定期清理任务 | `internal/cli/cleanup_tasks.go` | 16 (`runCleanupTasks`) |
+| 配置废弃警告 | `internal/config/parser.go` | 166 (`slog.Warn deprecated`) |
+| 时区废弃映射 | `internal/database/migrations.go` | 1184 (`deprecatedTimeZoneMap`) |
+| 限流检测 | `internal/reader/fetcher/response_handler.go` | 98 (`IsRateLimited`) |
+| Retry-After 解析 | `internal/reader/fetcher/response_handler.go` | 80 (`ParseRetryDelay`) |
+| 前端滚动定位 | `internal/ui/static/js/app.js` | 55 (`scrollPageTo`) |
+| 列表项跳转 | `internal/ui/static/js/app.js` | 389 (`goToListItem`) |
+| Session 数据库轮换 | `internal/storage/web_session.go` | 130 (`RotateWebSession`) |
