@@ -431,3 +431,486 @@ api.middleware.validateAPIKeyAuth()
 | JSON 403 响应 | `internal/http/response/json.go` | 119-138 |
 | UI 登录兜底 | `internal/ui/web_session_middleware.go` | 52-55 |
 | UI 公开路由定义 | `internal/ui/routes.go` | 31-48 |
+
+---
+
+## 七、深层技术细节补充
+
+### 7.1 三级防护下的异步链
+
+#### 异步架构设计
+鉴权通过后，部分操作会触发异步任务链，主要通过 Worker Pool 机制实现。
+
+**核心组件**：
+`internal/worker/pool.go:13-44`
+
+```go
+type Pool struct {
+    queue chan model.Job
+    wg    sync.WaitGroup
+}
+
+func NewPool(store *storage.Storage, nbWorkers int) *Pool {
+    workerPool := &Pool{
+        queue: make(chan model.Job),
+    }
+    for i := range nbWorkers {
+        workerPool.wg.Add(1)
+        worker := &worker{id: i, store: store}
+        go worker.Run(workerPool.queue, &workerPool.wg)
+    }
+    return workerPool
+}
+```
+
+**异步触发点**：
+`internal/api/feed_handlers.go:76-99
+
+```go
+func (h *handler) refreshAllFeedsHandler(w http.ResponseWriter, r *http.Request) {
+    userID := request.UserID(r)
+    
+    jobs, err := h.store.NewBatchBuilder()...FetchJobs()
+    
+    // 【关键】异步推送任务
+    go h.pool.Push(jobs)
+    
+    response.NoContent(w, r)  // 立即返回，不等待异步完成
+}
+```
+
+**完整异步链路**：
+
+```
+同步请求链 (HTTP Handler)
+    ↓ 鉴权通过
+    ↓ 构造 Job 列表
+    ↓ go h.pool.Push(jobs)  ──┐
+    ↓ 返回 204 No Content      │
+                              │
+异步执行链 (Worker Pool)   │
+    ├─ Worker 从 chan 取 Job
+    ├─ 执行 Feed 刷新
+    ├─ 解析 RSS/Atom 内容
+    ├─ 存储新文章
+    └─ 通知集成 (Webhook, Apprise 等)
+```
+
+**异步任务包括：
+- `internal/api/feed_handlers.go:97` - 刷新全部订阅
+- `internal/api/category_handlers.go:186` - 刷新分类订阅
+- `internal/api/user_handlers.go:246` - 删除用户后的清理
+- `internal/fever/handler.go:458` - Fever API 的标记已读
+- `internal/googlereader/handler.go:313` - Google Reader API 的订阅刷新
+
+**失败退路**：
+- 异步任务失败不会影响同步响应
+- Worker 内部有独立的错误日志和重试机制
+- Job 队列满时会阻塞（但 channel 无缓冲）
+
+---
+
+### 7.2 X-Auth-Token Header 大小写不敏感处理
+
+#### Go 标准库的隐式处理
+
+代码中直接使用 `r.Header.Get("X-Auth-Token")`，但实际上 **Go 标准库 `net/http` 的 `Header.Get()` 方法内部会自动调用 `textproto.CanonicalMIMEHeaderKey()` 进行规范化处理**。
+
+`internal/api/middleware.go:40`
+
+```go
+token := r.Header.Get("X-Auth-Token")
+```
+
+**CanonicalMIMEHeaderKey 的转换规则**：
+1. 首字母和每个 `-` 后的第一个字母大写
+2. 其余字母小写
+3. 因此 `x-auth-token`、`X-AUTH-TOKEN`、`X-Auth-Token` 都会被规范化为 `X-Auth-Token`
+
+**CORS 头配置**：
+`internal/api/middleware.go:27`
+
+```go
+w.Header().Set("Access-Control-Allow-Headers", "X-Auth-Token, Authorization, Content-Type, Accept")
+```
+
+**客户端发送 `x-auth-token` 也能正常工作，因为浏览器在预检请求中也会对 Header 名进行规范化。
+
+---
+
+### 7.3 INNER JOIN 的缓存策略
+
+#### 无应用层缓存
+Miniflux **没有应用层缓存（如 Redis、内存缓存等），完全依赖 PostgreSQL 数据库层面的缓存机制。
+
+**数据库查询语句**：
+`internal/storage/user.go:482-524
+
+```go
+func (s *Storage) UserByAPIKey(token string) (*model.User, error) {
+    query := `
+        SELECT u.id, u.username, ...
+        FROM users u
+        INNER JOIN api_keys ON api_keys.user_id = u.id
+        WHERE api_keys.token = $1
+    `
+    return s.fetchUser(query, token)
+}
+```
+
+**PostgreSQL 缓存层级**：
+
+| 缓存层级 | 作用 | 配置/机制 |
+|---------|------|-------------|
+| **Shared Buffers | 数据库共享内存缓存 | `shared_buffers | 通常为 25% 内存 |
+| **OS Page Cache | 操作系统页缓存 | 操作系统自动管理，最近最少使用（LRU） |
+| **查询计划缓存 | 执行计划缓存 | PostgreSQL 自动缓存常用查询计划 |
+| **索引缓存 | B-Tree 索引页缓存 | api_keys.token 唯一索引缓存 |
+
+**缓存失效时机**：
+1. API Key 被删除 → `DELETE FROM api_keys` → 相关数据页失效
+2. 用户信息更新 → `UPDATE users` → 用户数据页失效
+3. 数据库重启 → 所有缓存失效
+
+**为什么不做应用层缓存的设计考量**：
+- API Key 查询频率相对较低
+- Token 泄露后需立即失效，缓存会增加复杂度
+- PostgreSQL 的缓存足够应对一般负载
+- 简单性优先，避免缓存一致性问题
+
+---
+
+### 7.4 UserID Context 注入线程安全
+
+#### Go Context 的不可变性保证
+
+`internal/api/middleware.go:80-86`
+
+```go
+ctx := r.Context()
+ctx = context.WithValue(ctx, request.UserIDContextKey, user.ID)
+ctx = context.WithValue(ctx, request.UserTimezoneContextKey, user.Timezone)
+ctx = context.WithValue(ctx, request.IsAdminUserContextKey, user.IsAdmin)
+ctx = context.WithValue(ctx, request.IsAuthenticatedContextKey, true)
+
+next.ServeHTTP(w, r.WithContext(ctx))
+```
+
+**线程安全原理**：
+
+1. **`context.WithValue 不修改原 Context，而是创建新的 Context 实例**
+2. 每个请求有独立的 Request 对象，Context 是请求级别的
+3. Go `net/http` 每个请求在独立的 goroutine 中处理
+4. Context 是不可变的（immutable），只能创建新实例
+
+**上下文键类型安全**：
+`internal/http/request/context.go:12-25`
+
+```go
+type ContextKey int  // 非导出类型，防止外部包伪造
+
+const (
+    UserIDContextKey ContextKey = iota
+    // ...
+)
+```
+
+使用非导出的 `int` 类型作为键，**外部包无法构造相同的键来读取或写入 Context 中的值**，防止越权修改。
+
+**读取时的安全兜底**：
+`internal/http/request/context.go:60-73
+
+```go
+func UserID(r *http.Request) int64 {
+    if userID := getContextInt64Value(r, UserIDContextKey); userID != 0 {
+        return userID
+    }
+    // 兜底：从 WebSession 中读取
+    if session := WebSession(r); session != nil {
+        if id, ok := session.UserID(); ok {
+            return id
+        }
+    }
+    return 0  // 最终兜底：返回 0，表示未认证
+}
+```
+
+---
+
+### 7.5 IsAdminUser 细粒度授权
+
+#### 三级授权模型
+
+**粗粒度检查（中间件层）只解决"是不是管理员"，细粒度控制在 Handler 内进行。
+
+**细粒度授权场景**：
+
+**场景一：防止普通用户不能给自己提升管理员权限
+`internal/api/user_handlers.go:78-88`
+
+```go
+if !request.IsAdminUser(r) {
+    if originalUser.ID != request.UserID(r) {
+        response.JSONForbidden(w, r)
+        return
+    }
+
+    // 【细粒度控制：普通用户修改自己时，也不能修改 IsAdmin 字段
+    if userModificationRequest.IsAdmin != nil && *userModificationRequest.IsAdmin {
+        response.JSONBadRequest(w, r, errors.New("only administrators can change permissions of standard users"))
+        return
+    }
+}
+```
+
+**场景二：管理员也不能删除自己
+`internal/api/user_handlers.go:241-243`
+
+```go
+if user.ID == request.UserID(r) {
+    response.JSONBadRequest(w, r, errors.New("you cannot remove yourself"))
+    return
+}
+```
+
+**场景三：数据归属双重检查**
+`internal/storage/feed.go:36-41
+
+```go
+func (s *Storage) FeedExists(userID, feedID int64) bool {
+    query := `SELECT true FROM feeds WHERE user_id=$1 AND id=$2 LIMIT 1`
+    // 即使通过 user_id 过滤，防止越权访问
+}
+```
+
+**细粒度授权矩阵**：
+
+| 操作 | 普通用户 | 管理员 |
+|------|---------|-------|
+| 创建用户 | ❌ 403 | ✅ |
+| 查看所有用户列表 | ❌ 403 | ✅ |
+| 修改自己信息 | ✅ | ✅ |
+| 修改他人信息 | ❌ 403 | ✅ |
+| 修改自己 IsAdmin | ❌ 400 | ✅ |
+| 修改他人 IsAdmin | ❌ 403 | ✅ |
+| 删除自己 | ❌ 400 | ❌ 400 |
+| 删除他人 | ❌ 403 | ✅ |
+
+---
+
+### 7.6 标准化错误的国际化
+
+#### LocalizedError 体系
+
+`internal/locale/error.go:8-55
+
+```go
+type LocalizedError struct {
+    translationKey  string
+    translationArgs []any
+}
+
+func (v *LocalizedError) Translate(language string) string {
+    return NewPrinter(language).Printf(v.translationKey, v.translationArgs...)
+}
+```
+
+**翻译键体系
+`internal/locale/printer.go:18-30
+
+```go
+func (p *Printer) Printf(key string, args ...any) string {
+    return formatTranslation(p.Print(key), args...)
+}
+
+func (p *Printer) Print(key string) string {
+    if dict, err := getTranslationDict(p.language); err == nil {
+        if str, ok := dict.singulars[key]; ok {
+            return str
+        }
+    }
+    return key  // 兜底：返回键本身
+}
+```
+
+**翻译字典加载**：
+- 启动时加载所有 `internal/locale/translations/*.json 文件到内存
+- 支持 20+ 种语言
+- 键不存在时返回键本身（优雅降级）
+
+**多语言错误响应**
+
+**业务层使用**：
+`internal/validator/user.go:17-23
+
+```go
+func ValidateUserCreationWithPassword(...) *locale.LocalizedError {
+    if request.Username == "" || request.Password == "" {
+        return locale.NewLocalizedError("error.user_mandatory_fields")
+    }
+    // ...
+}
+```
+
+**API 响应层输出**：
+`internal/api/feed_handlers.go:46-48
+
+```go
+feed, localizedError := feedHandler.CreateFeed(...)
+if localizedError != nil {
+    response.JSONServerError(w, r, localizedError.Error())  // 默认英文错误消息
+}
+```
+
+> **注意**：API 层目前使用 `.Error()` 方法返回的是英文（en_US）翻译。UI 层会根据用户语言偏好调用 `.Translate(user.Language)` 来返回对应语言的错误消息。
+
+---
+
+### 7.7 Basic Auth 凭据轮换
+
+#### 密码更新机制
+
+`internal/storage/user.go:177-186
+
+```go
+func (s *Storage) UpdateUser(user *model.User) error {
+    if user.Password != "" {
+        hashedPassword, err := crypto.HashPassword(user.Password)
+        // ...
+        query := `
+            UPDATE users SET
+                username=LOWER($1),
+                password=$2,  // bcrypt 哈希后的新密码
+                ...
+            WHERE id=$31
+        `
+    }
+}
+```
+
+**密码哈希算法**：使用 bcrypt，成本因子由 `crypto.HashPassword 决定
+
+**凭据轮换流程**：
+
+```
+用户调用 PUT /v1/users/{userID}
+    ↓
+1. 鉴权：IsAdmin 或 userID == 自己
+    ↓
+2. 细粒度检查：非 Admin 不能提升权限
+    ↓
+3. 验证新密码强度（最小长度）
+    ↓
+4. bcrypt 哈希新密码
+    ↓
+5. UPDATE users SET password = 新哈希
+    ↓
+6. 旧密码立即失效（数据库层面无会话撤销机制
+```
+
+**Google Reader API 独立密码**：
+`internal/storage/integration.go:56-81
+
+```go
+func (s *Storage) GoogleReaderUserCheckPassword(username, password string) error {
+    query := `SELECT googlereader_password FROM integrations ...`
+    // 使用独立的 bcrypt 哈希
+}
+```
+
+**API Key vs Basic Auth 对比**：
+
+| 特性 | API Key | Basic Auth |
+|------|---------|------------|
+| 存储方式 | 明文 | bcrypt 哈希 |
+| 变更方式 | 删除重建 | 修改用户密码 |
+| 多令牌支持 | ✅ 多个 API Key | ❌ 单一密码 |
+| 泄露后 | 删除对应 Key | 修改密码，所有会话失效 |
+| 适用场景 | 第三方脚本 | 浏览器、手动调用 |
+
+---
+
+### 7.8 last_used_at 并发更新
+
+#### 并发安全分析
+
+`internal/storage/api_key.go:25-33
+
+```go
+func (s *Storage) SetAPIKeyUsedTimestamp(userID int64, token string) error {
+    query := `UPDATE api_keys SET last_used_at=now() WHERE user_id=$1 and token=$2`
+    _, err := s.db.Exec(query, userID, token)
+    return err
+}
+```
+
+**PostgreSQL 行级锁机制**：
+
+当多个请求使用同一 Token 并发调用时：
+
+1. **第一个请求** 获得行级锁（ROW EXCLUSIVE LOCK）
+2. **后续请求** 等待锁释放
+3. 第一个请求更新 `last_used_at = now()
+4. **锁释放**
+5. 第二个请求获得锁，再次更新 last_used_at = now()
+
+**并发场景时序图**：
+
+```
+goroutine A (T1)
+    │ UPDATE api_keys SET last_used_at=now() WHERE ...
+    ├─ 获得行锁
+    ├─ 更新时间戳 T1
+    └─ 释放行锁
+
+goroutine B (T2, 稍晚)
+    │ UPDATE api_keys SET last_used_at=now() WHERE ...
+    ├─ 等待行锁...
+    ├─ 获得行锁
+    ├─ 更新时间戳 T2
+    └─ 释放行锁
+```
+
+**数据一致性保证**：
+
+- **不会丢失更新**：PostgreSQL 的 `now()` 是事务开始时间，每个 UPDATE 是原子操作
+- **最终值正确性**：最后完成的事务的值会覆盖前面的（时间戳总是递增）
+- **无 ABA 问题**：时间戳单调递增，不存在 ABA
+
+**潜在问题与优化**：
+
+**当前实现问题**：每次请求都会执行 UPDATE，即使时间戳只差几毫秒，也会产生写操作。
+
+**可能的优化（代码中未实现）：
+
+```sql
+-- 防抖优化：仅当距上次使用超过 1 分钟才更新
+UPDATE api_keys 
+SET last_used_at=now() 
+WHERE user_id=$1 and token=$2
+AND last_used_at IS NULL OR last_used_at < now() - interval '1 minute'
+```
+
+**当前设计考量**：
+- API Key 使用频率相对较低
+- 简单性优先，避免过度优化
+- 数据库写入量可控
+- 精确记录每次使用时间
+
+---
+
+## 八、补充代码引用速查
+
+| 补充主题 | 文件位置 | 行号 |
+|----------|----------|------|
+| Worker Pool 实现 | `internal/worker/pool.go` | 13-44 |
+| 异步刷新全部订阅 | `internal/api/feed_handlers.go` | 76-99 |
+| LocalizedError 定义 | `internal/locale/error.go` | 8-55 |
+| 翻译 Printer | `internal/locale/printer.go` | 18-30 |
+| 细粒度权限提升防护 | `internal/api/user_handlers.go` | 78-88 |
+| Feed 归属检查 | `internal/storage/feed.go` | 36-41 |
+| Google Reader 密码验证 | `internal/storage/integration.go` | 56-81 |
+| Context 键类型定义 | `internal/http/request/context.go` | 12-25 |
+| UserID 读取兜底 | `internal/http/request/context.go` | 60-73 |
+| last_used_at 更新 | `internal/storage/api_key.go` | 25-33 |
+| 密码哈希更新 | `internal/storage/user.go` | 177-186 |
