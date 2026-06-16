@@ -1515,3 +1515,575 @@ function goToPreviousPage(offset) {
 | 前端滚动定位 | `internal/ui/static/js/app.js` | 55 (`scrollPageTo`) |
 | 列表项跳转 | `internal/ui/static/js/app.js` | 389 (`goToListItem`) |
 | Session 数据库轮换 | `internal/storage/web_session.go` | 130 (`RotateWebSession`) |
+
+## 十四、边界场景深度分析（续）
+
+### 14.1 Staleness 阈值的运维侧配置入口
+
+**已实现完整的配置体系，环境变量驱动**
+
+Miniflux 通过环境变量配置多维度的 staleness（过期）阈值，运维侧可通过容器环境变量或配置文件注入：
+
+**配置定义**（`internal/config/options.go:125-155`）：
+```go
+"CLEANUP_ARCHIVE_BATCH_SIZE": {
+    parsedIntValue: 10000,          // 每次归档批大小
+    rawValue:       "10000",
+    valueType:      intType,
+    validator:      func(rawValue) error { return validateGreaterOrEqualThan(rawValue, 1) },
+},
+"CLEANUP_ARCHIVE_READ_DAYS": {
+    parsedDuration: time.Hour * 24 * 60,   // 已读条目 60 天后归档
+    rawValue:       "60",
+    valueType:      dayType,
+},
+"CLEANUP_ARCHIVE_UNREAD_DAYS": {
+    parsedDuration: time.Hour * 24 * 180,  // 未读条目 180 天后归档
+    rawValue:       "180",
+    valueType:      dayType,
+},
+"CLEANUP_FREQUENCY_HOURS": {
+    parsedDuration: time.Hour * 24,        // 每 24 小时执行一次清理
+    rawValue:       "24",
+    valueType:      hourType,
+},
+"CLEANUP_REMOVE_SESSIONS_DAYS": {
+    parsedDuration: time.Hour * 24 * 30,   // 30 天未使用的 Session 过期
+    rawValue:       "30",
+    valueType:      dayType,
+},
+```
+
+**配置访问方法**：
+```go
+// 获取方法在 options.go:652-660
+func (c *configOptions) CleanupArchiveBatchSize() int { return c.options["CLEANUP_ARCHIVE_BATCH_SIZE"].parsedIntValue }
+func (c *configOptions) CleanupArchiveReadInterval() time.Duration { return c.options["CLEANUP_ARCHIVE_READ_DAYS"].parsedDuration }
+func (c *configOptions) CleanupArchiveUnreadInterval() time.Duration { return c.options["CLEANUP_ARCHIVE_UNREAD_DAYS"].parsedDuration }
+func (c *configOptions) CleanupFrequency() time.Duration { return c.options["CLEANUP_FREQUENCY_HOURS"].parsedDuration }
+func (c *configOptions) CleanupRemoveSessionsInterval() time.Duration { return c.options["CLEANUP_REMOVE_SESSIONS_DAYS"].parsedDuration }
+```
+
+**归档执行 + Tombstone 防重摄入**（`internal/storage/entry.go:362-404`）：
+```go
+func (s *Storage) ArchiveEntries(status string, interval time.Duration, limit int) (int64, error) {
+    query := `
+        WITH to_delete AS (
+            SELECT id, feed_id, hash
+            FROM entries
+            WHERE
+                status=$1 AND
+                starred is false AND          -- 星标条目永不过期
+                share_code='' AND             -- 有分享码的条目永不过期
+                created_at < now() - $2::interval  -- 超过 staleness 阈值
+            ORDER BY created_at ASC
+            FOR UPDATE SKIP LOCKED           -- 跳过锁定行避免死锁
+            LIMIT $3
+        ), deleted AS (
+            DELETE FROM entries
+            USING to_delete
+            WHERE entries.id = to_delete.id
+            RETURNING entries.feed_id, entries.hash
+        )
+        INSERT INTO entry_tombstones (feed_id, hash)  -- 写入墓碑防止重新摄入
+        SELECT feed_id, hash FROM deleted WHERE hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING
+    `
+}
+```
+
+**运维配置入口汇总**：
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `CLEANUP_FREQUENCY_HOURS` | 24h | 清理任务执行频率 |
+| `CLEANUP_ARCHIVE_READ_DAYS` | 60天 | 已读条目 staleness 阈值 |
+| `CLEANUP_ARCHIVE_UNREAD_DAYS` | 180天 | 未读条目 staleness 阈值 |
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | 每次归档批大小 |
+| `CLEANUP_REMOVE_SESSIONS_DAYS` | 30天 | Web Session staleness 阈值 |
+| `POLLING_PARSING_ERROR_LIMIT` | 3 | Feed 抓取失败禁用阈值 |
+
+### 14.2 ResourceBundle.SyncVersion 回滚路径
+
+**当前实现：数据库 Schema 单向升级，无回滚路径**
+
+**Schema 版本管理**（`internal/database/migrations.go:13`）：
+```go
+var schemaVersion = len(migrations)  // 版本号 = 迁移数组长度，单向递增
+```
+
+**升级逻辑**（`internal/database/database.go:13-51`）：
+```go
+func Migrate(db *sql.DB) error {
+    var currentVersion int
+    db.QueryRow(`SELECT version FROM schema_version`).Scan(&currentVersion)
+
+    for version := currentVersion; version < schemaVersion; version++ {
+        newVersion := version + 1
+
+        tx, err := db.Begin()
+
+        if err := migrations[version](tx); err != nil {   // 执行单个迁移
+            tx.Rollback()                                  // 失败回滚事务
+            return fmt.Errorf("[Migration v%d] %v", newVersion, err)
+        }
+
+        tx.Exec(`TRUNCATE schema_version`)
+        tx.Exec(`INSERT INTO schema_version (version) VALUES ($1)`, newVersion)
+        tx.Commit()
+    }
+}
+```
+
+**启动时版本检查**（`database.go:53-60`）：
+```go
+func IsSchemaUpToDate(db *sql.DB) error {
+    var currentVersion int
+    db.QueryRow(`SELECT version FROM schema_version`).Scan(&currentVersion)
+    if currentVersion < schemaVersion {
+        return fmt.Errorf(`the database schema is not up to date: current=v%d expected=v%d`,
+            currentVersion, schemaVersion)
+    }
+    return nil  // 只检查版本不低于，不回滚
+}
+```
+
+**回滚能力缺失清单**：
+- 没有 `migrations_down` 反向迁移数组
+- 没有 `rollback` CLI 命令（仅有 `-migrate` 正向迁移）
+- 没有 Schema 版本快照备份机制
+- 没有降级启动（旧版二进制 + 新版 Schema）的兼容层
+- `schema_version` 表只有 `version` 字段，无 `applied_at`、`rollback_sql` 等元数据
+
+**唯一的"回滚"方式**：备份数据库 → 升级失败 → 恢复备份
+
+### 14.3 重投上限自适应策略
+
+**当前实现：固定阈值线性计数，无自适应调整**
+
+**Feed 抓取错误计数**（`internal/model/feed.go:100-110`）：
+```go
+// 固定阈值 3，无自适应
+func (f *Feed) WithTranslatedErrorMessage(message string) {
+    f.ParsingErrorCount++          // 线性递增，无加权
+    f.ParsingErrorMsg = message
+}
+
+func (f *Feed) ResetErrorCounter() {
+    f.ParsingErrorCount = 0         // 成功直接归零，无滑动窗口
+    f.ParsingErrorMsg = ""
+}
+```
+
+**调度器错误过滤**（`internal/cli/scheduler.go:36-42`）：
+```go
+WithErrorLimit(errorLimit)
+// errorLimit = config.Opts.PollingParsingErrorLimit() = 3（固定）
+```
+
+**调度频率自适应（仅轮询间隔）**（`internal/model/feed.go:122-149`）：
+```go
+func (f *Feed) ScheduleNextCheck(weeklyCount int, refreshDelay time.Duration) time.Duration {
+    // 只有 Entry Frequency 模式下根据条目频率动态调整间隔
+    if config.Opts.PollingScheduler() == SchedulerEntryFrequency {
+        interval = (7 * 24 * time.Hour) / time.Duration(weeklyCount*factor)
+        interval = min(interval, maxInterval)
+        interval = max(interval, minInterval)
+    }
+    // 但重试上限（错误计数阈值）不调整
+}
+```
+
+**缺失的自适应能力**：
+- 没有根据历史失败率动态调整 `ParsingErrorLimit`
+- 没有指数退避（`delay = base * 2^attempt`）
+- 没有抖动（Jitter）防止惊群
+- 没有按失败原因（网络超时 / 403 / 解析错误）分类的差异化策略
+- 推送层面没有任何重试，更谈不上自适应
+
+**对比：各层面重试策略现状**：
+| 层面 | 重试机制 | 上限 | 自适应 |
+|------|----------|------|--------|
+| Feed 轮询 | 线性计数 + 重试时间窗口 | POLLING_PARSING_ERROR_LIMIT=3（固定） | 仅轮询间隔自适应，上限不调整 |
+| HTTP 抓取 | 支持 Retry-After 头 | 无 | 依赖服务端响应 |
+| 集成推送 | 无 | - | - |
+| 数据库事务 | 单事务内自动回滚 | 立即失败上报 | 不重试 |
+
+### 14.4 Wait-For Graph 死锁检测周期
+
+**当前实现：完全不存在死锁检测机制**
+
+Miniflux 的并发设计基于"尽量避免使用锁"的哲学，因此没有实现 Wait-For Graph：
+
+**并发设计模式**：
+```go
+// 1. Worker 池：channel + goroutine，无显式锁
+type Pool struct {
+    queue chan model.Job  // 无缓冲 channel
+    wg    sync.WaitGroup
+}
+
+// 2. 数据库级并发：PostgreSQL MVCC + FOR UPDATE SKIP LOCKED
+WITH to_delete AS (
+    SELECT id FROM entries ...
+    FOR UPDATE SKIP LOCKED  -- 跳过锁定行，不等锁 = 天然避免死锁
+)
+
+// 3. 推送并发：独立 goroutine 独立状态
+go integration.PushEntries(feed, newEntries, userIntegrations)  // 每 Feed 独立，无共享状态
+```
+
+**缺失的死锁治理能力**：
+- 没有 `sync.Mutex` 锁等待图（WFG）构建
+- 没有周期检测（如每 10 秒扫描 goroutine stack trace）
+- 没有死锁检测超时机制
+- 没有 goroutine 泄漏监控（pprof 除外，需手动调用）
+- 没有数据库死锁监控（PostgreSQL `pg_stat_activity` 除外，需 DBA 手动检查）
+
+**唯一的隐式保护**：`FOR UPDATE SKIP LOCKED` 在批量操作中避免了数据库级别的行锁等待，消除了最常见的死锁来源。
+
+### 14.5 BloomFilter 阈值上下界
+
+**当前实现：完全不存在布隆过滤器**
+
+Miniflux 使用多层精确去重策略，不使用概率数据结构：
+
+**去重层级**：
+```
+层1: RSS 适配层 GUID 碰撞兜底 (SHA-256)
+  ↓
+层2: 存储层条目哈希 (FNV-128a)
+  ↓
+层3: 数据库唯一索引 (feed_id, hash)
+  ↓
+层4: 归档墓碑 entry_tombstones (归档后防止重摄入)
+```
+
+**条目去重检查**（`internal/storage/entry.go:213-231`）：
+```go
+func (s *Storage) entryExists(tx *sql.Tx, entry *model.Entry) (bool, error) {
+    err := tx.QueryRow(`SELECT true FROM entries WHERE feed_id=$1 AND hash=$2 LIMIT 1`,
+        entry.FeedID, entry.Hash).Scan(&result)
+}
+```
+
+**墓碑防止重摄入**（`entry.go:386-388`）：
+```sql
+INSERT INTO entry_tombstones (feed_id, hash)
+SELECT feed_id, hash FROM deleted WHERE hash <> ''
+ON CONFLICT (feed_id, hash) DO NOTHING
+```
+
+**不存在的能力**：
+- 没有内存级布隆过滤器快速过滤
+- 没有假阳性（False Positive）概率参数配置
+- 没有上下界动态调整（根据内存压力 / 条目数量）
+- 没有计数布隆过滤器（支持删除操作）
+- 没有分层布隆（ColdFilter + HotFilter）架构
+
+**设计权衡分析**：
+
+| 维度 | 布隆过滤器方案 | Miniflux 当前方案（精确去重） |
+|------|---------------|-------------------------------|
+| 假阳性 | 0.01%~1% 可调 | 0（精确） |
+| 内存占用 | O(n) 极小（万级条目 < 100KB） | 数据库 B-Tree 索引 |
+| 查询速度 | 内存访问 ~100ns | SQL 查询 ~1ms |
+| 删除支持 | 需计数布隆（2-4x内存） | 原生支持 |
+| 部署复杂度 | 需配置参数 | 零配置 |
+| 假阳性后果 | 新条目被误判为重复而丢弃 | 无 |
+
+Miniflux 选择零配置 + 零假阳性的精确方案，牺牲部分性能换取可靠性。
+
+### 14.6 Leaky Bucket 恢复到 Token Bucket 的时机
+
+**当前实现：不存在 Bucket 限流算法体系**
+
+Miniflux 采用三层被动限流，没有主动的 Token Bucket 或 Leaky Bucket，因此不存在"降级→恢复"状态机：
+
+**三层被动限流**：
+```
+层1: Worker 池固定大小 = 16（自然背压，不区分桶类型）
+  ↓
+层2: 调度器 BATCH_SIZE = 100 + LIMIT_PER_HOST = 0（可配置每主机限制）
+  ↓
+层3: 被动检测 HTTP 429 + 解析 Retry-After
+```
+
+**429 响应处理**（`internal/reader/fetcher/response_handler.go:98-100`）：
+```go
+func (r *ResponseHandler) IsRateLimited() bool {
+    return r.httpResponse != nil &&
+        r.httpResponse.StatusCode == http.StatusTooManyRequests
+}
+```
+
+**恢复时机（隐式）**（`internal/reader/handler/handler.go:245-255`）：
+```go
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()
+    // 将下一次检查时间推迟 Retry-After 指定的时间
+    originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+    // 经过 retryDelay 后，系统自然恢复正常调度
+    // 无需状态转换，因为没有"限流状态"的概念
+}
+```
+
+**不存在的能力**：
+- 没有 Token Bucket → Leaky Bucket 的平滑降级
+- 没有 Leaky Bucket → Token Bucket 的自动恢复判断
+- 没有 429 计数 / 成功率的状态机转换阈值
+- 没有半开状态（Half-Open）探测恢复
+- 没有熔断机制（连续失败后暂停一段时间）
+
+**隐含的恢复逻辑**：
+- 每次调度独立判断，不保留历史状态
+- `Retry-After` 超时后，下次调度与正常 Feed 无区别
+- 错误计数 `ParsingErrorCount` 只有成功时清零，与限流状态不关联
+
+### 14.7 密钥泄露后的 KeyId 回收流程
+
+**当前实现：API Key 可即时删除，但无版本号和泄露审计**
+
+**API Key 生命周期管理**（`internal/storage/api_key.go`）：
+
+**创建**（`api_key.go:73-101`）：
+```go
+func (s *Storage) CreateAPIKey(userID int64, description string) (*model.APIKey, error) {
+    query := `INSERT INTO api_keys (user_id, token, description)
+              VALUES ($1, $2, $3) RETURNING ...`
+    return s.db.QueryRow(
+        query,
+        userID,
+        crypto.GenerateRandomStringHex(32),  // 256-bit 随机 hex
+        description,
+    )
+}
+```
+
+**删除（回收）**（`api_key.go:103-119`）：
+```go
+func (s *Storage) DeleteAPIKey(userID, keyID int64) error {
+    result, err := s.db.Exec(`DELETE FROM api_keys WHERE id = $1 AND user_id = $2`,
+        keyID, userID)
+    count, _ := result.RowsAffected()
+    if count == 0 {
+        return ErrAPIKeyNotFound
+    }
+    return nil
+}
+```
+
+**Web Session 紧急轮换**（`internal/storage/web_session.go:130-159`）：
+```go
+func (s *Storage) RotateWebSession(oldID string, session *model.WebSession) error {
+    err = s.db.QueryRow(`
+        UPDATE web_sessions
+        SET id=$2, secret_hash=$3, user_id=$4, state=$5, created_at=now()
+        WHERE id=$1
+        RETURNING created_at
+    `, oldID, session.ID, session.SecretHash, ...).Scan(&session.CreatedAt)
+}
+```
+
+**回收能力对比**：
+| 密钥类型 | 删除/回收 | KeyId 版本 | 泄露审计日志 | 双活过渡期 |
+|----------|-----------|------------|--------------|------------|
+| API Key | ✅ `DELETE FROM api_keys` | ❌ 无 KeyId 版本号 | ❌ 无删除审计 | ❌ 立即失效 |
+| Web Session | ✅ `Rotate()` 或过期清理 | ❌ 轮换但无版本 | ❌ 无轮换审计 | ❌ 新 ID 替换旧 ID |
+| Webhook Secret | ⚠️ 通过集成页面更新值 | ❌ 无版本 | ❌ 无变更日志 | ❌ 立即用新密钥签名 |
+| WebAuthn Credentials | ✅ `DeleteCredential` | ❌ 无版本 | ❌ 无 | ❌ 立即失效 |
+
+**UI 回收入口**（`internal/ui/ui.go:139`）：
+```go
+mux.HandleFunc("POST /keys/{keyID}/delete", handler.deleteAPIKey)
+// 路由：{keyID} 是自增 ID，不是 token 值
+```
+
+**缺失的企业级能力**：
+- 没有 KeyId 前缀标识（如 `mk_live_xxx` / `mk_test_xxx`）
+- 没有泄露事件后的批量吊销
+- 没有密钥使用审计（创建时间、最后使用时间、使用次数、IP 来源）
+- 没有 HMAC 密钥版本号（无法判断签名是旧密钥还是新密钥）
+- 没有主动令牌扫描（检测提交到 GitHub 的泄露密钥）
+
+### 14.8 Virtualized List 滚动跳转动画
+
+**当前实现：滚动跳转无动画，但存在其他动画系统**
+
+**滚动跳转实现**（`internal/ui/static/js/app.js:50-64`）：
+```javascript
+function scrollPageTo(element, evenIfOnScreen) {
+    const windowScrollPosition = window.scrollY;
+    const windowHeight = document.documentElement.clientHeight;
+    const viewportPosition = windowScrollPosition + windowHeight;
+    const itemBottomPosition = element.offsetTop + element.offsetHeight;
+
+    if (evenIfOnScreen ||
+        viewportPosition - itemBottomPosition < 0 ||       // 元素底部超出视口
+        viewportPosition - element.offsetTop > windowHeight) {  // 元素顶部超出视口
+        window.scrollTo(0, element.offsetTop - 10);  // ⚡ 瞬时跳转，无过渡动画
+    }
+}
+```
+
+**动画系统现状**（分散在 UI 各模块）：
+
+**Toast 通知动画**（`app.js:269-275` + `common.css:296-297`）：
+```javascript
+toastElementWrapper.addEventListener("animationend", () => {
+    toastElementWrapper.remove();
+});
+setTimeout(() => toastElementWrapper.classList.add("toast-animate"), 100);
+```
+```css
+.toast-animate {
+    animation: toastKeyFrames 2s;  /* 2秒渐入渐出 */
+}
+```
+
+**触摸滑动动画**（`touch_handler.js:37-88`）：
+```javascript
+onItemTouchStart(event) {
+    this.touch.element.style.transitionDuration = "0s";  // 跟随手指移动，无过渡
+}
+onItemTouchMove(event) {
+    const tx = (absDistance > 75 ? Math.sqrt(absDistance - 75) + 75 : absDistance) * Math.sign(distance);
+    this.touch.element.style.transform = `translateX(${tx}px)`;  // 阻尼效果
+}
+onItemTouchEnd(event) {
+    if (Math.abs(this.calculateDistance()) > 75) {
+        toggleEntryStatus(this.touch.element);  // 达到阈值切换状态
+    }
+    if (this.touch.moved) {
+        this.touch.element.style.transitionDuration = "0.15s";  // 松手 150ms 回弹
+        this.touch.element.style.transform = "none";
+    }
+}
+```
+
+**页面过渡动画**（`common.css:85-92`）：
+```css
+/* Smoother pages transition */
+@view-transition {
+    navigation: auto;
+}
+@view-transition {
+    navigation: cross-fade;
+}
+```
+
+**滚动动画缺失清单**：
+- 没有 `window.scrollTo({top, behavior: "smooth"})` 平滑滚动
+- 没有键盘跳转的视觉过渡（当前项 → 目标项）
+- 没有滚动到顶部/底部的弹性动效
+- 没有骨架屏加载动画
+- 没有进入视口的渐入动画（IntersectionObserver）
+
+**阻尼函数分析**（触摸滑动）：
+```
+absDistance ≤ 75px:  tx = absDistance                // 线性跟随
+absDistance > 75px:  tx = sqrt(absDistance - 75) + 75  // 亚线性阻尼，越拉越难
+```
+这种设计防止用户无限制滑动，同时提供超阈值后的"弹性"反馈。
+
+## 十五、架构总结（终极版）
+
+### 15.1 设计优点（15项）
+
+1. **解耦清晰**：Feed 刷新与集成推送完全分离，通过 goroutine 异步执行
+2. **容错性好**：单个渠道或单个 Feed 失败不影响整体系统
+3. **配置灵活**：每个用户可独立配置多个渠道，支持 Feed 级 Webhook 覆盖
+4. **背压机制**：Worker 池 + 无缓冲 channel 实现自然限流
+5. **安全考虑**：Webhook 签名验证、私有网络访问控制
+6. **安全哈希**：条目基于 FNV-128a 哈希去重，Webhook 使用 HMAC-SHA256 防伪造
+7. **调度智能**：支持基于条目频率的自适应调度间隔（Round-Robin / Entry Frequency）
+8. **碰撞兜底**：RSS GUID 重复时有三级 fallback 策略
+9. **数据库保障**：`(feed_id, hash)` 唯一索引从存储层面防止重复
+10. **资源清理**：Orphan Icons、过期 Session、旧条目归档定期清理
+11. **废弃兼容**：配置项废弃有警告日志，时区废弃有自动迁移映射
+12. **运维友好**：staleness 阈值全量环境变量配置，无需改源码
+13. **墓碑机制**：条目归档后写入 `entry_tombstones` 防止重新摄入
+14. **死锁避免**：`FOR UPDATE SKIP LOCKED` 跳过锁定行，天然避免数据库死锁
+15. **零配置去重**：精确去重多层兜底，零假阳性风险
+
+### 15.2 潜在改进点（已验证的缺失功能，共34项）
+
+1. **推送无重试**：集成推送失败后不会重试，可能导致消息丢失
+2. **推送无队列**：大量 Feed 同时刷新时，可能产生大量推送 goroutine
+3. **无速率限制**：对第三方 API 的调用速率没有限制（如 Telegram 的每分钟消息限制）
+4. **批量不一致**：Webhook 批量推送 vs Telegram/Slack 单条推送，策略不统一
+5. **无动态扩展**：添加新渠道需要修改核心代码，不支持插件
+6. **无消息模板**：推送格式硬编码，用户无法自定义
+7. **无 DLQ**：失败消息无法追溯和重放
+8. **无优先级队列**：高优先级消息无法插队处理
+9. **无推送去重**：多渠道同时启用时同一条消息会重复推送
+10. **无进度可视化**：没有推送状态追踪和 UI 展示
+11. **无插件接口**：没有 `IntegrationPluginInterface` 或插件市场
+12. **无推送 i18n**：推送消息不支持国际化
+13. **无 DLQ 重投策略**：没有指数退避、最大重试次数等策略
+14. **无优先级反转检测**：没有 PriorityChannel 或优先级继承
+15. **无主动碰撞检测**：FNV-128a 哈希碰撞时没有告警
+16. **无自适应批组合并**：没有 BatchCoalescer 或滑动窗口合并
+17. **无 HMAC 密钥轮换**：Webhook 密钥无法安全轮换
+18. **无 DispatchTracker**：没有 in-flight 请求追踪和 UI 优化
+19. **无集成健康检查**：没有检测不再响应的集成配置
+20. **无配置热重载**：配置变更需重启服务
+21. **无指数退避重试**：失败重试是固定阈值，无抖动和退避
+22. **无死锁检测**：并发原语无监控，仅靠 SKIP LOCKED 避免
+23. **无布隆过滤器**：内存级快速去重缺失（选择精确方案替代）
+24. **无客户端限流**：无 Token Bucket 控制第三方 API 调用速率
+25. **无密钥审计**：HMAC 操作无日志追踪，API Key 无版本管理
+26. **无虚拟列表**：前端大数据量渲染性能未优化
+27. **无 Schema 回滚**：数据库迁移单向，失败需恢复备份
+28. **无重试上限自适应**：`ParsingErrorLimit=3` 固定，不根据历史调整
+29. **无布隆过滤器动态阈值**：概率去重方案不存在
+30. **无限流状态机**：Token/Leaky Bucket 状态转换缺失
+31. **无密钥版本管理**：HMAC/Webhook Secret 无 KeyId 标识和双活过渡期
+32. **无滚动平滑动画**：键盘跳转 `window.scrollTo` 瞬时，无过渡
+33. **无密钥泄露审计**：API Key 删除/使用无详细日志
+34. **无半开状态探测**：限流恢复无渐进式探测验证
+
+### 15.3 关键代码位置（终极版，41个模块）
+
+| 模块 | 文件路径 | 核心行号 |
+|------|----------|----------|
+| 推送入口 | `internal/integration/integration.go` | 511 (`PushEntries`) |
+| 触发点 | `internal/reader/handler/handler.go` | 338 (`go integration.PushEntries`) |
+| Worker 池 | `internal/worker/pool.go` | 33 (`NewPool`) |
+| 调度器 | `internal/cli/scheduler.go` | 33 (`feedScheduler`) |
+| Telegram 实现 | `internal/integration/telegrambot/telegrambot.go` | 16 (`PushEntry`) |
+| Slack 实现 | `internal/integration/slack/slack.go` | 34 (`SendSlackMsg`) |
+| Webhook 实现 | `internal/integration/webhook/webhook.go` | 73 (`SendNewEntriesWebhookEvent`) |
+| 配置模型 | `internal/model/integration.go` | 7 (`Integration` 结构体) |
+| 错误计数 | `internal/model/feed.go` | 100 (`WithTranslatedErrorMessage`) |
+| 调度间隔 | `internal/model/feed.go` | 122 (`ScheduleNextCheck`) |
+| 条目去重 | `internal/storage/entry.go` | 213 (`entryExists`) |
+| 条目归档+墓碑 | `internal/storage/entry.go` | 362 (`ArchiveEntries`) |
+| FNV 哈希 | `internal/crypto/crypto.go` | 18 (`HashFromBytes`) |
+| SHA256 哈希 | `internal/crypto/crypto.go` | 26 (`SHA256`) |
+| HMAC 签名 | `internal/crypto/crypto.go` | 48 (`GenerateSHA256Hmac`) |
+| 恒定时间比较 | `internal/crypto/crypto.go` | 59 (`ConstantTimeCmp`) |
+| Ntfy 优先级 | `internal/integration/ntfy/ntfy.go` | 54 (`Priority: c.ntfyPriority`) |
+| Pushover 优先级 | `internal/integration/pushover/pushover.go` | 88 (`Priority: c.priority`) |
+| 指标监控 | `internal/metric/metric.go` | 24 (`BackgroundFeedRefreshDuration`) |
+| GUID 碰撞兜底 | `internal/reader/rss/adapter.go` | 116-139 |
+| Session 轮换 | `internal/model/web_session.go` | 68 (`Rotate`) |
+| i18n 资源 | `internal/locale/catalog.go` | 20 (`embed.FS` 翻译包) |
+| 唯一索引 | `internal/database/migrations.go` | 88 (`unique (feed_id, hash)`) |
+| Orphan 清理 | `internal/storage/icon.go` | 149 (`CleanupOrphanIcons`) |
+| 定期清理任务 | `internal/cli/cleanup_tasks.go` | 16 (`runCleanupTasks`) |
+| 配置废弃警告 | `internal/config/parser.go` | 166 (`slog.Warn deprecated`) |
+| 时区废弃映射 | `internal/database/migrations.go` | 1184 (`deprecatedTimeZoneMap`) |
+| 限流检测 | `internal/reader/fetcher/response_handler.go` | 98 (`IsRateLimited`) |
+| Retry-After 解析 | `internal/reader/fetcher/response_handler.go` | 80 (`ParseRetryDelay`) |
+| 前端滚动定位 | `internal/ui/static/js/app.js` | 55 (`scrollPageTo`) |
+| 列表项跳转 | `internal/ui/static/js/app.js` | 389 (`goToListItem`) |
+| Session DB 轮换 | `internal/storage/web_session.go` | 130 (`RotateWebSession`) |
+| Staleness 配置 | `internal/config/options.go` | 125-155 (`CLEANUP_*` 定义) |
+| Schema 单向迁移 | `internal/database/database.go` | 13 (`Migrate` 单向升级) |
+| 版本完整性检查 | `internal/database/database.go` | 53 (`IsSchemaUpToDate`) |
+| API Key 创建 | `internal/storage/api_key.go` | 73 (`CreateAPIKey`) |
+| API Key 删除 | `internal/storage/api_key.go` | 104 (`DeleteAPIKey`) |
+| 清理配置访问器 | `internal/config/options.go` | 652-660 |
+| Toast 动画 | `internal/ui/static/js/app.js` | 269 (`animationend` 监听) |
+| 触摸阻尼动画 | `internal/ui/static/js/touch_handler.js` | 37-88 |
+| 页面过渡动画 | `internal/ui/static/css/common.css` | 85-92 (`@view-transition`) |
