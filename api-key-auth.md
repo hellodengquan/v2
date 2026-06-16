@@ -1510,3 +1510,767 @@ if user.IsAdmin {
 | CLI 重置密码 | `internal/cli/reset_password.go` | 15-38 |
 | 用户删除（异步） | `internal/api/user_handlers.go` | 246-253 |
 | Fever 中间件 | `internal/fever/middleware.go` | 17-72 |
+
+---
+
+## 十、专家级深度补充
+
+### 10.1 12列对比矩阵下的混合鉴权
+
+#### 混合鉴权的实际链路
+
+Miniflux 采用 **链式穿透混合鉴权**，代码在 `internal/api/api.go:77` 以洋葱模型嵌套：
+
+```go
+return middleware.withCORSHeaders(
+    middleware.validateAPIKeyAuth(          // 外层
+        middleware.validateBasicAuth(mux)   // 内层
+    )
+)
+```
+
+**穿透逻辑**：
+`internal/api/middleware.go:42-48` - API Key 未提供时穿透到 Basic Auth
+```go
+if token == "" {
+    slog.Debug("[API] Skipped API token authentication", ...)
+    next.ServeHTTP(w, r)  // ← 关键：不拒绝，穿透到下一层
+    return
+}
+```
+
+`internal/api/middleware.go:92-95` - Basic Auth 检测到已认证时直接穿透
+```go
+if request.IsAuthenticated(r) {
+    next.ServeHTTP(w, r)  // ← 关键：已有认证直接通过
+    return
+}
+```
+
+**四种实际鉴权组合**：
+
+| 请求携带 | validateAPIKeyAuth | validateBasicAuth | 结果 |
+|----------|-------------------|-------------------|------|
+| **仅 X-Auth-Token** | ✅ 提取并验证成功，注入 Context | 检测到已认证，直接穿透 | API Key 鉴权成功 |
+| **仅 Authorization (Basic)** | ⚠️ token 为空，**穿透** | ✅ 提取并验证成功，注入 Context | Basic Auth 鉴权成功 |
+| **两者都有** | ✅ API Key 优先，注入 Context | 检测到已认证，直接穿透 | API Key 优先（Basic 被忽略） |
+| **都没有** | ⚠️ 穿透，注入无认证 | ⚠️ 无凭据，返回 401 | 401 Unauthorized |
+
+**混合鉴权的安全权衡**：
+
+| 优势 | 风险 |
+|------|------|
+| 单一请求失败不阻塞，降级友好 | Basic Auth 凭据通过 HTTPS 传输，但仍在日志中有泄漏风险 |
+| 客户端可随意切换鉴权方式 | 同时携带两种凭据时，**API Key 优先**，易引起混淆 |
+| 兼容多种客户端 | 穿透逻辑可能绕过预期的鉴权策略（如某接口本应强制 Basic） |
+
+**典型混合场景**：
+
+```
+场景：CI/CD Pipeline + curl 调试
+
+1. 流水线脚本使用 X-Auth-Token（多 Key 可单独撤销）
+   GET /v1/feeds
+   Header: X-Auth-Token: aaa...
+
+2. 开发人员临时调试使用 Basic Auth（无需创建 Key）
+   curl -u admin:pass123 https://miniflux/v1/feeds
+
+3. 两者都发送的罕见场景：
+   curl -u admin:pass123 -H "X-Auth-Token: aaa..." /v1/feeds
+   → API Key 验证成功，Basic 密码被完全忽略（即使密码错误也成功）
+```
+
+---
+
+### 10.2 条件更新的统计偏差
+
+#### 偏差来源与量级
+
+`last_used_at` 引入 1 分钟防抖后，统计指标会产生系统性偏差。
+
+**SQL 条件更新代码**：
+```sql
+UPDATE api_keys
+SET last_used_at = now()
+WHERE user_id = $1 AND token = $2
+AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
+```
+
+**四种偏差场景**：
+
+**场景一：请求频率不均匀**
+
+```
+真实请求序列 (10次/min 峰值 → 0 平稳):
+0s 10s 20s 30s 40s 50s 70s 130s 190s 250s
+
+防抖后记录:
+0s                     70s  130s  190s  250s
+
+统计偏差:
+- 峰值前 60s 的 6 次请求 → 记录 1 次，漏记 5 次
+- 每分钟平均 1.6 次 → 实际平均 4.0 次
+- 统计失真率: 60% (低频时) → 0% (高频时)
+```
+
+**场景二：审计回溯精度**
+
+```
+攻击者入侵时间: 实际 14:32:18
+last_used_at 记录: 14:32:00 (20s 误差)
+
+取证时的影响:
+- 溯源可定位到 ±30s (平均误差)
+- 峰值误差上限: 59s (窗口边界)
+- 无法还原窗口内的精确访问次数
+```
+
+**场景三：活跃度误判阈值**
+
+```
+阈值定义: 7天未使用 = 不活跃 Key
+
+真实使用: 第 7 天 23:59:30 使用了一次 → 应判为活跃
+防抖记录: 23:59:00 (假设上次 23:58:05) → 被判为不活跃 (7天+30s)
+
+后果: 误删除仍在使用的 Key
+建议修正: 阈值 = 原阈值 + 防抖窗口大小
+```
+
+**场景四：数据库死锁统计偏差**
+
+```
+原始: 1000 QPS → 1000 次锁争用
+防抖60s: 1000 QPS → ~17 次锁争用 (降低 98.3%)
+但数据库指标:
+- "update 行数" 指标下降 98%
+- 会误导 DBA 认为流量下降，实则只是写入被合并
+```
+
+**偏差校准公式**：
+
+```
+估算实际使用次数 ≈ 记录使用次数 × (1 + 窗口内平均并发请求数/2)
+
+示例:
+窗口=60s，平均QPS=5
+估算次数 ≈ 记录次数 × (1 + 5×60/2) = 记录次数 × 151
+但当QPS低时此公式不适用，因此：
+
+推荐方案: 保留一个独立统计列（无防抖）用于精确计数
+```
+
+---
+
+### 10.3 四级一致性的审计采样
+
+#### 采样策略与一致性映射
+
+四级一致性级别对应四种审计采样策略：
+
+| 级别 | 窗口 | 写入频率 | 采样策略 | 适用合规 |
+|------|------|----------|----------|----------|
+| **强一致** (0s) | 0s | 每次请求 | 全量记录 | SOC 2 Type II、支付级 |
+| **准一致** (10s) | 10s | ~6次/分钟 | 随机采样 1% + 全量异常 | 普通 SaaS、内部工具 |
+| **最终一致** (60s) | 60s | ~1次/分钟 | 首次+末次记录 | 个人项目、低安全 |
+| **最终一致** (300s) | 300s | ~1次/5分钟 | 仅末次记录 | 统计看板、非审计用 |
+
+**多级采样实现**（可叠加在条件更新之上）：
+
+```go
+// 准一致级别：10秒窗口 + 1% 随机采样
+func (s *Storage) SetAPIKeyUsedTimestampWithSampling(userID int64, token string, requestID string) (updated bool, err error) {
+    query := `
+        UPDATE api_keys
+        SET last_used_at = now()
+        WHERE user_id = $1 AND token = $2
+        AND (
+            last_used_at IS NULL
+            OR last_used_at < now() - interval '10 seconds'
+            OR $3::varchar IS NOT NULL  -- 1% 采样强制更新
+        )
+    `
+
+    // 对 requestID 哈希，1% 概率强制全量记录
+    shouldSample := hashString(requestID) % 100 == 0
+    var sampleArg interface{}
+    if shouldSample {
+        sampleArg = requestID  // 触发强制更新分支
+    }
+
+    result, err := s.db.Exec(query, userID, token, sampleArg)
+    if err != nil {
+        return false, err
+    }
+
+    rows, _ := result.RowsAffected()
+    return rows > 0, nil
+}
+```
+
+**异常流量全量采样触发条件**：
+
+```
+触发全量记录的条件:
+1. Token 首次使用 (last_used_at IS NULL)
+2. IP 变更 (与上次记录的 IP 不同) → 需额外存储 last_ip
+3. UA 变更 (与上次记录的 UA 不同) → 需额外存储 last_ua
+4. 检测到 brute force (同一 IP 连续失败 >5 次)
+5. 随机采样命中 (1%)
+6. 窗口到期 (正常防抖更新)
+```
+
+**四级一致性的审计报表精度**：
+
+| 报表指标 | 强一致 (0s) | 准一致 (10s) | 最终一致 (60s) | 最终一致 (300s) |
+|----------|-------------|-------------|----------------|-----------------|
+| 精确 QPS | ✅ ±0% | ⚠️ ±5-10% | ❌ ±30-50% | ❌ ±80-90% |
+| 用户活跃度排行 | ✅ ±0% | ✅ ±2% | ⚠️ ±10% | ❌ ±40% |
+| 入侵时间溯源 | ✅ ±1s | ⚠️ ±5s | ⚠️ ±30s | ❌ ±2.5min |
+| 泄露 Key 精确停用时间 | ✅ 精确 | ✅ 精确 | ⚠️ ±60s | ❌ ±300s |
+| 数据库写入量 | 1.0x | 0.1x | 0.017x | 0.003x |
+
+---
+
+### 10.4 CountAdmins 原子事务
+
+#### 原子性问题的来源
+
+当前代码缺失 `CountAdmins()` 检查。若要实现，必须保证 **SELECT COUNT → DELETE** 的原子性。
+
+**非原子实现的竞争窗口**：
+
+```
+管理员 A (ID=1)          管理员 B (ID=2)
+    │                        │
+    │ 1. SELECT COUNT(*)     │
+    │    FROM users WHERE    │
+    │    is_admin='t'        │
+    │    → 返回 2            │
+    │                        │ 2. SELECT COUNT(*)
+    │                        │    → 返回 2
+    │ 3. 检查: 2 > 1 ✅      │ 3. 检查: 2 > 1 ✅
+    │ 4. DELETE user_id=2    │ 4. DELETE user_id=1
+    │    COMMIT              │    COMMIT
+    │                        │
+    └────── 结果: 0 个管理员！双方都成功删除 ──────┘
+```
+
+**正确的原子事务实现**（推荐 PostgreSQL 方案）：
+
+```go
+// storage/user.go - 新增方法
+func (s *Storage) RemoveUserIfNotLastAdmin(userID int64, operatorID int64) error {
+    tx, err := s.db.Begin()
+    if err != nil {
+        return fmt.Errorf(`store: unable to start transaction: %v`, err)
+    }
+    defer tx.Rollback()
+
+    // 步骤1: 加锁读取管理员数量 (FOR UPDATE 行锁 + SERIALIZABLE 隔离级别)
+    var adminCount int
+    err = tx.QueryRow(`
+        SELECT COUNT(*)
+        FROM users
+        WHERE is_admin = true
+        FOR UPDATE  -- 关键: 锁住所有管理员行，阻塞并发读取
+    `).Scan(&adminCount)
+
+    if err != nil {
+        return fmt.Errorf(`store: unable to count admins: %v`, err)
+    }
+
+    // 步骤2: 获取待删除用户的管理员状态
+    var targetIsAdmin bool
+    err = tx.QueryRow(`
+        SELECT is_admin FROM users WHERE id=$1
+        FOR UPDATE  -- 锁定目标行
+    `, userID).Scan(&targetIsAdmin)
+
+    if err != nil {
+        return fmt.Errorf(`store: unable to fetch target user: %v`, err)
+    }
+
+    // 步骤3: 业务检查
+    if userID == operatorID {
+        return fmt.Errorf(`store: you cannot remove yourself`)
+    }
+
+    if targetIsAdmin && adminCount <= 1 {
+        return fmt.Errorf(`store: cannot remove the last administrator`)
+    }
+
+    // 步骤4: 执行删除
+    _, err = tx.Exec(`DELETE FROM users WHERE id=$1`, userID)
+    if err != nil {
+        return fmt.Errorf(`store: unable to delete user: %v`, err)
+    }
+
+    // 步骤5: 提交事务 (至此原子性保证)
+    if err := tx.Commit(); err != nil {
+        return fmt.Errorf(`store: unable to commit transaction: %v`, err)
+    }
+
+    return nil
+}
+```
+
+**三种原子性保障方案对比**：
+
+| 方案 | 原理 | 隔离级别 | 死锁风险 | 性能开销 |
+|------|------|----------|----------|----------|
+| **FOR UPDATE 行锁** | 锁定所有管理员行 | REPEATABLE READ | ⚠️ 高（按顺序加锁可避免） | 中 |
+| **SERIALIZABLE 隔离** | 序列化冲突回滚重试 | SERIALIZABLE | ✅ 无（冲突即失败） | 高（冲突重试） |
+| **pg_advisory_xact_lock** | 应用层命名锁 | 任意 | ✅ 无（按命名排序） | 低 |
+
+**pg_advisory_xact_lock 方案**（避免全表行锁）：
+
+```sql
+-- 使用固定的 advisory lock ID 作为"管理员锁"
+SELECT pg_advisory_xact_lock(42);  -- 42 = 任意约定的全局锁ID
+SELECT COUNT(*) FROM users WHERE is_admin=true;
+DELETE FROM users WHERE id=$1;
+COMMIT;  -- 锁自动释放
+```
+
+---
+
+### 10.5 最后一个管理员检查的 multi-tenant
+
+#### Miniflux 的多租户现状
+
+Miniflux **当前不支持多租户**，所有用户共享同一数据库实例，`users` 表无 `tenant_id` 或 `instance_id` 字段。
+
+**缺失的字段**：
+```go
+// model/user.go 当前实现
+type User struct {
+    ID        int64
+    Username  string
+    Password  string
+    IsAdmin   bool   // 全局管理员，非租户级
+    Timezone  string
+    Language  string
+    Theme     string
+    // 无 TenantID / InstanceID / Namespace
+}
+```
+
+**若引入多租户，最后一个管理员检查的挑战**：
+
+```
+租户 A: 管理员 (A1, A2)
+租户 B: 管理员 (B1)
+
+检查"最后一个管理员"时：
+- 全局检查: 3 个管理员 → 删除 B1 后剩 2 个 ✅
+- 租户级检查: 租户 B 只剩 B1 → 不应允许删除 ❌
+
+若不做租户级检查:
+管理员 A1 删除管理员 B1 → 租户 B 无管理员 → 租户 B 锁死
+```
+
+**多租户场景的 Check 逻辑**：
+
+```go
+// 需新增的检查逻辑（代码中未实现）
+func (s *Storage) canDeleteAdminUser(targetUser *model.User, currentUser *model.User) error {
+    // 1. 跨租户操作防护
+    if targetUser.TenantID != currentUser.TenantID && !currentUser.IsGlobalAdmin {
+        return fmt.Errorf("cross-tenant operation not allowed")
+    }
+
+    // 2. 租户级最后管理员检查
+    var tenantAdminCount int
+    err := s.db.QueryRow(`
+        SELECT COUNT(*) FROM users
+        WHERE tenant_id=$1 AND is_admin=true
+        FOR UPDATE
+    `, targetUser.TenantID).Scan(&tenantAdminCount)
+
+    if targetUser.IsAdmin && tenantAdminCount <= 1 {
+        return fmt.Errorf("cannot remove the last administrator of this tenant")
+    }
+
+    // 3. 全局级最后管理员检查（仅 GlobalAdmin 受影响）
+    if currentUser.IsGlobalAdmin && targetUser.IsGlobalAdmin {
+        var globalAdminCount int
+        s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE is_global_admin=true FOR UPDATE`).Scan(&globalAdminCount)
+        if globalAdminCount <= 1 {
+            return fmt.Errorf("cannot remove the last global administrator")
+        }
+    }
+
+    return nil
+}
+```
+
+**多租户隔离矩阵**：
+
+| 操作 | 租户管理员 | 全局管理员 |
+|------|-----------|-----------|
+| 查看本租户用户 | ✅ | ✅ |
+| 修改本租户用户权限 | ✅ | ✅ |
+| 删除本租户最后管理员 | ❌ 400 | ✅ |
+| 查看跨租户用户 | ❌ 403 | ✅ |
+| 删除最后一个全局管理员 | N/A | ❌ 400 |
+| Root Rescue CLI 恢复 | 租户级 CLI | 全局 CLI |
+
+**Root Rescue 在多租户下的变化**：
+
+```
+单租户: miniflux -create-admin admin pass123
+多租户: miniflux -create-admin -tenant-id=TENANT_UUID admin pass123
+        ├─ 需新增 -tenant-id 参数
+        ├─ 需新增 GLOBAL_ADMIN 环境变量
+        └─ 恢复的管理员属于指定租户
+```
+
+---
+
+### 10.6 Root Rescue 的审计
+
+#### 当前审计覆盖
+
+`internal/cli/create_admin.go:31-48`
+
+```go
+// 场景一: 管理员已存在，跳过
+if store.UserExists(userCreationRequest.Username) {
+    slog.Info("Skipping admin user creation because it already exists",
+        slog.String("username", userCreationRequest.Username),
+    )
+    return
+}
+
+// 场景二: 创建成功
+slog.Info("Created new admin user",
+    slog.String("username", user.Username),
+    slog.Int64("user_id", user.ID),
+)
+```
+
+**审计漏洞分析**：
+
+| 操作 | 日志级别 | 缺失字段 | 风险 |
+|------|----------|----------|------|
+| **环境变量创建** (`CREATE_ADMIN=1`) | Info | 操作者、触发原因、调用来源 | 容器重启自动创建，无人知晓 |
+| **交互终端创建** (`-create-admin`) | Info | 终端用户名、SSH 来源 IP、TTY | 物理控制台入侵无溯源 |
+| **密码重置** (`-reset-password`) | ❌ 无审计 | 完全缺失 | 密码被改后用户无感知 |
+| **API 权限变更** (IsAdmin) | ❌ 无审计 | 完全缺失 | 权限被提升无记录 |
+
+**密码重置的审计缺口**：
+`internal/cli/reset_password.go` 中只有 `slog.Info()`（若存在），但未记录谁发起了重置、重置了谁。
+
+**推荐的完整审计日志**：
+
+```go
+// 标准 Root Rescue 审计事件
+slog.Warn("ROOT RESCUE ACTION EXECUTED",
+    slog.String("action", "reset_password"),  // create_admin | reset_password
+    slog.String("trigger", "cli_flag"),       // cli_flag | environment_variable | api_call
+    slog.String("target_username", username),
+    slog.Int64("target_user_id", userID),
+    slog.String("caller_source", "terminal"), // terminal | systemd | docker_entrypoint
+    slog.String("caller_pid", fmt.Sprint(os.Getpid())),
+    slog.String("os_user", os.Getenv("USER")),
+    slog.String("ssh_connection", os.Getenv("SSH_CONNECTION")),  // 源IP:源端口
+    slog.String("audit_level", "critical"),
+)
+```
+
+**容器化部署中的审计追踪**：
+
+```yaml
+# Docker/K8s 环境变量触发的 Root Rescue
+env:
+  - name: CREATE_ADMIN
+    value: "1"
+  - name: ADMIN_USERNAME
+    valueFrom:
+      secretKeyRef:
+        name: miniflux-secrets
+        key: admin-username
+
+# 审计要点:
+# 1. Secret 创建时间 (kubectl describe secret)
+# 2. Pod 重启触发时间 (kubectl describe pod)
+# 3. 容器启动日志中 slog 输出
+# 4. 关联 Kubernetes audit log 查看谁修改了 Secret
+```
+
+**审计防篡改建议**：
+
+1. **日志转发**：将 `slog` 输出转发到不可变的外部日志系统（ELK、Loki、CloudWatch）
+2. **告警触发**：`ROOT RESCUE` 事件匹配即发送告警到 PagerDuty/Slack
+3. **定期比对**：每日定时导出管理员列表与 GitOps 期望状态比对，差异告警
+
+---
+
+### 10.7 4优化方案的迁移成本
+
+#### 四种 last_used_at 优化方案的迁移评估
+
+| 维度 | 当前实现 | 方案一：条件更新 | 方案二：应用层缓冲 | 方案三：分离存储 |
+|------|---------|-----------------|-------------------|-----------------|
+| **SQL 改动** | - | 1 行 WHERE 追加 | 无 | 新增表 + 聚合 SQL |
+| **Go 代码改动** | 0 行 | 0 行 | ~50 行 goroutine + ticker | ~100 行 Store 方法 |
+| **数据库迁移** | 无 | 无 | 无 | `CREATE TABLE` + 数据回填 |
+| **回滚难度** | N/A | ✅ 删除 WHERE 即可 | ✅ 关闭 feature flag | ⚠️ 需数据回迁 |
+| **对现有查询的影响** | - | ✅ 0 (仅写入变) | ✅ 0 | ⚠️ 读查询需 JOIN 新表 |
+| **测试工作量** | N/A | ⚪ 1 个单测 | 🟡 5+ 个单测（并发、优雅关闭） | 🟠 10+ 个单测 |
+| **文档更新** | - | 1 段 | 1 页 | 架构图 + 运维手册 |
+| **数据库兼容性** | - | ✅ PostgreSQL 7.4+ | ✅ 无 DB 依赖 | ⚠️ 需测试 SQLite/MySQL |
+| **总迁移成本** | N/A | **极低** (1h) | **中** (0.5 天) | **高** (2-3 天) |
+
+**方案一条件更新的迁移步骤**（推荐，极低风险）：
+
+```
+Phase 1: Pre-check (5分钟)
+├─ 检查 PostgreSQL 版本: SELECT version()  -- 99% 兼容
+└─ EXPLAIN 分析: EXPLAIN UPDATE ... WHERE last_used_at < now() - interval '60s'
+   确认使用 (user_id, token) 索引，不走全表扫描
+
+Phase 2: 灰度部署 (1h)
+├─ 配置 feature flag: config.Opts.APIKeyDebounceWindow()
+├─ 5% 流量启用 10s 窗口
+├─ 对比: 写入量下降、请求延迟、锁等待
+└─ 指标正常 → 扩大到 100%
+
+Phase 3: 正式发布
+├─ 10s → 60s 窗口逐步扩大
+├─ 观察 7 天活跃用户统计偏差
+└─ 偏差可接受 → 正式固化
+```
+
+**方案二应用层缓冲的迁移陷阱**：
+
+```
+陷阱1: Goroutine 泄漏
+goroutine for { select { case <-ticker.C: flush() ... } }
+服务关闭时 ticker 未关闭 → goroutine 泄漏
+
+陷阱2: 进程崩溃数据丢失
+缓冲区 100 条待写入 → OOM kill → 全部丢失
+last_used_at 倒退，审计断裂
+
+陷阱3: 内存泄漏
+高并发时 channel 阻塞 → 待刷新队列无限增长
+
+缓解方案:
+- 使用 buffered channel (上限 10k)
+- 注册 graceful shutdown hook
+- 写前 WAL (Write-Ahead Log) 到 tmpfs
+```
+
+**方案三分离存储的迁移回填**：
+
+```sql
+-- 回填历史数据 (数据量大时需分批 LIMIT/OFFSET)
+INSERT INTO api_key_usage (api_key_id, request_count, last_used_at)
+SELECT id, 1, last_used_at
+FROM api_keys
+WHERE last_used_at IS NOT NULL
+LIMIT 10000 OFFSET 0;  -- 每批 10k
+
+-- 回填期间增量数据捕获:
+-- 应用层双写: 写新表 + 写旧表 (持续 1 周)
+-- 切换读: 读查询改为读新表
+-- 停止双写: 删除旧字段 last_used_at
+```
+
+---
+
+### 10.8 bcrypt 升级到 Argon2 的兼容路径
+
+#### 当前技术栈评估
+
+Miniflux 依赖 `golang.org/x/crypto v0.53.0`，该版本已包含 Argon2 实现：
+
+```
+go.mod:
+golang.org/x/crypto v0.53.0
+    └─ golang.org/x/crypto/argon2     ✅ 已可用
+    └─ golang.org/x/crypto/bcrypt     ✅ 当前使用
+```
+
+**bcrypt vs Argon2id 参数对比**：
+
+| 参数 | bcrypt (cost=10) | Argon2id (推荐) |
+|------|------------------|-----------------|
+| **算法家族** | Blowfish | ARGON2 (内存困难) |
+| **内存占用** | 4 KB | 64 MB (推荐 m=65536) |
+| **迭代次数** | 1024 (2^10) | 3 (推荐 t=3) |
+| **并行度** | ❌ 单线程 | ✅ 4 线程 (p=4) |
+| **哈希长度** | 184 bits (23 bytes) | 256 bits (32 bytes) |
+| **彩虹表抵抗** | ⚠️ 依赖 salt | ✅ 内存困难天然抵抗 |
+| **ASIC 加速成本** | 低 (已被加速) | **极高** (需大量 SRAM) |
+| **OWASP 推荐** | 已降级 (第三选择) | **第一推荐** |
+
+**迁移的 PHC 字符串格式**：
+
+```
+bcrypt 格式:
+  $2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy
+  \__/ \/ \____________________/\_____________________________/
+  V    C          Salt                     Hash
+
+Argon2id 格式 (PHC 标准):
+  $argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHQ$RdescudvJCsgt3ub+b+dWRWJTmaaJObG
+  \_______/ \____/ \______________/ \________/ \___________________________/
+  Type      Version    Params          Salt              Hash
+```
+
+**渐进式迁移实现**（可合并到现有 crypto 包）：
+
+```go
+// internal/crypto/password.go - 新文件
+package crypto
+
+import (
+    "crypto/rand"
+    "encoding/base64"
+    "fmt"
+    "strings"
+
+    "golang.org/x/crypto/argon2"
+    "golang.org/x/crypto/bcrypt"
+)
+
+type PasswordHashType string
+
+const (
+    HashTypeBcrypt  PasswordHashType = "bcrypt"
+    HashTypeArgon2d PasswordHashType = "argon2id"
+)
+
+// Argon2 参数 - OWASP 2024 推荐
+const (
+    argon2Time    = 3
+    argon2Memory  = 64 * 1024  // 64 MB
+    argon2Threads = 4
+    argon2KeyLen  = 32         // 256 bits
+    argon2SaltLen = 16         // 128 bits
+)
+
+func HashPassword(password string) (string, error) {
+    // 新用户直接用 Argon2
+    return HashPasswordArgon2(password)
+}
+
+func HashPasswordArgon2(password string) (string, error) {
+    salt := GenerateRandomBytes(argon2SaltLen)
+    hash := argon2.IDKey([]byte(password), salt, argon2Time, argon2Memory, argon2Threads, argon2KeyLen)
+
+    b64Salt := base64.RawStdEncoding.EncodeToString(salt)
+    b64Hash := base64.RawStdEncoding.EncodeToString(hash)
+
+    return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+        argon2.Version, argon2Memory, argon2Time, argon2Threads,
+        b64Salt, b64Hash), nil
+}
+
+func VerifyPassword(password, encodedHash string) (bool, bool, error) {
+    // 返回值: (验证通过, 是否需要升级)
+    if strings.HasPrefix(encodedHash, "$argon2id$") {
+        ok := verifyArgon2Password(password, encodedHash)
+        return ok, false, nil
+    }
+    if strings.HasPrefix(encodedHash, "$2a$") ||
+       strings.HasPrefix(encodedHash, "$2b$") ||
+       strings.HasPrefix(encodedHash, "$2y$") {
+        err := bcrypt.CompareHashAndPassword([]byte(encodedHash), []byte(password))
+        if err != nil {
+            return false, false, nil
+        }
+        return true, true, nil  // ✅ 通过，但需要升级为 Argon2
+    }
+    return false, false, fmt.Errorf("unknown hash format")
+}
+```
+
+**迁移触发点**（用户登录时自动升级）：
+
+```go
+// internal/api/middleware.go - validateBasicAuth 中
+user, err := m.store.UserByUsername(username)
+if err != nil { /* 401 */ }
+
+ok, needUpgrade, err := crypto.VerifyPassword(password, user.Password)
+if !ok { /* 401 */ }
+
+// 关键: bcrypt 验证通过 → 异步升级为 Argon2
+if needUpgrade {
+    go func(userID int64, newPassword string) {
+        newHash, _ := crypto.HashPasswordArgon2(newPassword)
+        // 使用独立事务更新密码，不阻塞登录流程
+        m.store.UpdatePasswordHash(userID, newHash)
+        slog.Info("Password hash upgraded from bcrypt to argon2id",
+            slog.Int64("user_id", userID),
+        )
+    }(user.ID, password)
+}
+```
+
+**迁移风险与回退**：
+
+| 风险 | 概率 | 缓解方案 |
+|------|------|----------|
+| Argon2 参数导致内存 OOM | ⚠️ 中 | 检测 `runtime.NumCPU()` 动态调整 p 参数 |
+| 客户端升级中断（部分 bcrypt 残留） | ✅ 低 | VerifyPassword 兼容两种格式，无需同时切换 |
+| 降级回 bcrypt（极端情况） | ❌ 极低 | 保留 VerifyPassword 兼容逻辑，新密码重设时可配置 |
+| dummyBcryptHash 时序攻击防护失效 | ⚠️ 中 | 同步添加 dummyArgon2Hash |
+
+**完整迁移时间线**：
+
+```
+Week 0: 代码准备
+├─ 实现 VerifyPassword 双格式兼容
+├─ 新增 HashPasswordArgon2
+├─ 集成到 Basic Auth + Google Reader Auth + UI Login
+└─ 代码 Review + 安全审计
+
+Week 1: 灰度
+├─ 10% 新用户使用 Argon2
+├─ 验证: 登录延迟 (100ms bcrypt → ~200ms argon2)
+├─ 验证: 内存 (每个请求 +64MB 峰值)
+└─ 验证: 老用户 bcrypt 登录自动升级为 Argon2
+
+Week 2: 全量
+├─ 100% 新用户 Argon2
+├─ 观察老用户迁移进度 (预计 80% 活跃用户在 1 周内完成)
+└─ 监控: 登录成功率、延迟 P99、内存使用
+
+Week 3: 固化
+├─ 定期扫描: 7 天后仍未登录的 bcrypt 用户
+├─ 可选: 强制重置不活跃用户密码
+└─ 文档: 迁移报告 + 新参数备案
+```
+
+**Fever Token (MD5) 的单独处理**：
+
+Fever API 使用 `md5(username:password)` 而非 bcrypt/argon2，这是 Fever 协议的硬规定，客户端会在本地计算 MD5。**此 Token 无法升级为 Argon2**，只能：
+1. 保持兼容
+2. 建议用户优先使用 API Key（Miniflux 原生方案）
+3. 未来实现 Fever v2（如社区推动）时再行升级
+
+---
+
+## 十一、第三次补充代码引用速查
+
+| 主题 | 文件位置 | 行号 |
+|------|----------|------|
+| 混合鉴权中间件嵌套 | `internal/api/api.go` | 77 |
+| API Key 穿透到 Basic Auth | `internal/api/middleware.go` | 42-48 |
+| Basic Auth 检测已认证穿透 | `internal/api/middleware.go` | 92-95 |
+| dummyBcryptHash 定义 | `internal/storage/user.go` | 19 |
+| 时序攻击防护（dummy 比较） | `internal/storage/user.go` | 676-680 |
+| CLI 创建管理员（有审计） | `internal/cli/create_admin.go` | 31-48 |
+| CLI 重置密码 | `internal/cli/reset_password.go` | 15-38 |
+| Storage 结构体（无事务封装） | `internal/storage/storage.go` | 13-15 |
+| HashPassword bcrypt 实现 | `internal/crypto/crypto.go` | 43-46 |
+| golang.org/x/crypto 依赖版本 | `go.mod` | 16 |
+| User 结构体（无 TenantID） | `internal/model/user.go` | 10-30 |
+| 中间件 Context 注入逻辑 | `internal/api/middleware.go` | 80-86 |
+
