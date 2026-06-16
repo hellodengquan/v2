@@ -899,18 +899,614 @@ AND last_used_at IS NULL OR last_used_at < now() - interval '1 minute'
 
 ---
 
-## 八、补充代码引用速查
+## 八、进阶技术细节补充
 
-| 补充主题 | 文件位置 | 行号 |
-|----------|----------|------|
+### 8.1 IsAdmin 字段防护的审计
+
+#### 审计追踪现状
+
+代码中 **没有专门针对 IsAdmin 字段变更的审计日志**，但可以通过以下路径间接追踪：
+
+**变更入口一：API 修改用户**
+`internal/api/user_handlers.go:78-88`
+
+```go
+if !request.IsAdminUser(r) {
+    if userModificationRequest.IsAdmin != nil && *userModificationRequest.IsAdmin {
+        response.JSONBadRequest(w, r, errors.New("only administrators can change permissions of standard users"))
+        return
+    }
+}
+```
+
+此处的检查逻辑：
+- 非管理员尝试将 IsAdmin 设为 `true` → 拒绝（400）
+- **但非管理员可以将 IsAdmin 设为 `false`**（即主动放弃管理员权限），`Patch` 方法会执行
+- **管理员可以将任何人的 IsAdmin 设为任意值**，且无额外审计
+
+**变更入口二：CLI 创建管理员**
+`internal/cli/create_admin.go:24-49`
+
+```go
+func createAdminUser(store *storage.Storage, username, password string) {
+    userCreationRequest := &model.UserCreationRequest{
+        Username: username,
+        Password: password,
+        IsAdmin:  true,  // CLI 创建的用户固定为管理员
+    }
+    // ...
+    slog.Info("Created new admin user",
+        slog.String("username", user.Username),
+        slog.Int64("user_id", user.ID),
+    )
+}
+```
+
+**Patch 方法的隐患**：
+`internal/model/user.go:90-101`
+
+```go
+func (u *UserModificationRequest) Patch(user *User) {
+    // ...
+    if u.IsAdmin != nil {
+        user.IsAdmin = *u.IsAdmin  // 直接赋值，无审计日志
+    }
+    // ...
+}
+```
+
+**审计缺口分析**：
+
+| 操作 | 审计覆盖 | 缺口 |
+|------|----------|------|
+| 管理员创建用户 | ✅ `slog.Info("Created new admin user")` | 未记录操作者 |
+| 管理员修改他人 IsAdmin | ❌ 无日志 | 无法追踪谁改了谁的权限 |
+| 非管理员放弃管理员权限 | ❌ 无日志 | 无法追踪权限降级 |
+| CLI 创建管理员 | ✅ `slog.Info` | 仅记录到 stdout |
+| 用户删除（间接导致权限消失） | ❌ 异步执行无日志 | 无法追踪删除原因 |
+
+**补全建议**：
+
+```go
+// 在 updateUserHandler 中，Patch 前后对比 IsAdmin 变更
+if originalUser.IsAdmin != user.IsAdmin {
+    slog.Warn("User admin status changed",
+        slog.Int64("target_user_id", originalUser.ID),
+        slog.Bool("old_is_admin", originalUser.IsAdmin),
+        slog.Bool("new_is_admin", user.IsAdmin),
+        slog.Int64("operator_user_id", request.UserID(r)),
+        slog.Bool("operator_is_admin", request.IsAdminUser(r)),
+    )
+}
+```
+
+---
+
+### 8.2 多语言翻译的热更新
+
+#### 编译时嵌入 vs 运行时加载
+
+`internal/locale/catalog.go:20-31`
+
+```go
+//go:embed translations/*.json
+var translationFiles embed.FS
+
+func getTranslationDict(language string) (translationDict, error) {
+    if _, ok := defaultCatalog[language]; !ok {
+        var err error
+        if defaultCatalog[language], err = loadTranslationFile(language); err != nil {
+            return translationDict{}, err
+        }
+    }
+    return defaultCatalog[language], nil
+}
+```
+
+**关键设计**：
+
+1. **翻译文件编译时嵌入**：使用 `//go:embed` 指令，翻译 JSON 文件在编译时被打包进二进制
+2. **懒加载 + 内存缓存**：`defaultCatalog` 是包级变量，首次访问某语言时加载并缓存
+3. **无热更新机制**：修改翻译文件后必须重新编译部署
+
+**热更新不可能的原因**：
+
+| 层面 | 限制 | 影响 |
+|------|------|------|
+| `embed.FS` | 编译时嵌入，只读 | 无法在运行时替换翻译文件 |
+| `defaultCatalog` | 包级 map，无过期机制 | 已加载的翻译不会失效 |
+| 无文件监听 | 无 `fsnotify` 等机制 | 无法感知外部文件变化 |
+| 无管理 API | 无 reload 端点 | 无法通过 API 触发重载 |
+
+**翻译缓存的生命周期**：
+
+```
+编译时: embed.FS 打包 translations/*.json
+    ↓
+启动时: defaultCatalog = make(catalog)  // 空 map
+    ↓
+首次请求: getTranslationDict("zh_CN")
+    ├─ 检查 defaultCatalog["zh_CN"] 不存在
+    ├─ loadTranslationFile("zh_CN")
+    │   └─ translationFiles.ReadFile("translations/zh_CN.json")
+    ├─ 解析 JSON → translationDict
+    └─ 存入 defaultCatalog["zh_CN"]
+    ↓
+后续请求: 直接从 defaultCatalog 读取
+    ↓
+服务重启: 重新从 embed.FS 加载
+```
+
+**降级策略**：
+`internal/locale/printer.go:18-25`
+
+```go
+func (p *Printer) Print(key string) string {
+    if dict, err := getTranslationDict(p.language); err == nil {
+        if str, ok := dict.singulars[key]; ok {
+            return str
+        }
+    }
+    return key  // 兜底：返回翻译键本身
+}
+```
+
+翻译缺失时的三级降级：目标语言查找 → 键本身返回 → 不报错
+
+---
+
+### 8.3 bcrypt 迁移的兼容路径
+
+#### 当前哈希配置
+
+`internal/crypto/crypto.go:43-46`
+
+```go
+func HashPassword(password string) (string, error) {
+    bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+    return string(bytes), err
+}
+```
+
+`bcrypt.DefaultCost` 在 Go 标准库中的值为 **10**（2^10 = 1024 轮迭代）。
+
+**时序攻击防护**：
+`internal/storage/user.go:19`
+
+```go
+var dummyBcryptHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+```
+
+`internal/storage/user.go:676-680`
+
+```go
+err := s.db.QueryRow("SELECT password FROM users WHERE username=$1", username).Scan(&hash)
+if errors.Is(err, sql.ErrNoRows) {
+    // 对不存在的用户执行一次 dummy bcrypt 比较，消除时序差异
+    _ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
+    return fmt.Errorf(`store: unable to find this user: %s`, username)
+}
+```
+
+**bcrypt 版本兼容性**：
+
+| 版本前缀 | 说明 | 兼容性 |
+|----------|------|--------|
+| `$2a$` | 原始 bcrypt 规范 | ✅ Go 标准库支持 |
+| `$2b$` | OpenBSD 修正版 | ✅ Go 标准库支持（等同于 `$2a$`） |
+| `$2y$` | PHP `password_hash` 输出 | ✅ Go 标准库支持 |
+
+**迁移路径（代码中未实现，但可推演）**：
+
+```
+场景：需要从 bcrypt cost=10 升级到 cost=12
+
+1. 验证阶段：bcrypt.CompareHashAndPassword 按存储的 cost 验证
+   └─ 无论 cost 是多少，验证都能通过
+
+2. 升级检测（需新增逻辑）：
+   if strings.HasPrefix(hash, "$2a$10$") {
+       // 检测到旧 cost=10 的哈希
+       // 验证通过后，用新 cost=12 重新哈希
+       newHash, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
+       // 后台更新数据库
+   }
+
+3. 渐进迁移：每次登录时检查并升级
+   └─ 无需批量迁移，用户自然登录时完成
+```
+
+**独立密码体系的 bcrypt 使用**：
+
+| 密码类型 | 哈希位置 | 存储位置 | Cost |
+|----------|----------|----------|------|
+| 主密码 | `crypto.HashPassword` | `users.password` | DefaultCost=10 |
+| Google Reader 密码 | `crypto.HashPassword` | `integrations.googlereader_password` | DefaultCost=10 |
+| Fever Token | `md5.Sum` | `integrations.fever_token` | ⚠️ MD5，非 bcrypt |
+| UI 集成密码 | `crypto.HashPassword` | `integration_update.go:54` | DefaultCost=10 |
+
+> **注意**：Fever API 的 token 使用 MD5（`md5(username:password)`），这是 Fever 协议的规定，非 Miniflux 自主选择。Fever Token 验证时使用 `lower()` 大小写不敏感匹配，而非 bcrypt 常量时间比较。
+
+---
+
+### 8.4 独立密码体系在第三方协议的对接
+
+Miniflux 支持三种独立密码体系，分别对接不同的第三方协议。**项目不包含 IMAP 协议对接**，但独立密码体系的设计模式可复用于 IMAP 场景。
+
+#### 三种独立密码体系对比
+
+**体系一：API Key（X-Auth-Token）**
+`internal/storage/user.go:482-524`
+
+```go
+func (s *Storage) UserByAPIKey(token string) (*model.User, error) {
+    query := `SELECT u.* FROM users u
+        INNER JOIN api_keys ON api_keys.user_id=u.id
+        WHERE api_keys.token = $1`
+    return s.fetchUser(query, token)
+}
+```
+
+- **存储**：`api_keys` 表，明文 token
+- **匹配**：精确匹配（大小写敏感）
+- **一对多**：一个用户可拥有多个 API Key
+
+**体系二：Fever API Token**
+`internal/storage/integration.go:32-53`
+
+```go
+func (s *Storage) UserByFeverToken(token string) (*model.User, error) {
+    query := `SELECT users.id, users.username, users.is_admin, users.timezone
+        FROM users LEFT JOIN integrations ON integrations.user_id=users.id
+        WHERE integrations.fever_enabled='t' AND lower(integrations.fever_token)=lower($1)`
+    // ...
+}
+```
+
+- **存储**：`integrations.fever_token`，MD5 哈希
+- **生成**：`md5(username:password)`
+- **匹配**：`lower()` 大小写不敏感
+- **启用控制**：`fever_enabled='t'` 开关
+
+**体系三：Google Reader 密码**
+`internal/storage/integration.go:56-81`
+
+```go
+func (s *Storage) GoogleReaderUserCheckPassword(username, password string) error {
+    query := `SELECT googlereader_password FROM integrations
+        WHERE integrations.googlereader_enabled='t' AND integrations.googlereader_username=$1`
+    // bcrypt 验证
+    bcrypt.CompareHashAndPassword([]byte(hash), []byte(password))
+}
+```
+
+- **存储**：`integrations.googlereader_password`，bcrypt 哈希
+- **匹配**：bcrypt 常量时间比较
+- **启用控制**：`googlereader_enabled='t'` 开关
+
+#### 若需对接 IMAP 的复用模式
+
+```
+IMAP AUTHENTICATE PLAIN
+    ↓
+1. 新增 integrations.imap_enabled 字段
+2. 新增 integrations.imap_password 字段（bcrypt 哈希）
+3. 新增 Storage.IMAPUserCheckPassword() 方法
+4. 复用 Google Reader 的 bcrypt 验证模式
+5. 在 IMAP handler 中调用验证方法
+6. 注入与 Fever/GoogleReader 相同的 Context
+```
+
+---
+
+### 8.5 API Key vs Basic Auth 的选型矩阵
+
+#### 全维度选型对比
+
+| 维度 | API Key (X-Auth-Token) | Basic Auth | Fever Token | Google Reader |
+|------|----------------------|------------|-------------|---------------|
+| **传输方式** | HTTP Header | HTTP Header (Authorization) | Form POST | HTTP Header + POST |
+| **存储格式** | 明文 (64字符hex) | bcrypt 哈希 | MD5 哈希 | bcrypt 哈希 |
+| **多令牌** | ✅ 用户可创建多个 | ❌ 一用户一密码 | ❌ 一用户一 token | ❌ 一用户一密码 |
+| **粒度控制** | ❌ 每个 Key 权限等同 | ❌ 单一权限 | ❌ 单一权限 | ❌ 单一权限 |
+| **泄露后** | 删除特定 Key，其他不受影响 | 修改密码，所有会话失效 | 修改密码重新生成 | 修改密码重新生成 |
+| **时效性** | 无过期时间 | 无过期时间 | 无过期时间 | 无过期时间 |
+| **审计** | `last_used_at` 追踪 | `last_login_at` 追踪 | `last_login_at` 追踪 | `last_login_at` 追踪 |
+| **性能** | 明文比对 O(1) | bcrypt 验证 ~100ms | MD5 比对 O(1) | bcrypt 验证 ~100ms |
+| **时序安全** | ⚠️ 字符串比较可能泄漏长度 | ✅ 常量时间比较 | ⚠️ MD5 不安全 | ✅ 常量时间比较 |
+| **适用场景** | 第三方脚本、CI/CD | 浏览器、curl 调试 | Fever 客户端 | Reeder 等 Reader 客户端 |
+| **CORS 兼容** | ✅ 自定义 Header | ⚠️ 预检请求 | ✅ Form POST | ⚠️ 需预检 |
+| **用户自助** | ✅ UI 页面自行创建 | ✅ 修改密码 | ✅ 集成页面设置 | ✅ 集成页面设置 |
+
+**选型决策树**：
+
+```
+需要鉴权？
+├─ 第三方脚本调用？
+│   ├─ 是 → API Key（多令牌、可独立撤销）
+│   └─ 否 → 继续判断
+├─ 使用 RSS 阅读器客户端？
+│   ├─ Fever 兼容客户端 → Fever Token
+│   ├─ Google Reader 兼容客户端 → Google Reader 密码
+│   └─ 通用客户端 → Basic Auth
+├─ 临时调试？
+│   └─ Basic Auth（curl -u user:pass）
+└─ 长期集成？
+    └─ API Key（不暴露主密码）
+```
+
+---
+
+### 8.6 行级锁的热点行优化
+
+#### 热点行问题分析
+
+`internal/storage/api_key.go:26`
+
+```sql
+UPDATE api_keys SET last_used_at=now() WHERE user_id=$1 AND token=$2
+```
+
+每个 API 请求认证成功后都会执行此 UPDATE，**同一 Token 的行成为热点行**。
+
+**PostgreSQL 行锁类型**：
+
+| 锁类型 | 冲突范围 | 持续时间 |
+|--------|----------|----------|
+| ROW EXCLUSIVE | 与 SHARE / EXCLUSIVE 冲突 | 事务结束 |
+| SHARE ROW EXCLUSIVE | 与 UPDATE / DELETE 冲突 | 事务结束 |
+
+**热点行争用时序**：
+
+```
+请求 A ──┐
+请求 B ──┤  UPDATE api_keys SET last_used_at=now()
+请求 C ──┤  WHERE token = 'same-token'
+请求 D ──┘
+
+         时间 →
+A: ──BEGIN──UPDATE(获得锁)──COMMIT──
+B: ──BEGIN──UPDATE(等锁...)──获得锁──UPDATE──COMMIT──
+C: ──BEGIN──UPDATE(等锁...)──────────获得锁──UPDATE──COMMIT──
+D: ──BEGIN──UPDATE(等锁...)────────────────────获得锁──UPDATE──COMMIT──
+```
+
+**优化方案对比**：
+
+| 方案 | 原理 | 写入量 | 一致性 | 实现复杂度 |
+|------|------|--------|--------|-----------|
+| **当前实现** | 每次请求都写 | 高 | 强一致 | 低 |
+| **方案一：条件更新** | 仅距上次 >N 秒才写 | 低 | 最终一致 | 低 |
+| **方案二：应用层缓冲** | 内存批量合并写入 | 最低 | 最终一致 | 高 |
+| **方案三：分离存储** | 独立表 + 异步聚合 | 中 | 最终一致 | 高 |
+
+**方案一详细实现**（推荐，最小改动）：
+
+```sql
+UPDATE api_keys
+SET last_used_at = now()
+WHERE user_id = $1 AND token = $2
+AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')
+```
+
+- 不满足条件的 UPDATE 影响 0 行，不获取行锁
+- 满足条件的 UPDATE 仍获取行锁，但争用频率从每请求降为每分钟
+- `RowsAffected() == 0` 时表示跳过更新，无需特殊处理
+
+---
+
+### 8.7 1 分钟防抖的一致性窗口
+
+#### 防抖设计的一致性权衡
+
+引入 1 分钟防抖后，`last_used_at` 的语义从"最后一次使用时间"变为"最后一次使用所在分钟的起始时间"。
+
+**一致性窗口分析**：
+
+```
+真实使用时间线:
+    T=0s     T=30s    T=61s    T=90s    T=150s
+    │        │        │        │        │
+    ▼        ▼        ▼        ▼        ▼
+防抖后记录:
+    T=0s     (跳过)   T=61s    (跳过)   T=150s
+    │                 │                 │
+    ▼                 ▼                 ▼
+last_used_at:
+    0s               61s              150s
+```
+
+**窗口内的不一致场景**：
+
+| 场景 | 真实值 | 记录值 | 偏差 |
+|------|--------|--------|------|
+| 0s 和 30s 两次使用 | 30s | 0s | 30s |
+| 0s 使用后 55s 删除 Key | 已删除 | 0s（残留） | 无（Key 已不存在） |
+| 0s 使用后 50s 查询"最近使用" | 0s | 0s | 0s（一致） |
+| 59s 使用后 61s 使用 | 61s | 61s | 0s（跨窗口，一致） |
+
+**对安全审计的影响**：
+
+1. **入侵检测窗口增大**：攻击者使用被盗 Key 后，在 60 秒内的重复使用不会被记录
+2. **取证精度降低**：无法区分 60 秒窗口内的多次使用
+3. **Key 活跃度判断偏差**：可能将 55 秒前的使用误判为"刚刚使用"
+
+**推荐的一致性级别选择**：
+
+| 级别 | 窗口大小 | 写入量 | 适用场景 |
+|------|----------|--------|----------|
+| 强一致 | 0（当前） | 每请求一次 | 高安全要求 |
+| 准一致 | 10 秒 | ~6 次/分钟 | 平衡安全和性能 |
+| 最终一致 | 60 秒 | ~1 次/分钟 | 低安全、高性能 |
+| 最终一致 | 300 秒 | ~1 次/5分钟 | 仅做粗略统计 |
+
+**准一致方案（10 秒窗口）**：
+
+```sql
+UPDATE api_keys
+SET last_used_at = now()
+WHERE user_id = $1 AND token = $2
+AND (last_used_at IS NULL OR last_used_at < now() - interval '10 seconds')
+```
+
+10 秒窗口在安全审计和性能之间取得平衡：写入量减少约 90%，审计精度仍在可接受范围。
+
+---
+
+### 8.8 管理员自删的 root rescue
+
+#### 自删防护机制
+
+`internal/api/user_handlers.go:218-255`
+
+```go
+func (h *handler) removeUserHandler(w http.ResponseWriter, r *http.Request) {
+    if !request.IsAdminUser(r) {
+        response.JSONForbidden(w, r)
+        return
+    }
+
+    user, err := h.store.UserByID(userID)
+    // ...
+
+    if user.ID == request.UserID(r) {
+        response.JSONBadRequest(w, r, errors.New("you cannot remove yourself"))
+        return
+    }
+
+    go func() {
+        if err := h.store.RemoveUser(user.ID); err != nil {
+            slog.Error("Unable to delete user", ...)
+        }
+    }()
+    response.NoContent(w, r)
+}
+```
+
+**防护层级**：
+
+| 层级 | 检查点 | 效果 |
+|------|--------|------|
+| 第一层 | `IsAdminUser(r)` | 仅管理员可调用删除接口 |
+| 第二层 | `user.ID == request.UserID(r)` | 管理员不能删除自己 |
+| 无第三层 | 无 "最后一个管理员" 检查 | ⚠️ 可以删除其他管理员，导致无管理员 |
+
+**Root Rescue 场景分析**：
+
+**场景一：删除唯一其他管理员（只剩一个管理员）**
+
+```
+管理员 A (ID=1, IsAdmin=true)
+管理员 B (ID=2, IsAdmin=true)
+
+管理员 A 删除管理员 B → 成功
+此时只剩管理员 A，系统仍可运行
+```
+
+**场景二：管理员降级导致无管理员**
+
+```
+管理员 A (ID=1, IsAdmin=true)
+
+管理员 A 调用 PUT /v1/users/1，body: {"is_admin": false}
+→ 代码未阻止管理员降级自己
+→ 结果：系统中无任何管理员
+→ 所有管理操作（创建用户、删除用户等）均不可用
+```
+
+**场景三：所有管理员被删除**
+
+```
+管理员 A 删除管理员 B → 成功
+管理员 A 删除管理员 C → 成功
+// 此时只剩管理员 A
+管理员 A 无法删除自己（第二层防护）
+// 但如果管理员 A 通过数据库直接操作删除自己...
+// → 系统中无管理员，所有管理接口不可访问
+```
+
+**Root Rescue 恢复手段**：
+
+`internal/cli/create_admin.go:24-49`
+
+```go
+func createAdminUser(store *storage.Storage, username, password string) {
+    userCreationRequest := &model.UserCreationRequest{
+        Username: username,
+        Password: password,
+        IsAdmin:  true,
+    }
+    if store.UserExists(userCreationRequest.Username) {
+        slog.Info("Skipping admin user creation because it already exists")
+        return  // 已存在则跳过
+    }
+    // ...
+}
+```
+
+**恢复操作**：
+
+```bash
+# 方式一：创建新管理员（需服务器访问权限）
+miniflux -create-admin
+
+# 方式二：重置密码（已有管理员但忘记密码）
+miniflux -reset-password
+
+# 方式三：通过环境变量自动创建
+# 配置 CREATE_ADMIN=1, ADMIN_USERNAME=xxx, ADMIN_PASSWORD=xxx
+# 服务启动时自动创建
+```
+
+**代码中缺失的防护**：
+
+| 防护 | 状态 | 说明 |
+|------|------|------|
+| 管理员不能删除自己 | ✅ 已实现 | `user.ID == request.UserID(r)` |
+| 不能删除最后一个管理员 | ❌ 未实现 | 无 `CountAdmins()` 检查 |
+| 管理员不能降级自己 | ❌ 未实现 | `IsAdmin: false` 可作用于自身 |
+| 管理员操作审计 | ❌ 未实现 | 无 IsAdmin 变更日志 |
+| CLI 紧急恢复 | ✅ 已实现 | `-create-admin` 创建新管理员 |
+
+**建议补全的"最后一个管理员"检查**：
+
+```go
+// 在 removeUserHandler 中，删除前检查
+if user.IsAdmin {
+    adminCount, _ := h.store.CountAdmins()
+    if adminCount <= 1 {
+        response.JSONBadRequest(w, r, errors.New("cannot remove the last administrator"))
+        return
+    }
+}
+```
+
+---
+
+## 九、补充代码引用速查
+
+| 主题 | 文件位置 | 行号 |
+|------|----------|------|
 | Worker Pool 实现 | `internal/worker/pool.go` | 13-44 |
 | 异步刷新全部订阅 | `internal/api/feed_handlers.go` | 76-99 |
 | LocalizedError 定义 | `internal/locale/error.go` | 8-55 |
 | 翻译 Printer | `internal/locale/printer.go` | 18-30 |
+| 翻译目录加载 | `internal/locale/catalog.go` | 20-31 |
 | 细粒度权限提升防护 | `internal/api/user_handlers.go` | 78-88 |
+| 管理员自删防护 | `internal/api/user_handlers.go` | 241-243 |
+| Patch 方法（IsAdmin 赋值） | `internal/model/user.go` | 90-101 |
+| UserModificationRequest.IsAdmin | `internal/model/user.go` | 70 |
 | Feed 归属检查 | `internal/storage/feed.go` | 36-41 |
 | Google Reader 密码验证 | `internal/storage/integration.go` | 56-81 |
+| Fever Token 验证 | `internal/storage/integration.go` | 32-53 |
+| Fever Token 生成 | `internal/ui/integration_update.go` | 40 |
 | Context 键类型定义 | `internal/http/request/context.go` | 12-25 |
 | UserID 读取兜底 | `internal/http/request/context.go` | 60-73 |
 | last_used_at 更新 | `internal/storage/api_key.go` | 25-33 |
 | 密码哈希更新 | `internal/storage/user.go` | 177-186 |
+| 哈希密码函数 | `internal/crypto/crypto.go` | 43-46 |
+| 时序攻击防护 | `internal/storage/user.go` | 19, 676-680 |
+| CLI 创建管理员 | `internal/cli/create_admin.go` | 24-49 |
+| CLI 重置密码 | `internal/cli/reset_password.go` | 15-38 |
+| 用户删除（异步） | `internal/api/user_handlers.go` | 246-253 |
+| Fever 中间件 | `internal/fever/middleware.go` | 17-72 |
