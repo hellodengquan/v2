@@ -579,3 +579,360 @@ Integration.UserID ──────────→ User.ID
 2. **状态枚举压缩**：内部多状态字符串（`"unread"`/`"read"`）↔ 外部整型布尔（0/1）或 Stream 标签
 3. **内容代理重写**：`mediaproxy.RewriteDocumentWithAbsoluteProxyURL()` 统一处理 HTML 中的媒体 URL，保护源站并支持代理策略
 4. **嵌套结构展开**：内部关联对象（如 `Entry.Feed`、`Feed.Category`）在响应中展开或转为引用 ID
+
+---
+
+## 7. 异常输入的识别与拒绝路径
+
+### 7.1 Fever 异常输入拒绝
+
+#### 7.1.1 无效 api_key
+
+Fever 中间件（`middleware.go:16-73`）对 `api_key` 的校验分为三层，每一层都返回 **HTTP 200** + `{"api_version":3,"auth":0}`：
+
+| 拒绝阶段 | 条件 | 代码行 | 日志级别 |
+|----------|------|--------|----------|
+| 1. 空值检查 | `api_key == ""` | `middleware.go:22` | Warn |
+| 2. 数据库查询错误 | `store.UserByFeverToken()` 返回 err | `middleware.go:32-42` | Error |
+| 3. 无匹配用户 | `user == nil` | `middleware.go:44-52` | Warn |
+
+**关键点**：Fever 不对 `api_key` 做格式校验。无论传入任意字符串（如 `"abc"`、`"123"`），都直接走数据库查询路径。格式错误不会被提前拦截——查询结果返回 `user == nil` 时才拒绝。这意味着无效 Token 会导致一次无意义的数据库查询。
+
+**Fever 协议设计原因**：Fever API 规范要求鉴权失败时仍然返回 HTTP 200，仅通过 JSON 体中 `auth` 字段区分成败（0=失败，1=成功）。客户端通过解析 `auth` 值判断而非 HTTP 状态码。
+
+#### 7.1.2 无效写操作参数
+
+**无效 entry ID**（`mark=item`，`handler.go:407-409`）：
+
+```go
+entryID := request.FormInt64Value(r, "id")
+if entryID <= 0 {
+    return  // 直接 return，不写任何响应
+}
+```
+
+当 `id` 为空、非数字或 ≤0 时，Handler **静默返回空响应**，不返回任何 JSON 或错误。客户端收到一个空 body 的 HTTP 200 响应。
+
+**Entry 不存在**（`handler.go:420-427`）：
+
+```go
+if entry == nil {
+    response.JSON(w, r, newBaseResponse())
+    return
+}
+```
+
+返回正常的 `{"api_version":3,"auth":1,...}` 基础响应，仿佛操作成功。这是 Fever 协议的设计——写操作无失败语义。
+
+**无效 feed/group ID**（`mark=feed`、`mark=group`）：
+
+- `mark=feed` 中 `feedID <= 0` 时静默返回（`handler.go:492-494`）
+- `mark=group` 中 `groupID < 0` 时静默返回（`handler.go:514-516`）
+- `groupID == 0` 表示「标记全部已读」，是合法值
+
+**无效 `as` 值**（`mark=item`，`handler.go:429`）：
+
+`switch r.FormValue("as")` 不匹配任何 case 时，跳过状态修改，直接执行到 `handler.go:472` 返回 `newBaseResponse()`。客户端无法区分操作是否生效。
+
+#### 7.1.3 Fever 异常处理总结
+
+Fever 的设计哲学是**尽量不报错**——所有异常路径要么返回 `auth:0`（鉴权层），要么返回 `auth:1` 的基础响应（业务层），要么返回空响应（静默丢弃）。这与 Fever 原始协议规范一致，客户端需自行通过后续读操作验证变更是否生效。
+
+---
+
+### 7.2 Google Reader 异常输入拒绝
+
+GReader 的异常处理比 Fever 细致得多，不同层级的校验产生不同的 HTTP 状态码和错误格式。
+
+#### 7.2.1 ClientLogin 阶段的异常
+
+| 异常条件 | 代码行 | 响应 |
+|----------|--------|------|
+| 表单解析失败 | `handler.go:81-90` | HTTP 401 + JSON `{"error_message":"access unauthorized"}` |
+| `Email` 或 `Passwd` 为空 | `handler.go:96-104` | HTTP 401 + JSON `{"error_message":"access unauthorized"}` |
+| 密码校验失败 | `handler.go:106-116` | HTTP 401 + JSON `{"error_message":"access unauthorized"}` |
+
+所有登录失败统一返回 `response.JSONUnauthorized()`（`json.go:99-117`），HTTP 401 + JSON `{"error_message":"access unauthorized"}`。不泄露具体失败原因。
+
+#### 7.2.2 Authorization 头格式校验（GET 请求）
+
+GReader 中间件对 GET 请求的 `Authorization` 头执行**五层逐步校验**（`middleware.go:62-112`），任何一步失败都调用 `sendUnauthorizedResponse()`：
+
+| 校验步骤 | 条件 | 代码行 | 错误日志描述 |
+|---------|------|--------|-------------|
+| 1. 缺失 | `authorization == ""` | `middleware.go:64-71` | "No token provided" |
+| 2. 结构错误 | `strings.Fields()` 结果 `len != 2` | `middleware.go:73-82` | "Authorization header does not have the expected GoogleLogin format" |
+| 3. Scheme 错误 | `fields[0] != "GoogleLogin"` | `middleware.go:83-91` | "Authorization header does not begin with GoogleLogin" |
+| 4. auth 字段结构错误 | `strings.Split(fields[1], "=")` 结果 `len != 2` | `middleware.go:92-101` | "Authorization header does not have the expected GoogleLogin format" |
+| 5. auth 字段名错误 | `auths[0] != "auth"` | `middleware.go:102-110` | "Authorization header does not have the expected GoogleLogin format" |
+
+每步失败后的响应一致：
+- HTTP 401
+- Header: `X-Reader-Google-Bad-Token: true`
+- Content-Type: `text/plain; charset=utf-8`
+- Body: `Unauthorized`
+
+**典型异常输入示例**：
+- `Authorization: Bearer xxx` → 第 3 步拒绝（Scheme 不是 `GoogleLogin`）
+- `Authorization: GoogleLogin token=xxx` → 第 5 步拒绝（字段名不是 `auth`）
+- `Authorization: GoogleLogin` → 第 2 步拒绝（缺少第二部分）
+- `Authorization: GoogleLogin auth=xxx yyy` → 第 2 步拒绝（`Fields` 分割后超过 2 部分）
+
+#### 7.2.3 POST 请求 Token 校验
+
+| 校验步骤 | 条件 | 代码行 |
+|---------|------|--------|
+| 1. 表单解析失败 | `r.ParseForm()` 返回 err | `middleware.go:40-49` |
+| 2. T 字段为空 | `token == ""` | `middleware.go:52-60` |
+
+两种失败均调用 `sendUnauthorizedResponse()`。
+
+#### 7.2.4 Token 结构与内容校验
+
+通过前两步后，Token 值本身还要经过三层校验（`middleware.go:114-167`）：
+
+| 校验步骤 | 条件 | 代码行 | 日志描述 |
+|---------|------|--------|---------|
+| 1. 结构不符 | `strings.Split(token, "/")` 结果 `len != 2` | `middleware.go:114-124` | "Auth token does not have the expected structure username/hash" |
+| 2. 用户不存在 | `GoogleReaderUserGetIntegration()` 返回 err | `middleware.go:128-137` | "No user found with the given Google Reader username" |
+| 3. 哈希不匹配 | `!crypto.ConstantTimeCmp(expectedToken, token)` | `middleware.go:138-147` | "Token does not match" |
+
+此外还有两层后置校验：
+
+| 校验步骤 | 条件 | 代码行 | 日志描述 |
+|---------|------|--------|---------|
+| 4. 用户查询失败 | `store.UserByID()` 返回 err | `middleware.go:148-157` | "Unable to fetch user from database"（日志级别 Error） |
+| 5. 用户不存在 | `user == nil` | `middleware.go:159-167` | "No user found with the given Google Reader credentials" |
+
+**Token 格式异常示例**：
+- `"abc"`（无 `/` 分隔）→ 第 1 步拒绝
+- `"a/b/c"`（多个 `/`）→ 第 1 步拒绝（`Split` 结果 `len == 3`）
+- `"nonexistent_user/abcd1234..."` → 第 2 步拒绝（数据库查不到该 GReader 用户名）
+- `"readeruser/wrong_hash_value"` → 第 3 步拒绝（恒定时间比较失败）
+
+**安全要点**：第 3 步使用 `crypto.ConstantTimeCmp()` 进行恒定时间比较，防止通过响应时间差异推断 Token 片段的正确性（时序攻击）。
+
+#### 7.2.5 Stream ID 格式校验
+
+`getStream()` 函数（`stream.go:73-107`）按前缀逐级匹配，不合法时返回 error：
+
+| 异常输入 | 匹配路径 | 返回的 error |
+|---------|---------|-------------|
+| `user/-/state/com.google/unknown` | 进入 `streamPrefix` 分支，后缀不匹配任何 case | `"googlereader: unknown stream with id: unknown"` |
+| `user/999/state/com.google/fresh` | 进入 `userStreamPrefix` 分支，后缀不匹配 | `"googlereader: unknown stream with id: fresh"` |
+| `tag/something` | 不匹配任何前缀 | `"googlereader: unknown stream type: tag/something"` |
+| `""` (空字符串) | 单独 case | 返回 `Stream{NoStream, ""}` + `nil` error |
+
+**`getStreams()` 的错误传播**（`stream.go:109-119`）：
+
+```go
+for _, streamID := range streamIDs {
+    stream, err := getStream(streamID, userID)
+    if err != nil {
+        return []Stream{}, err  // 任何一个解析失败则整个列表失败
+    }
+    streams = append(streams, stream)
+}
+```
+
+只要列表中有一个 Stream ID 不合法，整个请求就被拒绝。这是**快速失败**策略。
+
+**Stream ID 错误在不同端点的传播**：
+
+| 端点 | 调用位置 | 错误响应 |
+|------|---------|---------|
+| `stream/items/ids` | `parseStreamFilterFromRequest()` → `getStreams(s)` | HTTP 500 + JSON `{"error_message":"..."}` |
+| `stream/items/ids` | `parseStreamFilterFromRequest()` → `getStreams(xt)` | HTTP 500 + JSON `{"error_message":"..."}` |
+| `stream/items/ids` | `parseStreamFilterFromRequest()` → `getStreams(it)` | HTTP 500 + JSON `{"error_message":"..."}` |
+| `stream/items/contents` | 同上 | HTTP 500 + JSON `{"error_message":"..."}` |
+| `edit-tag` | `getStreams(r.PostForm["a"])` / `getStreams(r.PostForm["r"])` | HTTP 500 + JSON `{"error_message":"..."}` |
+| `subscription/edit` | `getStreams(r.Form["s"])` | HTTP 400 + JSON `{"error_message":"..."}` |
+| `mark-all-as-read` | `getStream(r.Form.Get("s"))` | HTTP 400 + JSON `{"error_message":"..."}` |
+| `disable-tag` | `getStreams(r.Form["s"])` | HTTP 400 + JSON `{"error_message":"..."}` |
+| `rename-tag` | `getStream(r.Form.Get("s"))` / `getStream(r.Form.Get("dest"))` | HTTP 400 + JSON `{"error_message":"..."}` |
+
+**注意**：同一个 `getStream()` 错误在不同端点会产生不同的 HTTP 状态码。在流查询端点（`stream/items/ids`、`stream/items/contents`）中，`parseStreamFilterFromRequest` 返回的 error 被 `JSONServerError`（500）处理；在写操作端点中，同样的 error 被 `JSONBadRequest`（400）处理。这是代码中的不一致之处——Stream ID 格式错误本质上是客户端错误（4xx），但流查询端点返回了 500。
+
+#### 7.2.6 Item ID 格式校验
+
+`parseItemID()`（`item.go:29-57`）按优先级尝试三种解析方式：
+
+| 尝试顺序 | 格式 | 失败条件 |
+|---------|------|---------|
+| 1 | `tag:google.com,2005:reader/item/<hex>` | Sscanf 失败、扫描数量 != 1、结果 == 0 |
+| 2 | 16 字符裸十六进制 | Sscanf 失败或扫描数量 != 1 |
+| 3 | 十进制字符串 | ParseInt 失败（含溢出） |
+
+全部失败时返回 error，由调用方 `parseItemIDsFromRequest()`（`item.go:59-75`）包装为 `"googlereader: failed to parse item ID ..."` 向上传播。
+
+**Item ID 错误传播**：
+
+| 端点 | 代码行 | 响应 |
+|------|--------|------|
+| `edit-tag` | `handler.go:224-228` | HTTP 400 + `JSONBadRequest` |
+| `stream/items/contents` | `handler.go:638-642` | HTTP 400 + `JSONBadRequest` |
+
+此外 `parseItemIDsFromRequest` 还有前置检查：当 `r.Form["i"]` 为空时，返回 `"googlereader: no items requested"`。
+
+#### 7.2.7 edit-tag 标签语义冲突校验
+
+`checkAndSimplifyTags()`（`handler.go:1234-1281`）检测以下语义冲突：
+
+| 冲突类型 | 错误 |
+|---------|------|
+| add `read` + add `kept-unread` | `errSimultaneously`：`"googlereader: read and kept-unread should not be supplied simultaneously"` |
+| add `read` + remove `read` | `"googlereader: read should not be supplied for add and remove simultaneously"` |
+| add `starred` + remove `starred` | `"googlereader: starred should not be supplied for add and remove simultaneously"` |
+| add/remove 不支持的 StreamType（如 `NoStream`） | `"googlereader: unsupported tag type: ..."` |
+
+`BroadcastStream` 和 `LikeStream` 被识别但**静默忽略**（仅 Debug 日志），不触发错误。
+
+#### 7.2.8 subscription/edit Stream 类型校验
+
+`editSubscriptionHandler`（`handler.go:525-602`）对 `ac=edit` 时的标签做了额外类型校验：
+
+```go
+if newLabel.Type != LabelStream {
+    response.JSONBadRequest(w, r, errors.New("destination must be a label"))
+    return
+}
+```
+
+即 `a` 参数必须是 Label 流（如 `user/1/label/Tech`），传入 `user/1/state/com.google/read` 等状态流会被 400 拒绝。
+
+`disableTagHandler`（`handler.go:759-764`）也有类似校验：
+
+```go
+if stream.Type != LabelStream {
+    response.JSONBadRequest(w, r, errors.New("googlereader: only labels are supported"))
+    return
+}
+```
+
+#### 7.2.9 FeedStream 中 ID 非数字的处理
+
+`handleFeedStreamHandler`（`handler.go:1119-1124`）在从 `Stream.ID` 解析 feedID 时：
+
+```go
+feedID, err := strconv.ParseInt(rm.Streams[0].ID, 10, 64)
+if err != nil {
+    response.JSONServerError(w, r, err)
+    return
+}
+```
+
+由于 `getStream()` 对 `feed/` 前缀的处理只做 `TrimPrefix`（`stream.go:76`），不验证剩余部分是否为有效数字，所以 `feed/abc` 这种 Stream ID 能通过 `getStream()` 但在 `handleFeedStreamHandler` 中 `ParseInt` 失败，返回 HTTP 500。
+
+`markAllAsReadHandler`（`handler.go:1199-1204`）对 `FeedStream` 有相同问题，但返回 HTTP 400。
+
+#### 7.2.10 output 参数校验
+
+`checkOutputFormat()`（`handler.go:1283-1298`）要求 `output` 参数必须为 `"json"`：
+
+```go
+if output != "json" {
+    return errors.New("googlereader: only json output is supported")
+}
+```
+
+适用端点：`tag/list`、`subscription/list`、`stream/items/ids`、`stream/items/contents`。缺失或非 `json` 值均被拒绝为 HTTP 400。
+
+---
+
+### 7.3 过滤目标参数 `it` 解析后未使用的原因
+
+`parseStreamFilterFromRequest()`（`request_modifier.go:81-84`）：
+
+```go
+result.FilterTargets, err = getStreams(request.QueryStringParamList(r, paramStreamFilters), userID)
+if err != nil {
+    return requestModifiers{}, err
+}
+```
+
+`FilterTargets` 被解析并存储在 `requestModifiers` 中，但后续所有 Stream Handler 中均未读取 `rm.FilterTargets`：
+
+| Handler | 代码行 | 是否使用 `FilterTargets` |
+|---------|--------|------------------------|
+| `handleReadingListStreamHandler` | `handler.go:1005-1047` | ❌ 只遍历 `ExcludeTargets` |
+| `handleStarredStreamHandler` | `handler.go:1049-1071` | ❌ 不使用任何过滤 |
+| `handleReadStreamHandler` | `handler.go:1073-1095` | ❌ 不使用任何过滤 |
+| `handleFeedStreamHandler` | `handler.go:1119-1153` | ❌ 只遍历 `ExcludeTargets` |
+
+**未使用的原因**：
+
+1. **`it` 参数语义的复杂性**：在 Google Reader 原始协议中，`it`（include targets）用于将结果限定为同时属于指定流的项目。例如 `it=user/1/label/Tech` 表示只返回 Tech 分类的文章。实现此功能需要将 Stream 映射为 SQL JOIN 或子查询条件（如 LabelStream → Category 过滤、FeedStream → FeedID 过滤），而当前 `EntryQueryBuilder` 不直接支持这种多 Stream 交集过滤。
+
+2. **最小可用实现策略**：Miniflux 的 GReader 兼容层采用「先解析、后按需实现」的方式。将 `it` 解析为结构化 `[]Stream` 确保：
+   - 参数格式错误能在解析阶段就被捕获（返回 500 错误而非静默忽略）
+   - 未来添加过滤逻辑时代码改动最小（只需在 Handler 中遍历 `rm.FilterTargets`）
+
+3. **与 `xt`（排除目标）的不对称**：`xt` 已实现且仅支持 `ReadStream`（排除已读），因为「排除已读」可通过简单的 `WithStatuses(EntryStatusUnread)` 实现，无需复杂 JOIN。而 `it` 的 LabelStream 过滤需要 `Entry.Feed.Category` 关联查询，实现成本更高。
+
+4. **对客户端的兼容影响**：主流 GReader 客户端（Reeder、NetNewsWire 等）很少使用 `it` 参数，缺失此功能不影响基本使用场景。
+
+---
+
+### 7.4 鉴权失败返回 200 与 401 的差异分析
+
+#### Fever 返回 HTTP 200 的设计
+
+```go
+// middleware.go:28
+response.JSON(w, r, newAuthFailureResponse())
+// 等价于：HTTP 200 + {"api_version":3,"auth":0}
+```
+
+**协议原因**：
+
+Fever API 规范明确规定鉴权失败通过 JSON 体中的 `auth` 字段表达，而非 HTTP 状态码。这是 Fever 原始服务端的协议设计——所有请求都返回 200，客户端通过解析 `auth` 值判断是否认证成功。
+
+**客户端行为假设**：
+
+Fever 客户端实现通常先发一个无操作的请求（如 `?api_key=xxx`），检查 `auth` 是否为 1 来确认凭证有效。如果收到 HTTP 401，某些简单客户端可能直接抛出网络错误而不解析响应体，导致用户看到的是"网络连接失败"而非"密码错误"。
+
+**安全影响**：
+
+- 正面：不暴露 HTTP 层面的鉴权失败，对简单探测器有一定混淆
+- 负面：HTTP 缓存层和 CDN 无法基于状态码区分已认证与未认证响应，可能缓存 `auth:0` 的响应
+
+#### GReader 返回 HTTP 401 的设计
+
+**两个鉴权失败响应路径**：
+
+路径 A — `ClientLogin` 端点（`handler.go:88`）：
+```
+HTTP 401 + JSON {"error_message":"access unauthorized"}
+Content-Type: application/json
+```
+
+路径 B — `/reader/api/0/*` 端点（`response.go:122-129`）：
+```
+HTTP 401 + 纯文本 "Unauthorized"
+Content-Type: text/plain; charset=utf-8
+X-Reader-Google-Bad-Token: true
+```
+
+**协议原因**：
+
+Google Reader 原始 API 使用标准 HTTP 鉴权语义。`ClientLogin` 返回 JSON 格式的 401 是因为该端点本就返回 JSON（或纯文本）格式。而 `/reader/api/0/*` 端点的 401 响应格式遵循 Google Reader 的特定约定：
+
+- `X-Reader-Google-Bad-Token` Header 让客户端可以区分「Token 过期需刷新」与「凭证错误需重新登录」。客户端收到此 Header 后通常会尝试 `GET /reader/api/0/token` 获取新 Token，若仍失败则跳转到登录页。
+- 纯文本 Body（而非 JSON）是因为 Google Reader 原始实现就是如此，客户端对此有硬编码匹配。
+
+**两种鉴权失败响应的差异总结**：
+
+| 维度 | Fever（HTTP 200） | GReader ClientLogin（HTTP 401） | GReader API（HTTP 401） |
+|------|-------------------|-------------------------------|----------------------|
+| HTTP 状态码 | 200 | 401 | 401 |
+| Content-Type | application/json | application/json | text/plain |
+| Body 格式 | `{"api_version":3,"auth":0}` | `{"error_message":"access unauthorized"}` | `Unauthorized` |
+| 客户端检测方式 | 解析 JSON 的 `auth` 字段 | 解析 JSON 的 `error_message` | 检查 HTTP 状态码 + `X-Reader-Google-Bad-Token` |
+| 可恢复性 | 不区分原因 | 不区分原因 | `X-Reader-Google-Bad-Token` 允许客户端尝试刷新 Token |
+| 缓存友好性 | 差（200 可能被缓存） | 好（401 不被缓存） | 好（401 不被缓存） |
+| 错误信息详细度 | 无（仅 `auth:0`） | 低（固定消息） | 低（固定消息 + 特殊 Header） |
+
+**设计哲学对比**：
+
+- **Fever**：鉴权是「查询的一部分」——`auth` 字段和其他数据字段同级，客户端统一解析。这与 Fever 把所有操作合并到单一端点的设计一致。
+- **GReader**：鉴权是「请求的前提」——先验失败直接中断请求，使用标准 HTTP 语义拒绝。这与 GReader 多端点、REST 风格的设计一致。
