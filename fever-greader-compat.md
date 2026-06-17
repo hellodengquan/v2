@@ -936,3 +936,262 @@ Google Reader 原始 API 使用标准 HTTP 鉴权语义。`ClientLogin` 返回 J
 
 - **Fever**：鉴权是「查询的一部分」——`auth` 字段和其他数据字段同级，客户端统一解析。这与 Fever 把所有操作合并到单一端点的设计一致。
 - **GReader**：鉴权是「请求的前提」——先验失败直接中断请求，使用标准 HTTP 语义拒绝。这与 GReader 多端点、REST 风格的设计一致。
+
+---
+
+## 8. 存储层错误与媒体重写的错误传播
+
+### 8.1 流查询 SQL 出错的响应传播路径
+
+Fever 和 GReader 的流查询都通过 `EntryQueryBuilder` 访问数据库，SQL 出错时的传播路径高度一致——均返回 HTTP 500 + JSON 错误。
+
+#### 8.1.1 Fever 侧错误传播链
+
+| 端点 | 调用链 | 错误出口 | 代码行 |
+|------|--------|----------|--------|
+| `?items` | `handleItems` → `builder.GetEntries()` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:289-293` |
+| `?items` | `handleItems` → `builder.CountEntries()` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:295-300` |
+| `?unread_item_ids` | `handleUnreadItems` → `builder.GetEntryIDs()` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:345-349` |
+| `?saved_item_ids` | `handleSavedItems` → `builder.GetEntryIDs()` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:375-379` |
+| `?feeds` | `handleFeeds` → `store.Feeds(userID)` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:133-137` |
+| `?groups` | `handleGroups` → `store.Categories(userID)` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:185-189` |
+| `?favicons` | `handleFavicons` → `store.Favicons(userID)` 失败 | `response.JSONServerError(w, r, err)` | `handler.go:225-229` |
+
+**共同点**：所有存储层错误直接通过 `response.JSONServerError()` 输出，HTTP 状态码 **500**，响应体为 `{"error_message": "..."}`。
+
+#### 8.1.2 GReader 侧错误传播链
+
+**ID 列表查询**（`stream/items/ids`）：
+
+```
+streamItemIDsHandler
+  └─ parseStreamFilterFromRequest()  ← Stream 解析错误也走 500（见 7.2.5）
+  └─ rm.Streams[0].Type dispatch:
+       ├─ ReadingListStream → handleReadingListStreamHandler
+       │    └─ getItemRefsAndContinuation(builder, rm)
+       │         ├─ builder.GetEntryIDs() 失败 → JSONServerError (500)
+       │         └─ builder.CountEntries() 失败 → JSONServerError (500)
+       ├─ StarredStream    → handleStarredStreamHandler  ← 同上
+       ├─ ReadStream       → handleReadStreamHandler     ← 同上
+       └─ FeedStream       → handleFeedStreamHandler
+            ├─ strconv.ParseInt(rm.Streams[0].ID) 失败 → JSONServerError (500)
+            └─ getItemRefsAndContinuation 同上
+```
+
+**内容详情查询**（`stream/items/contents`）：
+
+```
+streamItemContentsHandler
+  ├─ checkOutputFormat() 失败 → JSONBadRequest (400)  ← 注意：这是客户端错误
+  ├─ r.ParseForm() 失败 → JSONServerError (500)
+  ├─ parseStreamFilterFromRequest() 失败 → JSONServerError (500)
+  ├─ parseItemIDsFromRequest() 失败 → JSONBadRequest (400)
+  └─ builder.GetEntries() 失败 → JSONServerError (500)
+```
+
+**写操作的存储错误**：
+
+| 端点 | 存储操作 | 错误响应 | 代码行 |
+|------|----------|----------|--------|
+| `edit-tag` | `ToggleBookmark` / `SetEntriesStatus` | `JSONServerError` (500) | `handler.go:314-335` |
+| `subscription/edit` (ac=subscribe) | `CreateFeed` | `JSONBadRequest` (400) + error 消息 | `handler.go:532-536` |
+| `subscription/edit` (ac=unsubscribe) | `RemoveFeed` | `JSONServerError` (500) | `handler.go:565-569` |
+| `quickadd` | `CreateFeed` | `JSONBadRequest` (400) + "Quickadd failed" | `handler.go:463-470` |
+| `mark-all-as-read` | `UpdateCategoryEntriesStatus` 等 | `JSONServerError` (500) | `handler.go:1199` 等 |
+
+**注意不一致**：`CreateFeed` 失败（如 URL 无效）在 `quickadd` 和 `subscription/edit` 中返回 **400**，但其他存储操作失败返回 **500**。这是因为 `CreateFeed` 的错误可能是客户端参数问题（无效 URL），也可能是数据库问题，没有做细粒度区分。
+
+#### 8.1.3 JSONServerError 的响应格式
+
+`internal/http/response/json.go:88-97`：
+
+```go
+func JSONServerError(w http.ResponseWriter, r *http.Request, err error) {
+    errorMessage := "Internal Server Error"
+    if config.Opts.HasDebugMode() {
+        errorMessage = err.Error()
+    }
+    w.Header().Set("Content-Type", "application/json; charset=utf-8")
+    w.WriteHeader(http.StatusInternalServerError)
+    json.NewEncoder(w).Encode(map[string]string{"error_message": errorMessage})
+}
+```
+
+- 正常模式：HTTP 500 + `{"error_message":"Internal Server Error"}`，不暴露内部错误细节
+- Debug 模式：HTTP 500 + `{"error_message":"<原始错误信息>"}`，包含完整错误栈或 SQL 错误
+
+这是一条**安全边界**——生产环境不向客户端泄露内部错误信息，防止攻击者通过错误消息推断数据库结构或查询逻辑。
+
+---
+
+### 8.2 GoogleReaderUserGetIntegration：用户不存在 vs 连库失败
+
+`GoogleReaderUserGetIntegration()`（`storage/integration.go:84-107`）返回两类 error，但在中间件中被**统一处理**。
+
+#### 8.2.1 存储层的两类错误
+
+```go
+err := s.db.QueryRow(query, username).Scan(
+    &integration.UserID, &integration.GoogleReaderEnabled,
+    &integration.GoogleReaderUsername, &integration.GoogleReaderPassword,
+)
+if errors.Is(err, sql.ErrNoRows) {
+    return &integration, fmt.Errorf(`store: unable to find this user: %s`, username)
+} else if err != nil {
+    return &integration, fmt.Errorf(`store: unable to fetch user: %v`, err)
+}
+```
+
+| 错误类型 | 触发条件 | error 消息 | 返回的 integration |
+|----------|----------|-----------|-------------------|
+| **用户不存在** | 查询返回 0 行（`sql.ErrNoRows`） | `"store: unable to find this user: <username>"` | 零值结构体（字段全空） |
+| **连库失败** | 数据库连接错误、SQL 语法错误、超时等 | `"store: unable to fetch user: <底层错误详情>"` | 零值结构体 |
+
+值得注意的是，两类错误都返回了**零值的 integration 结构体**，而不是 `nil`。这意味着调用方可以安全地读取结构体字段（虽然值都是空/零），但必须先检查 error。
+
+#### 8.2.2 中间件层的统一处理
+
+`middleware.go:128-136`：
+
+```go
+if integration, err = m.store.GoogleReaderUserGetIntegration(parts[0]); err != nil {
+    slog.Warn("[GoogleReader] No user found with the given Google Reader username",
+        slog.Bool("authentication_failed", true),
+        slog.String("client_ip", clientIP),
+        slog.String("user_agent", r.UserAgent()),
+        slog.Any("error", err),
+    )
+    sendUnauthorizedResponse(w, r)
+    return
+}
+```
+
+**关键发现**：无论用户不存在还是数据库故障，`if err != nil` 都进入同一条分支，产生**完全相同的客户端响应**：
+
+- HTTP 401
+- `X-Reader-Google-Bad-Token: true`
+- Body: `Unauthorized`
+
+**区别仅在服务端日志**：
+- 日志级别相同：都是 `Warn`
+- 日志消息相同：都是 `"No user found with the given Google Reader username"`
+- 但 `slog.Any("error", err)` 会记录不同的 error 详情，运维人员可区分
+
+#### 8.2.3 用户不存在返回 401 的安全理由
+
+这是**防止用户名枚举攻击**的标准安全实践：
+
+- 如果用户不存在返回 404 或不同的错误消息，攻击者可以通过逐个尝试用户名来确认哪些用户名是有效的
+- 统一返回 401 + 相同的错误消息，攻击者无法区分「用户名不存在」和「密码错误」
+- `X-Reader-Google-Bad-Token` Header 在两种情况下都会设置，进一步确保了不可区分性
+
+**类似设计**：
+- `GoogleReaderUserCheckPassword()` 也有同样的模式（`storage/integration.go:57-81`）：用户不存在和密码错误都返回 error，调用方统一返回 `JSONUnauthorized`
+- Fever 的 `UserByFeverToken()` 中用户不存在返回 `nil, nil`（零值用户 + nil error），同样在 `user == nil` 分支返回 `auth:0`，不与数据库错误区分
+
+#### 8.2.4 连库失败时的行为问题
+
+当数据库真的挂了的时候，鉴权层返回 401 而不是 500，有几个隐含的影响：
+
+| 影响 | 说明 |
+|------|------|
+| **监控盲点** | 数据库故障时表现为大量「认证失败」，而不是「服务器错误」，监控告警可能不触发 |
+| **客户端误导** | 客户端看到 401 会尝试刷新 Token 或提示用户「密码错误」，而实际上是服务端故障 |
+| **安全收益** | 不暴露数据库状态给潜在攻击者，防止通过错误响应推断基础设施状态 |
+
+这是一个**安全优先于可观测性**的设计选择。
+
+---
+
+### 8.3 HTML 媒体代理重写的错误处理
+
+`mediaproxy.RewriteDocumentWithAbsoluteProxyURL()` 是 Fever 和 GReader 共同调用的内容处理函数，其错误处理策略是**容错降级**——解析失败不影响请求，也不影响单条 Entry，最多是不代理媒体 URL。
+
+#### 8.3.1 两个错误点与降级策略
+
+`genericProxyRewriter()`（`mediaproxy/rewriter.go:27-95`）中有两处可能失败：
+
+| 错误点 | 触发条件 | 处理方式 | 代码行 |
+|--------|----------|----------|--------|
+| HTML 解析失败 | `goquery.NewDocumentFromReader()` 返回 err（如 HTML 格式严重损坏、内存不足） | `return htmlDocument` —— 返回原始 HTML，不做任何重写 | `rewriter.go:33-36` |
+| Body 提取失败 | `doc.FindMatcher(goquery.Single("body")).Html()` 返回 err | `return htmlDocument` —— 同上，返回原始 HTML | `rewriter.go:89-92` |
+
+**设计意图**：媒体代理是「增值功能」，核心价值是保护用户隐私和源站带宽。即使代理失效，文章内容本身仍然可读，只是图片/视频直接从源站加载。这是**功能降级（Graceful Degradation）** 模式。
+
+#### 8.3.2 单条媒体 URL 解析失败的粒度处理
+
+`shouldProxifyURL()`（`rewriter.go:110-124`）中每条 URL 单独判断：
+
+```go
+parsedURL, err := url.Parse(mediaURL)
+if err != nil || !parsedURL.IsAbs() || parsedURL.Host == "" {
+    return false  // 不代理，保留原 URL
+}
+```
+
+- 单张图片的 URL 格式非法 → 这张图片不代理，其他图片正常代理
+- 不会因为某一条 src 解析失败导致整篇文章内容出问题
+- 粒度精确到**单个媒体元素**
+
+`proxifySourceSet()` 处理 `srcset` 属性时也是同理——每个 image candidate 单独处理，坏的 URL 只是跳过代理，不会导致整个 srcset 属性出错。
+
+#### 8.3.3 对 Entry 和整个请求的影响层级
+
+| 错误层级 | 影响范围 | 结果 |
+|----------|----------|------|
+| 单条媒体 URL 解析失败 | 该 URL 不代理 | 对应图片/视频直接加载源站 URL，其他内容正常 |
+| 整篇 HTML 解析失败 | 该 Entry 内容不重写 | 该 Entry 返回原始 HTML，其他 Entry 正常 |
+| 全部 Entry 解析失败 | 所有内容不重写 | 请求成功，只是所有媒体都不代理 |
+
+**不会出现的情况**：
+- ❌ 单条 Entry 解析失败导致整条请求 500
+- ❌ 单条 Entry 解析失败导致该 Entry 从列表中消失
+- ❌ 单条 Entry 解析失败返回空内容（实际上返回原始内容）
+
+这与流查询 SQL 出错的行为形成鲜明对比：
+- **存储层错误**：致命错误，整个请求失败（500）
+- **内容渲染错误**：非致命错误，局部降级（保留原始内容）
+
+#### 8.3.4 附件（Enclosure）的代理错误处理
+
+GReader 的 `streamItemContentsHandler`（`handler.go:694`）还会调用附件代理：
+
+```go
+entry.Enclosures.ProxifyEnclosureURL(config.Opts.MediaProxyMode(), config.Opts.MediaProxyResourceTypes())
+```
+
+`ProxifyEnclosureURL` 是 `model.Enclosures` 类型的方法，逻辑同样是容错式——URL 不合法或不需要代理时跳过，不返回 error。Fever 响应中不处理附件代理（Fever 的 item 结构没有 enclosure 字段）。
+
+---
+
+### 8.4 错误处理层级总览
+
+将存储层和媒体重写的错误处理放在一起看，可以归纳出三层错误处理策略：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  第 1 层：请求入口 / 参数解析                                │
+│  （Stream ID 格式错误、Item ID 格式错误、output 不对等）     │
+│  → HTTP 400 BadRequest 或 HTTP 401 Unauthorized            │
+│  → 客户端可修复                                             │
+├─────────────────────────────────────────────────────────────┤
+│  第 2 层：存储层 / SQL 查询                                 │
+│  （数据库连接失败、查询超时、约束冲突等）                    │
+│  → HTTP 500 Internal Server Error                          │
+│  → 服务端问题，客户端无法修复                               │
+│  → Debug 模式暴露详情，生产模式隐藏细节                      │
+├─────────────────────────────────────────────────────────────┤
+│  第 3 层：内容渲染 / 媒体重写                               │
+│  （HTML 解析失败、单条 URL 格式错误等）                     │
+│  → 静默降级，返回原始内容                                   │
+│  → 非致命错误，不影响请求成功性                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**设计一致性观察**：
+
+1. **越靠近请求入口，错误越明确**（400/401 有明确语义）
+2. **越深入业务逻辑，错误越模糊**（500 统一内部错误，生产环境不泄露细节）
+3. **纯数据转换类错误不抛出**（媒体重写、ID 格式转换等），走降级或跳过策略
+4. **鉴权错误全部收敛为统一响应**，防止信息泄露
+5. **Fever 与 GReader 在存储层错误处理上完全一致**，都通过 `response.JSONServerError` 输出 500
