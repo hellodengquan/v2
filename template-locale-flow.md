@@ -410,7 +410,279 @@ func (h *handler) showLoginPage(w http.ResponseWriter, r *http.Request) {
 
 ---
 
-## 7. 关键代码位置索引
+## 7. 翻译键缺失与语言文件加载失败的错误处理
+
+### 7.1 总体策略：静默降级，不报错不崩溃
+
+整个 locale 系统的错误处理哲学是**静默降级（graceful degradation）**：无论翻译键缺失、语言不存在还是文件加载失败，都不会抛出 panic 或返回 HTTP 500，而是始终返回一个合理的字符串值，保证页面可渲染。
+
+### 7.2 翻译键缺失时的行为
+
+#### `Print(key)` — 两种降级路径
+
+代码位置：`internal/locale/printer.go:18-25`
+
+```go
+func (p *Printer) Print(key string) string {
+    if dict, err := getTranslationDict(p.language); err == nil {
+        if str, ok := dict.singulars[key]; ok {
+            return str
+        }
+    }
+    return key
+}
+```
+
+降级路径分析：
+
+| 场景 | 条件分支 | 返回值 | 说明 |
+|------|----------|--------|------|
+| 语言文件加载成功，键存在 | `err == nil && ok == true` | 翻译后的字符串 | 正常路径 |
+| 语言文件加载成功，键不存在 | `err == nil && ok == false` | 原始 key | 如 `Print("missing.key")` → `"missing.key"` |
+| 语言文件加载失败 | `err != nil` | 原始 key | 进入外层 `return key` |
+
+**结论：键缺失时静默返回原始 key 字符串，不使用 `en_US` 作为备选，不报错。**
+
+测试验证（`internal/locale/printer_test.go:96-109`）：
+
+```go
+func TestPrintWithMissingKey(t *testing.T) {
+    defaultCatalog = catalog{
+        "en_US": translationDict{
+            singulars: map[string]string{
+                "existing.key": "value",
+            },
+        },
+    }
+    translation := NewPrinter("en_US").Print("missing.key")
+    // 期望值是 "missing.key"，不是 en_US 的任何翻译
+    if translation != "missing.key" {
+        t.Errorf(`Wrong translation, got %q`, translation)
+    }
+}
+```
+
+#### `Printf(key, args...)` — 继承 Print 的降级行为
+
+代码位置：`internal/locale/printer.go:28-30`
+
+```go
+func (p *Printer) Printf(key string, args ...any) string {
+    return formatTranslation(p.Print(key), args...)
+}
+```
+
+`Printf` 内部调用 `Print(key)`，因此键缺失时 `Print` 返回原始 key，然后 `formatTranslation` 对该 key 做格式化处理：
+
+| 场景 | 返回值 | 说明 |
+|------|--------|------|
+| key 缺失，key 不含 `%` 占位符 | 原始 key | `hasFormattingDirective` 返回 false，忽略 args |
+| key 缺失，key 本身含 `%d` 等 | `fmt.Sprintf(key, args...)` | key 充当格式化模板（意外行为但不会崩溃） |
+
+测试验证（`internal/locale/printer_test.go:67-85`）：
+
+```go
+func TestPrintfWithMissingKeyAndPlaceholder(t *testing.T) {
+    // key "Status: %s" 不在 fr_FR 的翻译字典中
+    translation := NewPrinter("fr_FR").Printf("Status: %s", "ok")
+    // key 本身含 %s，因此 args 被用于格式化，返回 "Status: ok"
+    if translation != "Status: ok" {
+        t.Errorf(`Wrong translation, got %q`, translation)
+    }
+}
+```
+
+#### `Plural(key, n, args...)` — 三种降级路径
+
+代码位置：`internal/locale/printer.go:33-47`
+
+```go
+func (p *Printer) Plural(key string, n int, args ...any) string {
+    dict, err := getTranslationDict(p.language)
+    if err != nil {
+        return key
+    }
+
+    if choices, found := dict.plurals[key]; found {
+        index := getPluralForm(p.language, n)
+        if len(choices) > index {
+            return formatTranslation(choices[index], args...)
+        }
+    }
+
+    return key
+}
+```
+
+降级路径分析：
+
+| 场景 | 条件分支 | 返回值 | 说明 |
+|------|----------|--------|------|
+| 语言文件加载失败 | `err != nil` | 原始 key | 第一层降级 |
+| 键不在 plurals 中 | `found == false` | 原始 key | 第二层降级 |
+| 复数形式数组长度不够 | `len(choices) <= index` | 原始 key | 第三层降级（越界保护） |
+| 正常 | `len(choices) > index` | `formatTranslation(choices[index], args...)` | 正常路径 |
+
+测试验证（`internal/locale/printer_test.go:280-304`）：
+
+```go
+func TestPluralWithIndexOutOfBounds(t *testing.T) {
+    // 捷克语有 3 种复数形式，但翻译数组只有 1 个元素
+    defaultCatalog["cs_CZ"] = translationDict{
+        plurals: map[string][]string{
+            "limited.key": {"only one form"},
+        },
+    }
+    printer := NewPrinter("cs_CZ")
+    // n=5 时 getPluralForm("cs_CZ", 5) 返回 index 2，但 choices 只有 1 个元素
+    translation := printer.Plural("limited.key", 5)
+    // 越界保护生效，返回原始 key
+    if translation != "limited.key" {
+        t.Errorf(`Wrong translation, got %q`, translation)
+    }
+}
+```
+
+### 7.3 语言文件加载失败时的行为
+
+#### 加载流程与错误传播
+
+代码位置：`internal/locale/catalog.go:23-31`
+
+```go
+func getTranslationDict(language string) (translationDict, error) {
+    if _, ok := defaultCatalog[language]; !ok {
+        var err error
+        if defaultCatalog[language], err = loadTranslationFile(language); err != nil {
+            return translationDict{}, err
+        }
+    }
+    return defaultCatalog[language], nil
+}
+```
+
+可能失败的环节：
+
+| 环节 | 失败原因 | 代码位置 |
+|------|----------|----------|
+| `translationFiles.ReadFile()` | 语言代码对应的 JSON 文件不存在（`embed.FS` 中无此文件） | `catalog.go:34` |
+| `parseTranslationMessages()` | JSON 语法错误或值类型非法（非 string/[]any） | `catalog.go:39` |
+
+#### 加载失败不会导致 HTTP 500
+
+关键观察：`getTranslationDict` 返回 `(translationDict{}, err)`，但调用方 `Print`、`Printf`、`Plural` 全部**吞掉错误**：
+
+```go
+// Print: err != nil 时走 return key
+if dict, err := getTranslationDict(p.language); err == nil { ... }
+return key
+
+// Plural: err != nil 时直接 return key
+dict, err := getTranslationDict(p.language)
+if err != nil {
+    return key
+}
+```
+
+**因此，即使语言文件加载失败：**
+1. `Print`/`Printf`/`Plural` 静默返回原始 key
+2. 模板渲染不会中断
+3. HTTP 请求正常返回 200，页面上显示的是翻译 key（如 `"page.login.title"`）而非翻译后的文本
+4. **不会产生 HTTP 500 状态码**
+
+测试验证（`internal/locale/printer_test.go:8-15`）：
+
+```go
+func TestPrintfWithMissingLanguage(t *testing.T) {
+    defaultCatalog = catalog{}
+    translation := NewPrinter("invalid").Printf("missing.key")
+    // "invalid" 语言不在 catalog 中，embed.FS 中也没有 invalid.json
+    // loadTranslationFile 会失败，但 Printf 静默降级
+    if translation != "missing.key" {
+        t.Errorf(`Wrong translation, got %q`, translation)
+    }
+}
+```
+
+### 7.4 不存在 en_US 备选降级
+
+**整个 locale 系统没有 `en_US` 备选降级机制。** 当某种语言的翻译键缺失时，系统不会回退到 `en_US` 对应的翻译。这一点在测试中有明确验证：
+
+```go
+// fr_FR 的 plurals 中没有 "number_of_users" 键
+// 但也不会去 en_US 查找，直接返回原始 key
+func TestPluralWithMissingTranslation(t *testing.T) {
+    defaultCatalog = catalog{
+        "en_US": translationDict{
+            plurals: map[string][]string{
+                "number_of_users": {"%d user (%s)", "%d users (%s)"},
+            },
+        },
+        "fr_FR": translationDict{},  // 空字典，没有任何键
+    }
+    translation := NewPrinter("fr_FR").Plural("number_of_users", 2)
+    expected := "number_of_users"  // 返回 key，不是 en_US 的 "%d users"
+}
+```
+
+同样，`LocalizedError.Translate` 在语言无效时也不回退到 `en_US`：
+
+```go
+// internal/locale/error.go:26-33
+func (l *LocalizedErrorWrapper) Translate(language string) string {
+    if l.translationKey == "" {
+        if l.originalErr == nil {
+            return ""
+        }
+        return l.originalErr.Error()
+    }
+    return NewPrinter(language).Printf(l.translationKey, l.translationArgs...)
+}
+```
+
+当 `language` 无效时，`Printf` → `Print` → key 缺失 → 返回原始 key。
+
+### 7.5 唯一会报错的场景：Render 中 language 字段缺失
+
+代码位置：`internal/template/engine.go:97`
+
+```go
+printer := locale.NewPrinter(data["language"].(string))
+```
+
+如果 `data["language"]` 为 `nil`（即调用方未传入 `language` 参数），此处的类型断言 `.(string)` 会触发 **panic**。这是整个流程中唯一可能因语言相关原因导致崩溃的地方——但它本质上是调用方的编程错误（忘记在 view 参数中设置 `language`），而非翻译系统本身的容错问题。
+
+正常流程中 `view.New()` 始终会从 `WebSession` 取出 `language`（默认 `en_US`），所以此 panic 在生产环境不会触发。
+
+### 7.6 错误处理策略总结
+
+```
+翻译键缺失 / 语言文件加载失败
+    │
+    ├── Print ───────► 返回原始 key 字符串
+    ├── Printf ──────► 返回原始 key（不含 % 则忽略 args；含 % 则将 key 当模板格式化）
+    └── Plural ──────► 返回原始 key 字符串
+
+复数形式数组越界
+    │
+    └── Plural ──────► 返回原始 key 字符串（len(choices) <= index 保护）
+
+language 参数缺失（data["language"] == nil）
+    │
+    └── Engine.Render ► panic（类型断言失败，编程错误，生产环境不会触发）
+
+是否有 en_US 备选降级？
+    │
+    └── 否。所有降级路径均直接返回原始 key，不回退到其他语言。
+
+加载失败是否导致 HTTP 500？
+    │
+    └── 否。所有错误被静默吞掉，页面正常渲染，翻译 key 作为文本显示。
+```
+
+---
+
+## 8. 关键代码位置索引
 
 | 模块 | 文件 | 关键行 |
 |------|------|--------|
@@ -419,7 +691,9 @@ func (h *handler) showLoginPage(w http.ResponseWriter, r *http.Request) {
 | 语言列表 | `internal/locale/locale.go` | 7-31 |
 | 翻译目录 | `internal/locale/catalog.go` | 23-31 (懒加载), 47-79 (JSON解析) |
 | 翻译器 | `internal/locale/printer.go` | 18-47 (Print/Printf/Plural), 52-77 (格式化安全) |
+| 翻译器测试 | `internal/locale/printer_test.go` | 8-15 (缺失语言), 96-109 (缺失键), 280-304 (复数越界) |
 | 复数规则 | `internal/locale/plural.go` | 8-76 |
+| 本地化错误 | `internal/locale/error.go` | 8-34 (LocalizedErrorWrapper), 36-55 (LocalizedError) |
 | View 封装 | `internal/ui/view/view.go` | 34-49 (默认参数注入) |
 | WebSession 语言 | `internal/model/web_session.go` | 139-144 (Language getter), 205-208 (setter) |
 | HTTP 响应 | `internal/http/response/html.go` | 17-30 (HTML) |
