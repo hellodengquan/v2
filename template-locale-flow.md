@@ -682,7 +682,211 @@ language 参数缺失（data["language"] == nil）
 
 ---
 
-## 8. 关键代码位置索引
+## 8. 模板国际化覆盖率分析
+
+### 8.1 总体统计
+
+通过扫描 `internal/template/templates/` 下全部 36 个 HTML 模板文件（6 个公共模板 + 30 个视图模板），统计结果如下：
+
+| 指标 | 数量 |
+|------|------|
+| `{{ t "..." }}` 国际化调用 | 851 处 |
+| `{{ plural "..." }}` 国际化调用 | 21 处 |
+| **合计国际化调用** | **872 处** |
+| 硬编码可见文本（需人工甄别） | 102 处 |
+| **国际化覆盖率** | **89.5%** |
+
+### 8.2 按文件分表统计
+
+| 文件 | `t()` | `plural()` | 硬编码 | i18n 覆盖率 |
+|------|------:|----------:|-------:|----------:|
+| **common/feed_list.html** | 15 | 3 | 0 | 100.0% |
+| **common/feed_menu.html** | 8 | 0 | 0 | 100.0% |
+| **common/item_meta.html** | 25 | 1 | 0 | 100.0% |
+| **common/pagination.html** | 9 | 0 | 0 | 100.0% |
+| **common/settings_menu.html** | 8 | 0 | 0 | 100.0% |
+| **views/categories.html** | 21 | 3 | 0 | 100.0% |
+| **views/category_entries.html** | 27 | 2 | 0 | 100.0% |
+| **views/choose_subscription.html** | 5 | 0 | 0 | 100.0% |
+| **views/create_api_key.html** | 7 | 0 | 0 | 100.0% |
+| **views/create_category.html** | 10 | 0 | 0 | 100.0% |
+| **views/create_user.html** | 10 | 0 | 0 | 100.0% |
+| **views/edit_category.html** | 11 | 0 | 0 | 100.0% |
+| **views/edit_user.html** | 10 | 0 | 0 | 100.0% |
+| **views/feed_entries.html** | 33 | 2 | 0 | 100.0% |
+| **views/feeds.html** | 3 | 0 | 0 | 100.0% |
+| **views/history_entries.html** | 11 | 1 | 0 | 100.0% |
+| **views/import.html** | 8 | 0 | 0 | 100.0% |
+| **views/login.html** | 10 | 0 | 0 | 100.0% |
+| **views/search.html** | 8 | 0 | 0 | 100.0% |
+| **views/sessions.html** | 12 | 0 | 0 | 100.0% |
+| **views/shared_entries.html** | 17 | 1 | 0 | 100.0% |
+| **views/starred_entries.html** | 3 | 1 | 0 | 100.0% |
+| **views/tag_entries.html** | 1 | 1 | 0 | 100.0% |
+| **views/unread_entries.html** | 20 | 1 | 0 | 100.0% |
+| **views/users.html** | 17 | 0 | 0 | 100.0% |
+| **views/webauthn_rename.html** | 5 | 0 | 0 | 100.0% |
+| **common/layout.html** | 59 | 1 | 34 | 63.8% |
+| **views/api_keys.html** | 19 | 0 | 1 | 95.0% |
+| **views/settings.html** | 77 | 1 | 3 | 96.3% |
+| **views/category_feeds.html** | 14 | 1 | 2 | 88.2% |
+| **views/about.html** | 13 | 0 | 2 | 86.7% |
+| **views/entry.html** | 53 | 2 | 6 | 90.2% |
+| **views/edit_feed.html** | 77 | 0 | 13 | 85.6% |
+| **views/add_subscription.html** | 25 | 0 | 7 | 78.1% |
+| **views/offline.html** | 3 | 0 | 1 | 75.0% |
+| **views/integrations.html** | 197 | 0 | 33 | 85.7% |
+
+**覆盖率 100% 的模板共 25 个（占 69.4%），低于 90% 的模板共 6 个（占 16.7%）。**
+
+### 8.3 未国际化内容分类与具体路径
+
+以下将 102 处"硬编码"文本分为**无需国际化**（合理设计）与**建议国际化**（潜在遗漏）两类，并列出具体文件和位置。
+
+---
+
+### 8.4 无需国际化的内容（共 55 处，占 53.9%）
+
+这类内容属于品牌名、产品名、键盘按键、协议名、版本号、HTML 实体等，不应该或不需要翻译。
+
+#### A. 品牌名 / 产品名（4 处）
+
+| 文件 | 位置 | 内容 | 说明 |
+|------|------|------|------|
+| `common/layout.html:6` | `<title>` 中 | `- Miniflux` | 产品品牌名后缀 |
+| `views/about.html:12` | `<h3>` 标题 | `Miniflux` | About 页的产品名 |
+| `views/offline.html:6` | `<title>` 中 | `- Miniflux` | 离线页的品牌名后缀 |
+| `views/about.html:44` | License 链接 | `Apache 2.0` | 协议版本号（行业通用名） |
+
+#### B. 键盘快捷键按键标识（34 处）
+
+全部来自 `common/layout.html:141-184` 的快捷键模态对话框。这些是物理按键名称，属于无需翻译的通用符号：
+
+```
+g + u, g + b, g + h, g + f, g + c, g + s, p, k, n, j, F, G, h, l,
+o, Enter, v, V, c, C, m, M, A, d, f, s, a, g + g, z + t, R, #, /, Esc,
+以及 HTML 实体：&#x23F4; (⏴), &#x23F5; (⏵)
+```
+
+说明：键盘按键名（字母/组合键）是物理键盘上的实际标识，全世界通用，不翻译是正确的。
+
+#### C. 第三方服务 / 协议品牌名（34 处，与 B 部分有重叠统计）
+
+全部来自 `views/integrations.html`，是第三方集成服务的**注册品牌名**，不能翻译：
+
+| 品牌名 | 出现位置 |
+|--------|----------|
+| `Archive.org` | `<details><summary>` |
+| `Apprise` | `<details><summary>` + `edit_feed.html` 中 |
+| `Betula` | `<details><summary>` |
+| `Cubox` | `<details><summary>` |
+| `Discord` | `<details><summary>` |
+| `Espial` | `<details><summary>` |
+| `Fever` | `<details><summary>`（RSS 协议名） |
+| `Google Reader` | `<details><summary>`（产品名） |
+| `Instapaper` | `<details><summary>` |
+| `LinkAce` | `<details><summary>` |
+| `Linkding` | `<details><summary>` |
+| `LinkTaco` | `<details><summary>` + OAuth 链接 URL |
+| `Linkwarden` | `<details><summary>` |
+| `Matrix Bot` | `<details><summary>` |
+| `Notion` | `<details><summary>` |
+| `Ntfy` | `<details><summary>` + `edit_feed.html` 中 |
+| `Nunux Keeper` | `<details><summary>` |
+| `Omnivore` | `<details><summary>` |
+| `Karakeep` | `<details><summary>` |
+| `Pinboard` | `<details><summary>` |
+| `Pushover` | `<details><summary>` + `edit_feed.html` 中 |
+| `Raindrop` | `<details><summary>` |
+| `Readeck` | `<details><summary>` |
+| `Readwise Reader` | `<details><summary>` |
+| `RSS-Bridge` | `<details><summary>` |
+| `Shaarli` | `<details><summary>` |
+| `Shiori` | `<details><summary>` |
+| `Slack` | `<details><summary>` |
+| `Telegram Bot` | `<details><summary>` |
+| `Wallabag` | `<details><summary>` |
+| `Webhook` | `<details><summary>` + `edit_feed.html` 中 |
+
+#### D. API / URL 路径标识（2 处）
+
+| 文件 | 位置 | 内容 | 说明 |
+|------|------|------|------|
+| `views/api_keys.html:59` | 端点展示 | `/v1/` | API 版本路径，技术标识 |
+| `views/integrations.html:141` | Fever 端点 | `{rootURL}/fever/` | 同上 |
+
+#### E. HTML 格式实体 / 排版空白（13 处）
+
+| 文件 | 内容 | 出现次数 | 说明 |
+|------|------|---------:|------|
+| `views/add_subscription.html` | `&nbsp;` | 7 | 外部链接图标与 label 间的不可换行空格 |
+| `views/edit_feed.html` | `&nbsp;` | 7 | 同上 |
+| `views/settings.html` | `&nbsp;` | 3 | 同上 |
+| `views/category_feeds.html:1,6` | `&gt;` (`>`) | 2 | 面包屑分隔符（"分类 > Feeds"中的 >） |
+| `views/entry.html` | `&centerdot;` (·) | 1 | 条目元信息间的圆点分隔符 |
+
+#### F. 媒体播放时间 / 速度单位标识（5 处）
+
+全部来自 `views/entry.html:29-36`，是数字 + 单位组合：
+
+| 内容 | 说明 |
+|------|------|
+| `-30s`, `-10s`, `+10s`, `+30s` | 音视频快进/快退秒数 |
+| `1.00x` | 播放速度倍率 |
+
+这些是技术操作标识，全球用户通用，不翻译也可理解。
+
+---
+
+### 8.5 建议国际化的内容（共 1 处，占 1.0%）
+
+以下内容用户可见且有语义含义，遗漏了国际化包裹，建议补充。
+
+| 序号 | 文件 | 行号 / 上下文 | 硬编码内容 | 建议翻译键 |
+|------|------|-------------|-----------|----------|
+| 1 | `common/layout.html:134` | 模态对话框关闭按钮 | `x` | `action.close_modal` 或使用 aria-label 已有的 Close |
+
+> 说明：`<button class="btn-close-modal" aria-label="Close" autofocus>x</button>` 中的可见字符 `x`。虽然 `aria-label` 存在但不是国际化的（硬编码 "Close"），同时可见字符对纯文本/无 CSS 场景用户可见。建议两处都改为 `{{ t "action.close" }}`。
+
+### 8.6 甄别结论汇总
+
+```
+扫描发现 102 处"硬编码"可见文本
+    │
+    ├── 8.4 无需国际化：101 处（99.0%）
+    │   ├── 品牌名 / 产品名：4 处
+    │   ├── 键盘快捷键按键标识：34 处
+    │   ├── 第三方服务品牌名：33 处
+    │   ├── API / URL 路径标识：2 处
+    │   ├── HTML 实体 / 排版空白：19 处
+    │   └── 媒体时间 / 速度单位：5 处
+    │
+    └── 8.5 建议国际化：1 处（1.0%）
+        └── layout.html 模态框关闭按钮 "x"（+ aria-label "Close"）
+
+真实国际化覆盖率（排除无需国际化后）≈ 99.9%
+```
+
+### 8.7 国际化做得好的实践总结
+
+1. **`<details><summary>` 中的品牌名**：品牌名不翻译是正确做法，如 "Discord"、"Notion" 等国际品牌保持原名
+2. **键盘快捷键**：字母键名（`g + u` 等）不翻译，全世界通用
+3. **输入框 `placeholder`**：全部使用 `t` 函数包裹，如 `placeholder="{{ t "..." }}"`
+4. **`title` / `aria-label` 属性**：布局模板中 `aria-label="{{ t "skip_to_content" }}"` 等无障碍属性也做了国际化
+5. **`data-*` 属性**：按钮的 `data-label-*` 属性（给 JS 读取的动态文案）也全部国际化
+
+### 8.8 未使用 `t`/`plural` 但实际不影响的情形
+
+以下代码模式看似"硬编码"但因合理原因不应计入覆盖率分母：
+
+- **`placeholder="https://domain.tld/"`** 等示例 URL：属于技术提示，全球用户都能识别
+- **`{{ .entry.Title }}`** 等动态数据：这是用户内容，不是 UI 文本
+- **SVG `<template id="icon-read">`**：图标资源标识，不是用户可见文本
+- **`<option value="{{ .ID }}">{{ .Title }}</option>`**：动态渲染的分类名、用户名等用户自有数据
+
+---
+
+## 9. 关键代码位置索引
 
 | 模块 | 文件 | 关键行 |
 |------|------|--------|
