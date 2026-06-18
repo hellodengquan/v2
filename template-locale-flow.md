@@ -886,18 +886,287 @@ o, Enter, v, V, c, C, m, M, A, d, f, s, a, g + g, z + t, R, #, /, Esc,
 
 ---
 
-## 9. 关键代码位置索引
+## 9. 新增语言需要修改的所有位置
+
+### 9.1 完整修改清单（共 5 个文件，6 处改动）
+
+新增一门语言时，需要在以下位置依次修改：
+
+| 序号 | 位置 | 文件 | 关键代码 | 原因 |
+|------|------|------|----------|------|
+| **1** | **可用语言列表** | `internal/locale/locale.go:7-31` | `var AvailableLanguages map[string]string` | 在用户设置页面渲染语言下拉选项；`validateLanguage()` 校验用户选择的合法性 |
+| **2** | **复数规则 case 分支** | `internal/locale/plural.go:8-76` | `func getPluralForm(lang string, n int) int` | 为该语言的数字返回正确的复数形式数组索引 |
+| **3** | **JSON 翻译文件** | `internal/locale/translations/{language}.json` | 翻译文件 | 必须与 `AvailableLanguages` 中的 key 完全一致，`embed.FS` 通过此文件名加载 |
+| **4** | **复数形式数量表** | `internal/locale/catalog_test.go:100-138` | `var numberOfPluralFormsPerLanguage map[string]int` | 测试用例校验每个复数 key 的数组长度是否与语言规则匹配 |
+| **5** | **复数规则测试场景** | `internal/locale/plural_test.go:8-222` | `func TestPluralRules` 的 `scenarios` map | 测试用例验证 `getPluralForm` 对各数值返回正确索引 |
+
+> **注意**：除上述 5 处外，其余引用 `AvailableLanguages` 的地方（`validator/user.go`、`ui/settings_show.go`、`catalog_test.go:33-98` 的循环测试等）均通过 `range AvailableLanguages` 自动遍历，无需手动修改。
+
+### 9.2 改动点 1：可用语言列表（AvailableLanguages）
+
+**代码位置**：`internal/locale/locale.go:7-31`
+
+```go
+var AvailableLanguages = map[string]string{
+    "ar_SA":            "العربية",
+    "de_DE":            "Deutsch",
+    // ...
+    "zh_CN":            "简体中文",
+    // ↓ 新增：language_code: "Native Language Name"
+    "cs_CZ":            "Čeština",
+}
+```
+
+**作用**：
+- `ui/settings_show.go:68` 中 `view.Set("languages", locale.AvailableLanguages)` 将此 map 传递给模板，用于渲染设置页的语言下拉列表
+- `validator/user.go:199-205` 的 `validateLanguage()` 通过检查 `languages[language]` 是否存在，确保用户选择的语言是系统支持的
+- 多个测试用例 `for language := range AvailableLanguages` 自动遍历验证所有语言的完整性
+
+### 9.3 改动点 2：复数规则（getPluralForm 的 case 分支）
+
+**代码位置**：`internal/locale/plural.go:8-76`
+
+函数签名：
+```go
+func getPluralForm(lang string, n int) int
+```
+
+根据语言 `lang` 和数字 `n` 返回对应的复数形式数组索引，供 `Printer.Plural()` 查找翻译。
+
+**当前已覆盖的 case 分支（按复数形式数量分类）**：
+
+| 复数形式数量 | 语言代码 | 规则说明 |
+|-------------:|----------|----------|
+| **1 种** | `zh_CN`, `zh_TW`, `nan_Latn_pehoeji`, `id_ID`, `ja_JP`, `ko_KR` | 无复数变化，始终返回 0 |
+| **2 种** | `gl_ES` | 特殊规则：`n != 1` 时返回 1（注意法语等 2 种形式的语言使用 default 规则） |
+| **2 种（default）** | `fr_FR`, `pt_BR`, `tr_TR`, `de_DE`, `el_EL`, `en_US`, `es_ES`, `fi_FI`, `hi_IN`, `it_IT`, `nl_NL` | `n > 1` 返回 1，否则返回 0 |
+| **3 种** | `cs_CZ`, `pl_PL`, `ro_RO`, `ru_RU`, `uk_UA`, `sr_RS` | 各有不同的数字条件分支 |
+| **6 种** | `ar_SA` | 阿拉伯语最复杂，有 6 种复数形式 |
+
+**关键观察**：
+1. `plural.go:59` 的 `case "ru_RU", "uk_UA", "sr_RS"` 中包含 `sr_RS`（塞尔维亚语），但该语言**并未**出现在 `AvailableLanguages` 中，也没有对应的 `sr_RS.json` 翻译文件。这是"预支持"状态——复数规则已准备好，等待翻译贡献。
+2. `gl_ES`（加利西亚语）虽然也是 2 种复数形式，但规则特殊（`n != 1` 而非 `n > 1`），因此单独 case 处理。
+3. `default` 分支注释明确标注 `// includes fr_FR, pr_BR, tr_TR`，意味着新增的语言如果规则与 default 一致（`n > 1` → index 1），可以**不**在此处添加 case。
+
+### 9.4 改动点 3：JSON 翻译文件命名约定
+
+**代码位置**：`internal/locale/catalog.go:20-21, 34`
+
+```go
+//go:embed translations/*.json
+var translationFiles embed.FS
+
+func loadTranslationFile(language string) (translationDict, error) {
+    translationFileData, err := translationFiles.ReadFile("translations/" + language + ".json")
+    // ...
+}
+```
+
+**命名约定**：
+- 文件名 = `{language_code}.json`，其中 `language_code` 必须与 `AvailableLanguages` 中的 key 完全一致（区分大小写）
+- 例如 `AvailableLanguages["nan_Latn_pehoeji"] = "Pe̍h-ōe-jī"` 对应文件 `translations/nan_Latn_pehoeji.json`
+- 通过 Go 1.16+ 的 `embed.FS` 内嵌到二进制，新增 JSON 文件必须重新编译
+
+**JSON 文件结构**：
+- **单数形式**：`"translation.key": "Translated text"`
+- **复数形式**：`"plural.key": ["Singular form", "Plural form 1", "Plural form 2", ...]`
+- 数组长度必须与 `getPluralForm` 对该语言可能返回的最大索引 + 1 一致
+- 例如 `ar_SA` 需要 6 个元素，`zh_CN` 需要 1 个元素，`en_US` 需要 2 个元素
+
+**测试验证**：
+- `catalog_test.go:33-40` 循环遍历 `AvailableLanguages`，确保每个语言的 JSON 文件都能成功加载
+- `catalog_test.go:42-68` 确保 singulars 和 plurals 都不为空
+- `catalog_test.go:70-98` 确保每种语言都包含 `en_US` 的所有 key
+- `catalog_test.go:100-138` 确保每个复数 key 的数组长度与 `numberOfPluralFormsPerLanguage` 一致
+
+### 9.5 改动点 4：复数形式数量表（测试用例）
+
+**代码位置**：`internal/locale/catalog_test.go:101-125`
+
+```go
+var numberOfPluralFormsPerLanguage = map[string]int{
+    "ar_SA":            6,
+    "de_DE":            2,
+    // ...
+    "zh_TW":            1,
+    // ↓ 新增语言的复数形式数量
+    "cs_CZ":            3,
+}
+```
+
+此 map 是测试用例 `TestTranslationFilePluralForms` 的校验基准：
+- 对每个语言的每个复数 key，断言 `len(choices) == numberOfPluralFormsPerLanguage[language]`
+- 若新增语言未在此 map 中，测试不会失败（Go map 零值为 0，而实际数组长度至少为 1，会触发断言失败）
+
+### 9.6 改动点 5：复数规则测试场景（测试用例）
+
+**代码位置**：`internal/locale/plural_test.go:8-222`
+
+```go
+func TestPluralRules(t *testing.T) {
+    scenarios := map[string]map[int]int{
+        // ↓ 新增语言的测试场景：{数字: 期望的复数索引}
+        "cs_CZ": {
+            1: 0,  // n == 1 → index 0
+            2: 1,  // n >= 2 && n <= 4 → index 1
+            5: 2,  // default → index 2
+        },
+        // ...
+    }
+}
+```
+
+**作用**：
+- 测试 `getPluralForm` 对该语言在不同数字下返回正确索引
+- 对于使用 `default` 规则的新增语言（如 `de_DE`、`en_US`），也需要在此补充测试场景（见 `plural_test.go:166-205`）
+- 特殊场景 `"unknown_language"`（`plural_test.go:206-211`）验证未在 case 中列出的语言能正确 fallback 到 default 规则
+
+### 9.7 新增语言示例（以捷克语 cs_CZ 为例）
+
+完整改动清单：
+
+```
+1. internal/locale/locale.go:
+   + "cs_CZ": "Čeština",
+
+2. internal/locale/plural.go (已有，cs_CZ case 已存在):
+   case "cs_CZ":
+       switch {
+       case n == 1: return 0
+       case n >= 2 && n <= 4: return 1
+       default: return 2
+       }
+
+3. internal/locale/translations/cs_CZ.json:
+   {
+       "action.login": "Přihlásit se",
+       // ... 所有 singular keys
+       "page.unread_entry_count": ["%d nepřečtená položka", "%d nepřečtené položky", "%d nepřečtených položek"],
+       // ... 所有 plural keys（每个数组长度为 3）
+   }
+
+4. internal/locale/catalog_test.go:
+   + "cs_CZ": 3,
+
+5. internal/locale/plural_test.go:
+   + "cs_CZ": {
+   +     1: 0,
+   +     2: 1,
+   +     4: 1,
+   +     5: 2,
+   + },
+```
+
+### 9.8 复数函数语言覆盖情况分析
+
+#### 已显式覆盖的语言（10 个）
+
+| 语言代码 | 语言名称 | 复数形式数 | case 位置 |
+|----------|---------:|-----------:|----------|
+| `ar_SA` | 阿拉伯语 | 6 | `plural.go:10-24` |
+| `cs_CZ` | 捷克语 | 3 | `plural.go:25-33` |
+| `gl_ES` | 加利西亚语 | 2 | `plural.go:34-38` |
+| `id_ID` | 印尼语 | 1 | `plural.go:39-40` |
+| `ja_JP` | 日语 | 1 | `plural.go:39-40` |
+| `ko_KR` | 韩语 | 1 | `plural.go:39-40` |
+| `pl_PL` | 波兰语 | 3 | `plural.go:41-49` |
+| `ro_RO` | 罗马尼亚语 | 3 | `plural.go:50-58` |
+| `ru_RU` | 俄语 | 3 | `plural.go:59-67` |
+| `uk_UA` | 乌克兰语 | 3 | `plural.go:59-67` |
+| `sr_RS` | 塞尔维亚语 | 3 | `plural.go:59-67`（已定义但语言未启用） |
+| `zh_CN` | 简体中文 | 1 | `plural.go:68-69` |
+| `zh_TW` | 繁体中文 | 1 | `plural.go:68-69` |
+| `nan_Latn_pehoeji` | 闽南语 | 1 | `plural.go:68-69` |
+
+#### 通过 default 规则覆盖的语言（10 个）
+
+`plural.go:70-74` 的 `default` 分支注释 `// includes fr_FR, pr_BR, tr_TR`，实际覆盖了 AvailableLanguages 中以下 10 个语言：
+
+| 语言代码 | 语言名称 | 复数形式数 | 规则 |
+|----------|---------:|-----------:|------|
+| `fr_FR` | 法语 | 2 | `n > 1` → index 1 |
+| `pt_BR` | 巴西葡萄牙语 | 2 | `n > 1` → index 1 |
+| `tr_TR` | 土耳其语 | 2 | `n > 1` → index 1 |
+| `de_DE` | 德语 | 2 | `n > 1` → index 1 |
+| `el_EL` | 希腊语 | 2 | `n > 1` → index 1 |
+| `en_US` | 英语 | 2 | `n > 1` → index 1 |
+| `es_ES` | 西班牙语 | 2 | `n > 1` → index 1 |
+| `fi_FI` | 芬兰语 | 2 | `n > 1` → index 1 |
+| `hi_IN` | 印地语 | 2 | `n > 1` → index 1 |
+| `it_IT` | 意大利语 | 2 | `n > 1` → index 1 |
+| `nl_NL` | 荷兰语 | 2 | `n > 1` → index 1 |
+
+#### 未覆盖的语言使用默认值的潜在影响
+
+**潜在问题 1：法语（fr_FR）的复数规则不完全匹配 default**
+
+法语实际复数规则应为：`n == 0 || n == 1` → 单数（index 0），其他 → 复数（index 1）。
+
+即 `0 条记录` 在法语中应为单数形式（"0 enregistrement" 而非 "0 enregistrements"），但当前 default 规则 `n > 1` 会将 `n=0` 错误地返回复数形式（index 1）。
+
+```go
+// 当前 default 规则：
+default:
+    if n > 1 {
+        return 1
+    }
+    return 0
+
+// n=0 时：0 > 1 为 false → 返回 0（单数），这个是对的
+// n=1 时：1 > 1 为 false → 返回 0（单数），这个也是对的
+// n=2 时：2 > 1 为 true → 返回 1（复数），正确
+```
+
+> 实际上当前 default 规则对法语是正确的！因为 `n=0` 和 `n=1` 都返回 0，与法语规则一致。但如果未来新增葡萄牙语（葡萄牙）`pt_PT`，其规则与 `pt_BR` 不同（`pt_PT` 要求 `n >= 2` 才用复数），default 规则就会出错。
+
+**潜在问题 2：加利西亚语（gl_ES）已单独处理避免错误**
+
+`gl_ES` 的规则是 `n != 1` → 复数（index 1），即 `n=0` 时返回 1。如果走 default 规则会返回 0，因此单独 case 处理是正确的。
+
+**潜在问题 3：未来新增特殊规则语言的风险**
+
+如果未来新增以下语言但忘记添加 case，会使用 default 规则导致错误：
+
+| 拟新增语言 | 实际规则 | default 规则结果 | 影响 |
+|-----------|----------|-----------------|------|
+| `pt_PT`（葡萄牙葡萄牙语） | `n >= 2` → 复数 | `n > 1` → 复数 | **相同**，无问题 |
+| `lv_LV`（拉脱维亚语） | 3 种复数形式 | 仅返回 0/1 | 复数形式数组越界或选择错误翻译 |
+| `lt_LT`（立陶宛语） | 3 种复数形式 | 仅返回 0/1 | 同上 |
+| `sl_SI`（斯洛文尼亚语） | 4 种复数形式 | 仅返回 0/1 | 同上 |
+| `cy_GB`（威尔士语） | 6 种复数形式 | 仅返回 0/1 | 同上 |
+| `br_FR`（布列塔尼语） | 5 种复数形式 | 仅返回 0/1 | 同上 |
+
+**错误表现**：
+1. **翻译选择错误**：例如拉脱维亚语 `n=11` 实际应返回 index 2，但 default 返回 0 → 显示单数形式
+2. **数组越界保护**：`Printer.Plural()` 中有 `len(choices) > index` 检查（`printer.go:44`），越界时返回原始 key，不会 panic
+3. **测试捕获**：`TestTranslationFilePluralForms` 会校验数组长度与 `numberOfPluralFormsPerLanguage` 一致，如果翻译文件提供了 3 个元素但测试 map 中该语言数量为 2（或未添加 → 0），测试会失败
+
+**风险分级**：
+
+| 风险等级 | 场景 | 说明 |
+|---------|------|------|
+| 🔴 高 | 新增有 3+ 种复数形式的语言但忘记添加 case | 翻译选择错误，用户看到语法错误的句子 |
+| 🟡 中 | 新增 2 种形式但规则与 default 有差异（如 `pt_PT`） | 细微语法错误，多数用户可能察觉不到 |
+| 🟢 低 | 新增 2 种形式且规则与 default 完全一致（如新增 `sv_SE` 瑞典语） | 可以不添加 case，但建议添加以提高可读性 |
+
+---
+
+## 10. 关键代码位置索引
 
 | 模块 | 文件 | 关键行 |
 |------|------|--------|
 | 模板引擎 | `internal/template/engine.go` | 35-88 (解析), 90-114 (渲染) |
 | 模板函数 | `internal/template/functions.go` | 35-161 (函数注册), 284-323 (elapsedTime) |
 | 语言列表 | `internal/locale/locale.go` | 7-31 |
-| 翻译目录 | `internal/locale/catalog.go` | 23-31 (懒加载), 47-79 (JSON解析) |
+| 翻译目录 | `internal/locale/catalog.go` | 20-21 (embed), 23-31 (懒加载), 34 (文件加载), 47-79 (JSON解析) |
 | 翻译器 | `internal/locale/printer.go` | 18-47 (Print/Printf/Plural), 52-77 (格式化安全) |
 | 翻译器测试 | `internal/locale/printer_test.go` | 8-15 (缺失语言), 96-109 (缺失键), 280-304 (复数越界) |
 | 复数规则 | `internal/locale/plural.go` | 8-76 |
+| 复数规则测试 | `internal/locale/plural_test.go` | 8-222 |
+| 复数形式数量测试 | `internal/locale/catalog_test.go` | 100-138 |
 | 本地化错误 | `internal/locale/error.go` | 8-34 (LocalizedErrorWrapper), 36-55 (LocalizedError) |
+| 语言校验 | `internal/validator/user.go` | 199-205 (validateLanguage) |
+| 设置页传递语言列表 | `internal/ui/settings_show.go` | 68 |
 | View 封装 | `internal/ui/view/view.go` | 34-49 (默认参数注入) |
 | WebSession 语言 | `internal/model/web_session.go` | 139-144 (Language getter), 205-208 (setter) |
 | HTTP 响应 | `internal/http/response/html.go` | 17-30 (HTML) |
