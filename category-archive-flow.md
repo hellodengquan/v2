@@ -372,6 +372,32 @@ CREATE INDEX entry_tombstones_deleted_at_idx ON entry_tombstones (deleted_at);
 
 删除 Feed 时通过外键级联清理该 Feed 的所有墓碑。
 
+#### 墓碑生命周期与清理时机
+
+**结论：墓碑记录默认永久保留，不存在 TTL 或定期清理机制。**
+
+经过全代码库检索，没有任何 `DELETE FROM entry_tombstones` 或 `CleanupTombstones` 之类的主动清理代码。`deleted_at` 字段虽然建有索引 `entry_tombstones_deleted_at_idx`，但在业务逻辑中从未以它为条件做过期筛选——该索引为未来扩展预留。
+
+**唯一的墓碑清理触发点：删除 Feed**
+```sql
+-- entry_tombstones.feed_id 外键定义：
+REFERENCES feeds(id) ON DELETE CASCADE
+```
+当一个 Feed 被删除时，PostgreSQL 级联删除该 Feed 关联的全部墓碑记录。删除 Feed 的路径：
+- 用户主动删除单个 Feed（`DELETE FROM feeds WHERE id=?`）
+- 删除其所属的 Category，外键级联删除 Feed，再级联删除墓碑
+- 删除用户，级联删除全部数据
+
+**墓碑的写入路径（共两处）**：
+| 写入场景 | 代码位置 | 触发条件 |
+|----------|----------|----------|
+| 自动归档 | `storage/entry.go:363-404` `ArchiveEntries()` | 清理调度器或 `--run-cleanup-tasks` 时批量写入 |
+| 手动清空历史 | `storage/entry.go:491-508` `FlushHistory()` | UI "清除历史记录"按钮 或 API `PUT /v1/flush-history` |
+
+两者写入逻辑相同：`INSERT INTO entry_tombstones ... ON CONFLICT DO NOTHING`。
+
+> **存储代价提示**：由于墓碑永久累积，对于运行多年、订阅大量 Feed 的实例，`entry_tombstones` 表可能膨胀。若需人工清理，可基于 `deleted_at` 索引执行 SQL（例如删除一年前的墓碑），但这会带来被删条目重新被摄入的副作用。
+
 #### 墓碑检查点
 
 **1. 创建条目时** (`storage/entry.go:117-119`)
@@ -412,6 +438,65 @@ func cleanupScheduler(store *storage.Storage, frequency time.Duration) {
 ```
 
 使用 `time.Tick()` 无限循环触发。默认频率 `CLEANUP_FREQUENCY_HOURS = 24` 小时。
+
+### 5.1.1 配置生效时机：修改 max-days 后是否需要重启？
+
+**结论：需要重启进程。配置仅在启动时解析一次，运行中无法动态生效。**
+
+#### 配置加载链路
+
+**启动时一次性解析** (`internal/cli/cli.go:80-96`)
+```go
+cfg := config.NewConfigParser()
+
+if flagConfigFile != "" {
+    config.Opts, err = cfg.ParseFile(flagConfigFile)  // 1. 先读配置文件
+}
+
+config.Opts, err = cfg.ParseEnvironmentVariables()     // 2. 再读环境变量（覆盖文件）
+```
+
+`ParseFile` 和 `ParseEnvironmentVariables` 都将原始值解析后写入 `configOptions.options` map 中的 `parsedDuration`、`parsedIntValue` 等字段，之后整个进程生命周期内不再重新解析。
+
+**`config.Opts` 是包级全局单例** (`internal/config/config.go:8-9`)：
+```go
+var Opts *configOptions
+```
+没有任何 hot-reload 或文件监听机制。
+
+#### 调度器与配置值的关系
+
+**调度器频率**在 `runScheduler()` 启动时就已确定并固化到 `time.Tick()` 中：
+```go
+// internal/cli/scheduler.go:27-30
+go cleanupScheduler(
+    store,
+    config.Opts.CleanupFrequency(),  // 启动时快照，之后不会重新读取
+)
+```
+`time.Tick(frequency)` 创建后无法修改间隔——即使你能改 `config.Opts`，调度器频率也不会变。
+
+**归档天数**是每次 `runCleanupTasks()` 运行时从 `config.Opts` 读取的：
+```go
+// internal/cli/cleanup_tasks.go:26,39
+config.Opts.CleanupArchiveReadInterval()
+config.Opts.CleanupArchiveUnreadInterval()
+```
+
+但这只是 getter 返回 `parsedDuration` 的静态值。因为 `config.Opts` 底层 map 没有被重新解析，所以即使环境变量已更新，读出来的仍然是启动时的值。
+
+#### 两条独立的执行路径
+
+| 触发方式 | 配置解析时机 | 配置变更是否生效 |
+|----------|-------------|----------------|
+| 守护进程定时调度 | daemon 启动时 (`cli.Parse()` 中) | ❌ 不生效，需重启 |
+| CLI 手动执行 `--run-cleanup-tasks` | 每次命令执行时重新 `cli.Parse()` | ✅ 每次使用最新配置 |
+
+手动模式每次都是独立进程：
+```bash
+miniflux --config-file /etc/miniflux.conf --run-cleanup-tasks
+```
+这条命令每次都会重新读文件和环境变量，所以能拿到最新值。
 
 ### 5.2 清理任务完整流程
 
@@ -530,13 +615,17 @@ users (1)
 | Category 存储 | `internal/storage/category.go` | 246-290 删除迁移 |
 | Entry 模型 | `internal/model/entry.go` | 27-47 starred/tags |
 | Entry 归档 | `internal/storage/entry.go` | 363-404 ArchiveEntries |
+| FlushHistory 手动清历史 | `internal/storage/entry.go` | 491-508 |
 | 标签查询 | `internal/storage/entry_query_builder.go` | 160-166 WithTags |
 | 置顶查询 | `internal/storage/entry_query_builder.go` | 62-69 WithStarred |
 | 全局可见性 | `internal/storage/entry_query_builder.go` | 226-230 |
 | RSS 标签提取 | `internal/reader/rss/adapter.go` | 154-156, 185-189, 290-295 |
 | Feed 创建流程 | `internal/reader/handler/handler.go` | 104-192 |
 | 清理任务入口 | `internal/cli/cleanup_tasks.go` | 16-58 |
-| 清理调度器 | `internal/cli/scheduler.go` | 53-57 |
-| 配置默认值 | `internal/config/options.go` | 125-155 |
+| 清理调度器 | `internal/cli/scheduler.go` | 27-30, 53-57 |
+| CLI 入口与配置解析 | `internal/cli/cli.go` | 80-96 |
+| 配置全局单例 | `internal/config/config.go` | 8-9 |
+| 配置解析器 | `internal/config/parser.go` | 31-37, 39-51 |
+| 配置默认值与 getter | `internal/config/options.go` | 125-155, 655-667 |
 | 数据库初始 schema | `internal/database/migrations.go` | 47-121 |
 | Tombstones 迁移 | `internal/database/migrations.go` | 1470-1498 |
