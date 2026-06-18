@@ -414,6 +414,129 @@ SELECT EXISTS(entries...) OR EXISTS(entry_tombstones...)
 ```
 墓碑化的条目视为"非新条目"，避免爬虫重复抓取全文。
 
+#### 4.4.3 墓碑读路径：刷新 Feed 时的查询热点
+
+墓碑表的读流量并非来自清理任务，而是**每一次 Feed 刷新的每一条 entry**。以下是完整的调用链和 SQL 命中情况。
+
+##### 完整的 Feed 刷新调用链
+
+每刷新 1 个 Feed（含 N 条解析出的 entry），总共会触发 **2N 次 entry_tombstones 查询**：
+
+```
+handler.CreateFeed() / handler.RefreshFeed()
+│
+├─ processor.ProcessFeedEntries()   [processor/processor.go:27]
+│   └─ for each entry in feed:
+│        └─ store.IsNewEntry()      [L95] ← ★ 命中点 #1
+│
+└─ store.RefreshFeedEntries()       [storage/entry.go:315]
+    └─ for each entry in feed:
+         ├─ store.entryExists()      [L325] — 仅查 entries 表，不含墓碑
+         └─ store.createEntry()      [L338]
+              └─ WHERE NOT EXISTS (SELECT ... entry_tombstones)  ← ★ 命中点 #2
+```
+
+##### 命中点详解
+
+**命中点 #1 — `IsNewEntry()` 爬虫预判断** (`storage/entry.go:278-293`)
+
+```sql
+SELECT EXISTS(
+    SELECT 1 FROM entries WHERE feed_id=$1 AND hash=$2
+) OR EXISTS(
+    SELECT 1 FROM entry_tombstones WHERE feed_id=$1 AND hash=$2
+)
+```
+
+调用目的：在昂贵的网页抓取（crawler/scraper）之前判断条目是否已知。如果不查墓碑，已被归档的旧条目每次刷新都会被重新抓取全文，浪费大量 HTTP 请求。
+
+执行计划分析：
+- PostgreSQL 将 `OR EXISTS` 拆成两次独立的 **Index Scan**
+- 对 entries 用 `entries_feed_id_hash_key` 唯一索引（B-tree，`(feed_id, hash)`）
+- 对 entry_tombstones 用 **主键索引**（也是 B-tree `(feed_id, hash)`）
+- 两者命中即短路返回 true
+
+**命中点 #2 — `createEntry()` 原子写入保护** (`storage/entry.go:86-119`)
+
+```sql
+INSERT INTO entries (...) SELECT ...
+WHERE NOT EXISTS (
+    SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+)
+RETURNING id, status, ...
+```
+
+调用目的：即使前面的 `entryExists()` 返回 false（entries 中不存在），也可能是因为被归档了。写入前必须再做一次原子检查，防止已删条目被重新摄入为新的未读。
+
+如果命中墓碑：`QueryRow` 返回 `sql.ErrNoRows`，上游捕获后返回 `ErrEntryTombstoned`，被 `RefreshFeedEntries()` 专门捕获并**静默忽略**（`storage/entry.go:339-341`）：
+
+```go
+case errors.Is(err, ErrEntryTombstoned):
+    err = nil   // 当做"已处理过的重复条目"，不回滚，不加到 newEntries
+```
+
+> 注意：`entryExists()` 和 `getEntryIDByHash()` 两个辅助函数**只查 entries 表，不查墓碑**。这是设计上的有意分工——把墓碑检查留给最后一次写入的原子防御。
+
+##### 索引覆盖情况
+
+| 表 | 索引 | 类型 | 被谁使用 | 是否满足覆盖索引 |
+|----|------|------|---------|----------------|
+| `entries` | `entries_feed_id_hash_key` | UNIQUE B-tree `(feed_id, hash)` | `entryExists()`、`getEntryIDByHash()`、`IsNewEntry` 前半段 | ✅ 理想匹配。等值查询 `feed_id=? AND hash=?` 正好是前缀+全部列 |
+| `entry_tombstones` | `PRIMARY KEY (feed_id, hash)` | B-tree 组织表（PostgreSQL 的 PK 即组织方式） | `IsNewEntry` 后半段、`createEntry` 的 WHERE NOT EXISTS | ✅ 理想匹配。等值查询正好对齐 PK 的两列 |
+| `entry_tombstones` | `entry_tombstones_deleted_at_idx` | B-tree `(deleted_at)` | **无人使用！** | ❌ 预留索引，代码里所有查询都带 `feed_id+hash` 条件，从未按时间过滤 |
+
+两个核心查询都走主键 B-tree，时间复杂度是 `O(log N)` 比较加几次页访问。
+
+##### 百万级数据膨胀下的性能衰减
+
+以下是规模增长后的性能分析（基于 PostgreSQL B-tree 特性估算）：
+
+| 墓碑行数 | B-tree 深度 | 单次 Index Scan 页读取 | 1 个 Feed × 20 条 × 2 次 | 100 个 Feed/小时 |
+|----------|------------|----------------------|----------------------|-----------------|
+| 1 万 | ~2 层（根+叶子） | 2~3 次随机读 | ~100 次 | 10,000 次 |
+| 100 万 | ~3 层（根+中间+叶子） | 3~4 次随机读 | ~160 次 | 16,000 次 |
+| 1,000 万 | ~4 层 | 4~5 次随机读 | ~200 次 | 20,000 次 |
+
+**衰减来源 1：B-tree 深度增加**
+- 每增加 2 个数量级，B-tree 深度 +1 层
+- 每多一层意味着多一次随机磁盘读取（除非根/中间页在共享缓冲池中被命中）
+- 但由于 `(feed_id, hash)` 的第一列是 feed_id，**同一 Feed 的墓碑在叶子页中物理聚集**，刷新同一 feed 时多次查询会命中缓存，实际缓冲命中率通常 >90%
+
+**衰减来源 2：`IsNewEntry` 两次索引扫描的 OR 开销**
+- PostgreSQL 优化器对 `OR EXISTS` 会生成**两个 Index Scan + Append + Result 节点**的计划
+- 即使 entries 表里已经存在（99% 的正常场景），仍然要先跑 entries 的 Index Scan 才短路，不会跑 entry_tombstones
+- **对墓碑的查询只在两种情况下真正触发**：
+  1. 条目确实不存在（新条目/过期条目）— entries 扫不到，才去扫 entry_tombstones
+  2. 条目已被归档 — 同上
+
+因此对于稳定的 Feed（历史文章不怎么变），墓碑查询量远小于 `2N`，实际可能只有 5%~10% 真的走到 entry_tombstones。
+
+**衰减来源 3：VACUUM 与页膨胀**
+- 墓碑是 INSERT-only 工作负载（只有 INSERT，基本无 UPDATE/DELETE，因为 feed 级级联删除相对少见）
+- 所以 page 利用率很高，几乎不会有膨胀问题
+- PostgreSQL 的 autovacuum 只需要偶尔跑一次做可见性冻结
+- **这是墓碑工作负载天然友好于性能的一面**
+
+**衰减来源 4：写放大（写入路径影响读取）**
+- ArchiveEntries 的 `INSERT INTO entry_tombstones` 是批量的，但写入时要在主键 B-tree 中找叶子页做插入
+- 因为 PK 首列是 feed_id，**同一 feed 的墓碑会落到同一片叶子页**，每次归档一个 feed 的旧条目时，这些写入大部分会落在同一页，写放大可控
+- 只有百万级跨多个 feed 的混写才会导致缓冲区被频繁冲刷
+
+##### 实际风险与缓解建议
+
+真正的风险不在单次查询时延，而在**热点叠加**：
+
+1. **大量 Feed 同时刷新时的查询风暴**：1000 个 Feed × 平均 20 条/Feed = 20,000 次 entries 查询 + 可能 2,000 次墓碑查询。如果 worker pool 有 5 个 goroutine 并发，会同时对同一 PK 索引页产生竞争。
+   - 缓解：`SCHEDULER_ENTRY_FREQUENCY_MAX_INTERVAL` 调大，分散刷新时间
+
+2. **冷启动后首次刷新的缓存 miss**：重启 PostgreSQL 或重启服务器后，共享缓冲池为空，100万墓碑前几次查询都是真实的磁盘随机读。
+   - 缓解：可以定期跑 `pg_prewarm` 把 PK 索引预热到共享缓冲池
+
+3. **人工清理墓碑后的性能反噬**：如果你用 `DELETE FROM entry_tombstones WHERE deleted_at < now() - interval '1 year'` 清理，会产生大量死元组，VACUUM 之前会短暂出现 Index Scan 要扫描更多页才能定位行的情况。
+   - 缓解：批量小步清理（每次 10 万行），用 `VACUUM ANALYZE entry_tombstones` 跟进更新统计
+
+4. **`entries_feed_id_status_hash_idx` 冗余索引占用**：`migrations.go:398` 额外建了一个 `(feed_id, status, hash)` 索引，但所有墓碑检查都只走唯一索引 `entries_feed_id_hash_key`，该索引主要服务于状态过滤，不影响墓碑路径，但会消耗更多存储和写入延迟。
+
 ---
 
 ## 五、清理任务调度
