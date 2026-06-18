@@ -1195,3 +1195,273 @@ entry.Enclosures.ProxifyEnclosureURL(config.Opts.MediaProxyMode(), config.Opts.M
 3. **纯数据转换类错误不抛出**（媒体重写、ID 格式转换等），走降级或跳过策略
 4. **鉴权错误全部收敛为统一响应**，防止信息泄露
 5. **Fever 与 GReader 在存储层错误处理上完全一致**，都通过 `response.JSONServerError` 输出 500
+
+---
+
+## 9. Fever HTTP 200 响应的缓存风险与运维影响
+
+### 9.1 代码层面的响应头核对
+
+#### 9.1.1 Fever 响应无任何 Cache-Control
+
+对比 Fever 和 GReader 的所有响应函数经过的 Builder 链路：
+
+| 响应函数 | 调用链 | Cache-Control |
+|----------|--------|---------------|
+| Fever `response.JSON(w, r, newAuthFailureResponse())` | `JSON()` → `NewBuilder().WithHeader("Content-Type", ...).Write()` | **无** |
+| Fever `response.JSON(w, r, result)`（成功响应） | 同上 | **无** |
+| GReader `response.JSON(w, r, ...)` | 同上 | **无** |
+| GReader `sendUnauthorizedResponse()` | `NewBuilder().WithStatus(401).WithHeader("X-Reader-Google-Bad-Token", ...)` | **无** |
+| UI `response.HTML(w, r, ...)`（管理后台） | `NewBuilder().WithHeader("Cache-Control", "no-cache, max-age=0, must-revalidate, no-store")` | `no-cache, max-age=0, must-revalidate, no-store` |
+| 静态资源 `WithCaching()` | `ETag` + `Cache-Control: public, max-age=N, immutable` | `public, max-age=N, immutable` |
+
+**代码证据**：
+
+- `internal/http/response/json.go:17-28` — `JSON()` 只设置 `Content-Type`，不设置任何缓存头：
+  ```go
+  func JSON(w http.ResponseWriter, r *http.Request, body any) {
+      responseBody, err := json.Marshal(body)
+      ...
+      NewBuilder(w, r).
+          WithHeader("Content-Type", jsonContentTypeHeader).
+          WithBodyAsBytes(responseBody).
+          Write()
+  }
+  ```
+- `internal/http/response/builder.go:34-36` — `NewBuilder()` 初始化的 headers 是空 map，不自带任何头：
+  ```go
+  func NewBuilder(w http.ResponseWriter, r *http.Request) *Builder {
+      return &Builder{w: w, r: r, statusCode: http.StatusOK,
+          headers: make(http.Header), enableCompression: true}
+  }
+  ```
+- `internal/http/response/builder.go:126-134` — `writeHeaders()` 仅追加安全头，没有缓存控制：
+  ```go
+  func (b *Builder) writeHeaders() {
+      b.headers.Set("X-Content-Type-Options", "nosniff")
+      b.headers.Set("X-Frame-Options", "DENY")
+      b.headers.Set("Referrer-Policy", "no-referrer")
+      ...
+  }
+  ```
+- `internal/http/server/middleware.go:16-47` — 全局中间件只在 HTTPS 时加 `Strict-Transport-Security`，没有任何缓存相关 Header。
+
+**最终结论**：Fever 和 GReader 的所有 JSON 响应（包括鉴权失败的 HTTP 200）**不设置任何 `Cache-Control`、`Expires`、`Pragma`、`ETag`、`Last-Modified` 头**，也**不设置 `Set-Cookie`**（`Set-Cookie` 仅出现在 UI Web 登录 `internal/ui/auth.go:44`）。
+
+#### 9.1.2 仓库内无管理员清缓存接口
+
+搜索整个 `internal/` 目录（见 grep 结果 100 行）：
+
+- 只有 `/history/flush`（`internal/ui/ui.go:51`）用于清空用户的阅读历史，不是清缓存接口
+- `FlushAllSessions()`（`internal/storage/web_session.go:249-250`）清空 Web 会话，无 HTTP 路由
+- `certificateCache`（`internal/storage/certificate_cache.go`）是 ACME 证书缓存，与 API 响应无关
+- `tzCache`（`internal/timezone/timezone.go:14`）是 Go 内存级时区缓存
+- `compiledRegexesCache`（`internal/reader/filter/filter.go:49`）是 Go 内存级正则缓存
+
+**结论**：仓库内**没有任何管理员清缓存的 HTTP API**，也没有 PURGE / BAN 相关的处理函数。如果 CDN 缓存了错误响应，只能通过 CDN 控制台手动清除或等待 TTL 过期。
+
+---
+
+### 9.2 主流 CDN / 反向代理默认配置的缓存行为
+
+根据 RFC 7234 与各产品官方文档，没有显式缓存指令时，HTTP 200 响应是否被缓存取决于产品实现。以下是 Fever 鉴权失败响应 `HTTP 200 + {"api_version":3,"auth":0}` 在常见部署场景下的风险评估。
+
+#### 9.2.1 Cloudflare 默认配置
+
+| 条件 | 行为 | 依据 |
+|------|------|------|
+| Content-Type: application/json | **可能被缓存** | Cloudflare 默认缓存文件类型列表包含 JSON（属于 `text/json`/`application/json` 类别） |
+| 无 Cache-Control 头 | **使用默认 TTL** | Cloudflare 默认 TTL：Business/Enterprise 4 小时，Pro 2 小时，Free 计划 4 小时 |
+| 无 Set-Cookie 头 | **不阻止缓存** | Cloudflare 仅在有 Set-Cookie 时默认不缓存（Bypass Cache） |
+| Request URL: `/fever/` | **命中缓存** | 路径层面默认没有例外，除非配置了「Cache Rules」排除 `/fever/` 和 `/reader/` |
+
+**缓存有效期**：2~4 小时（按计划等级）
+
+**风险等级**：🔴 **高**
+
+一个未授权的首次请求（如攻击者探测）如果先于合法用户请求到达，Cloudflare 会将 `auth:0` 响应缓存 2~4 小时，期间所有正常用户都会被拒绝访问。
+
+#### 9.2.2 nginx 默认配置（`proxy_cache`）
+
+| 条件 | 行为 | 依据 |
+|------|------|------|
+| `proxy_cache` 启用 + 无显式缓存头 | **不缓存** | nginx `proxy_cache` 默认只在响应含 `Cache-Control: public`、`Expires` 或 `X-Accel-Expires` 时才缓存。无这些头时不缓存。 |
+| Content-Type: application/json | 不影响 | nginx 不按 Content-Type 决定是否缓存，只看缓存头 |
+
+**缓存有效期**：不缓存（仅当管理员显式配置 `proxy_cache_valid 200 10m;` 这类指令时才缓存）
+
+**风险等级**：🟢 **低**（默认安全）
+
+**但是**：如果管理员配置了 `proxy_cache_valid any 10m;` 或 `proxy_cache_valid 200 1h;`，则会缓存所有 200 响应，包括 `auth:0`，风险上升到 🔴 高。
+
+#### 9.2.3 Varnish 默认配置（`builtin.vcl`）
+
+| 条件 | 行为 | 依据 |
+|------|------|------|
+| 无 Cache-Control 头 | **不缓存** | `vcl_fetch` builtin 规则：`set beresp.ttl = 120s;` 仅用于静态资源；但后续 `return(deliver)` 默认不进入 `cacheable` 判断 |
+| 无 Set-Cookie 头 | 不阻止缓存 | 但无 `Cache-Control: public` 时不会执行缓存动作 |
+| POST 请求 | **永不缓存** | Varnish 默认不缓存 POST 请求 |
+
+**缓存有效期**：GET 请求无缓存头时不缓存（若管理员显式配置 `set beresp.ttl = 1h;` 则缓存 1 小时）。Fever 写操作都是 POST，天然不被缓存。
+
+**风险等级**：🟢 **低**（默认安全）
+
+#### 9.2.4 总结对比表
+
+| 代理/CDN | 默认是否缓存 Fever `auth:0` 200 响应 | 默认 TTL | 触发缓存的条件 |
+|----------|-------------------------------------|----------|---------------|
+| Cloudflare Free/Pro/Enterprise | ✅ **是** | 2~4 小时 | 默认即启用，无需额外配置 |
+| nginx proxy_cache | ❌ 否 | N/A | 需显式 `proxy_cache_valid` |
+| Varnish builtin.vcl | ❌ 否 | N/A | 需显式 `set beresp.ttl` |
+| Squid 默认 | ❌ 否 | N/A | 需显式配置 refresh_pattern |
+| Fastly 默认 | ✅ 是 | 3600 秒 | 默认 TTL 对无缓存头的 200 |
+| Akamai 默认 | ✅ 是 | 600 秒 | 无缓存头时按 MIME 类型默认缓存 |
+
+**高危部署组合**：
+- Miniflux + Cloudflare 无自定义 Cache Rules → 所有 Fever 用户 2~4 小时内无法登录
+- Miniflux + Cloudflare + `/fever/` 路径命中 Page Rules 缓存 → 风险更高（自定义 TTL 可能更长）
+
+---
+
+### 9.3 第三方客户端如何区分真假未授权
+
+由于 Fever 鉴权失败返回 HTTP 200，客户端和代理层无法通过状态码区分。以下从代码和协议层分析客户端可用的区分手段。
+
+#### 9.3.1 Fever 客户端的判断逻辑（代码层面）
+
+根据 `internal/fever/README.md:33-40` 和 `internal/fever/response.go:14-21`，Fever 协议要求客户端解析 JSON body：
+
+**鉴权失败响应体**：
+```json
+{"api_version": 3, "auth": 0}
+```
+
+**鉴权成功响应体**：
+```json
+{"api_version": 3, "auth": 1, "last_refreshed_on_time": 1710000000, ...}
+```
+
+客户端判断伪代码：
+```go
+resp, _ := http.Get("https://example.com/fever/?api_key=xxx")
+var result feverResponse
+json.NewDecoder(resp.Body).Decode(&result)
+if result.Auth == 0 {
+    // 视为未授权
+    return ErrAuthFailed
+}
+```
+
+**CDN 缓存了 `auth:0` 后的表现**：
+- 合法用户请求时，CDN 返回缓存的 `{"api_version":3,"auth":0}`
+- 客户端解析 `auth==0` → 提示「用户名或密码错误」
+- 用户反复检查密码无果 → 运维噩梦
+
+**客户端能用来排除缓存的辅助信号**：
+
+| 信号 | 真未授权 | CDN 缓存的假未授权 | 可靠性 |
+|------|---------|-------------------|--------|
+| HTTP 状态码 200 | ✅ 是 | ✅ 是 | 无法区分 |
+| `auth` 字段 == 0 | ✅ 是 | ✅ 是 | 无法区分 |
+| `api_version` 字段存在 | ✅ 是 | ✅ 是 | 无法区分 |
+| `last_refreshed_on_time` 字段 | ❌ 不存在（auth:0 响应不含此字段） | ❌ 不存在 | 无法区分 |
+| HTTP 响应头 `Age` | 通常不存在 | Cloudflare 会加 `Age:` Header | **部分可用** |
+| HTTP 响应头 `CF-Cache-Status` | 不存在 | `HIT` | **Cloudflare 可用** |
+| HTTP 响应头 `X-Cache` | 不存在 | `HIT` | **Varnish/nginx 可用** |
+| Body 中有 `error_message` 字段 | ❌ 不存在（仅 500 时才出现） | ❌ 不存在 | 无法区分 |
+
+**客户端无法从响应内容层面区分**真假未授权。只能通过 CDN 特有的 Header（`CF-Cache-Status: HIT`、`X-Cache: HIT`、`Age: >0`）间接怀疑是缓存问题，但这些头不是 Fever 协议的一部分，多数通用 Fever 客户端不检查。
+
+#### 9.3.2 GReader 客户端的天然优势
+
+GReader 鉴权失败返回 HTTP 401，代理层天然不缓存（除非管理员强行配置缓存 401，这非常罕见）。此外：
+
+- HTTP 401 不是 RFC 7231 定义的「可缓存」状态码（200/203/204/206/300/301/404/405/410/414/501 才是默认可缓存的）
+- `X-Reader-Google-Bad-Token: true` Header 让客户端可以进一步区分是 Token 过期还是完全未授权
+
+**对比总结**：
+
+| 维度 | Fever 200 + auth:0 | GReader 401 + Unauthorized |
+|------|-------------------|---------------------------|
+| RFC 默认可缓存 | ✅ 是（200 默认可缓存） | ❌ 否（401 默认不缓存） |
+| CDN 默认行为 | Cloudflare 等会缓存 2~4 小时 | 不缓存 |
+| 客户端区分难度 | 高（需依赖非标准 CDN Header） | 低（HTTP 状态码即可） |
+| 对客户端的影响 | 误报「密码错误」 | 正常报错或尝试刷新 Token |
+| 受影响的操作 | 所有 Fever 操作（读写都是 200） | 不受影响 |
+
+---
+
+### 9.4 运维缓解建议（基于代码现状）
+
+仓库代码层面不提供缓存防护，运维需要在外层代理层加固：
+
+#### 9.4.1 必须：对 API 路径设置 Cache-Control
+
+在反向代理（nginx / Caddy / Cloudflare Rules）层为以下路径追加响应头：
+
+```
+/fever/*        → Cache-Control: no-store, private, no-cache, must-revalidate
+/reader/*       → Cache-Control: no-store, private, no-cache, must-revalidate
+/accounts/*     → Cache-Control: no-store, private, no-cache, must-revalidate
+```
+
+nginx 示例配置：
+```nginx
+location /fever/ {
+    add_header Cache-Control "no-store, private, no-cache, must-revalidate" always;
+    proxy_pass http://miniflux;
+}
+location /reader/ {
+    add_header Cache-Control "no-store, private, no-cache, must-revalidate" always;
+    proxy_pass http://miniflux;
+}
+```
+
+Cloudflare 配置路径：
+- 规则 → Cache Rules → 新建规则
+- 匹配：`URI Path starts with /fever/ OR URI Path starts with /reader/`
+- 动作：设置缓存级别 → Bypass
+
+#### 9.4.2 备选：仅对 POST 放行 Cache（效果有限）
+
+由于 Fever 写操作使用 POST，读操作使用 GET。仅对 `/fever/` 的 GET 请求禁用缓存：
+
+```nginx
+location /fever/ {
+    if ($request_method = GET) {
+        add_header Cache-Control "no-store, private, no-cache, must-revalidate" always;
+    }
+    proxy_pass http://miniflux;
+}
+```
+
+但这仍无法防止攻击者先用 GET 请求缓存 `auth:0`，所以建议全路径禁用。
+
+#### 9.4.3 监控：区分「真未授权」与「缓存污染」
+
+如果已经发生了疑似缓存污染，排查方法：
+
+```bash
+# 检查 Cloudflare 返回头，看是否 HIT
+curl -I 'https://your-miniflux.com/fever/?api_key=WRONG_TOKEN' | grep -iE '(cf-cache-status|age|x-cache)'
+
+# 如果返回 CF-Cache-Status: HIT 且 Age > 0，说明已经缓存了未授权响应
+# 解决：Cloudflare Dashboard → Caching → Configuration → Purge Cache → Purge Everything
+```
+
+#### 9.4.4 代码修复方向（仓库尚未实现）
+
+要从根本上解决，需要在 `response.JSON()` 或 Fever/GReader Handler 中主动追加缓存控制头。参考 UI 层 `response.HTML()` 的做法：
+
+```go
+// 建议修改方向：在 JSON() 中增加缓存头（仅针对 API 路径）
+func JSON(w http.ResponseWriter, r *http.Request, body any) {
+    ...
+    builder := NewBuilder(w, r).
+        WithHeader("Content-Type", jsonContentTypeHeader).
+        WithHeader("Cache-Control", "no-store, private, no-cache, must-revalidate")
+    ...
+}
+```
+
+但当前代码**未做此修改**，运维不能依赖应用层处理。
