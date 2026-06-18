@@ -1465,3 +1465,204 @@ func JSON(w http.ResponseWriter, r *http.Request, body any) {
 ```
 
 但当前代码**未做此修改**，运维不能依赖应用层处理。
+
+---
+
+## 10. response.JSON 统一加 Cache-Control 头的影响面评估
+
+### 10.1 Fever 全量响应类型清单
+
+对 `internal/fever/` 目录下所有 `response.` 调用的完整核对（见 grep 30 行结果）：
+
+| 调用函数 | 次数 | 使用场景 | 走 `response.JSON` |
+|----------|------|---------|-------------------|
+| `response.JSON` + `newBaseResponse()` | 1 | 无参数默认响应 | ✅ 是 |
+| `response.JSON` + `groupsResponse` | 1 | `?groups` 分类列表 | ✅ 是 |
+| `response.JSON` + `feedsResponse` | 1 | `?feeds` 订阅源列表 + favicons | ✅ 是 |
+| `response.JSON` + `faviconsResponse` | 1 | `?favicons` 图标列表（base64 data URI） | ✅ 是 |
+| `response.JSON` + `itemsResponse` | 1 | `?items` 文章列表 | ✅ 是 |
+| `response.JSON` + `unreadResponse` | 1 | `?unread_item_ids` 未读 ID 列表 | ✅ 是 |
+| `response.JSON` + `savedResponse` | 1 | `?saved_item_ids` 已收藏 ID 列表 | ✅ 是 |
+| `response.JSON` + `newBaseResponse()` | 5 | 写操作成功返回（mark 三种 + toggle 两次路径） | ✅ 是 |
+| `response.JSON` + `newAuthFailureResponse()` | 3 | 鉴权中间件三种失败路径 | ✅ 是 |
+| `response.JSONServerError` | 17 | 各类存储层错误 | ✅ 是（共用 Builder） |
+
+**结论**：Fever 的**全部 30 处响应输出**都直接或间接经过 `response.JSON()` 家族函数（`JSON`/`JSONServerError` 等），没有任何例外。Fever 响应中提到的 `favicons` 数据是 base64 编码内嵌在 JSON body 里（`faviconsResponse.Favicons[].Data`），不是独立的二进制 HTTP 端点。
+
+### 10.2 GReader 响应类型清单（含 nonstandard 文本响应）
+
+对 `internal/googlereader/` 目录下所有响应输出的完整核对（见 grep 95 行结果）：
+
+#### 10.2.1 走 `response.JSON` 家族的响应（JSON 格式）
+
+| 调用函数 | 次数 | 典型使用场景 |
+|----------|------|------------|
+| `response.JSON` | 11 | `subscription/list`、`tag/list`、`stream/items/ids`（4 种 Stream）、`stream/items/contents`、`subscription/quickadd`（成功+失败两种）、`tokenHandler`(JSON 格式)、`user-info`、fallback 返回 `[]` |
+| `response.JSONBadRequest` | 21 | `output` 格式错误、`i` 为空、Stream ID 非法、标签冲突、`ac` 不识别、`edit-tag` 中 item ID 解析失败等 |
+| `response.JSONServerError` | 41 | 各类存储层错误、`ParseForm` 失败、Stream 解析错误（此处应是 400 但返回 500，见 7.2.5） |
+| `response.JSONUnauthorized` | 4 | `ClientLogin` 中表单解析失败、用户空、密码校验失败、token 鉴权失败 |
+| `response.JSONNotFound` | 2 | `rename-tag` / `mark-all-as-read` 中找不到 Category/Feed |
+
+JSON 家族合计：**79 处**。
+
+#### 10.2.2 **不走** `response.JSON` 的响应（非 JSON 格式 / 非标准路径）
+
+| 调用方式 | 次数 | 使用场景 | 代码位置 | 有缓存头？ |
+|----------|------|---------|---------|-----------|
+| `response.Text(w, r, "OK")` | 6 | `edit-tag`、`subscription/edit`、`mark-all-as-read`、`disable-tag`、`rename-tag` 成功返回 | `handler.go:319/601/774/841/1231` | ❌ 无 |
+| `response.Text(w, r, loginResponse.String())` | 1 | `ClientLogin` 非 JSON 模式 | `handler.go:146` | ❌ 无 |
+| `response.Text(w, r, token)` | 1 | `tokenHandler` 默认路径（非 `output=json`） | `handler.go:184` | ❌ 无 |
+| `sendUnauthorizedResponse()` 直接 NewBuilder | N/A | `/reader/api/0/*` 鉴权失败 401 | `response.go:122-129` | ❌ 无 |
+
+**关键代码核对**：
+
+`response.Text()` 实现（`text.go:8-13`）：
+```go
+func Text(w http.ResponseWriter, r *http.Request, body string) {
+    NewBuilder(w, r).
+        WithHeader("Content-Type", `text/plain; charset=utf-8`).
+        WithBodyAsString(body).
+        Write()
+}
+```
+和 `response.JSON()` 一样，`Text()` 也只设置 `Content-Type`，**没有任何缓存头**。
+
+`sendUnauthorizedResponse()` 实现（`response.go:122-129`）：
+```go
+func sendUnauthorizedResponse(w http.ResponseWriter, r *http.Request) {
+    response.NewBuilder(w, r).
+        WithStatus(http.StatusUnauthorized).
+        WithHeader("X-Reader-Google-Bad-Token", "true").
+        WithHeader("Content-Type", "text/plain; charset=utf-8").
+        WithBodyAsString("Unauthorized").
+        Write()
+}
+```
+同样**没有缓存头**。
+
+**结论**：如果只在 `response.JSON()` 中加 `Cache-Control`，则 **8 处响应（6 个 "OK" 文本 + ClientLogin 纯文本 + token 纯文本）和 `sendUnauthorizedResponse()` 仍然没有缓存头保护**。需要同时修改 `response.Text()` 并在 `sendUnauthorizedResponse()` 中追加缓存头。
+
+### 10.3 图标、静态资源响应与 Fever/GReader API 的路径隔离
+
+#### 10.3.1 图标的响应路径（完全不经过 response.JSON）
+
+**Fever favicon**：不是独立 HTTP 端点，而是内嵌在 `?favicons` JSON 响应中的 base64 data URI：
+```go
+// fever/response.go:115-118
+type favicon struct {
+    ID   int64  `json:"id"`
+    Data string `json:"data"`  // 形如 "image/png;base64,iVBORw0KGgoAAAA..."
+}
+```
+**走 `response.JSON`**，加 `no-store` 会影响这条响应，但内嵌的 data URI 本身无法被 CDN 单独缓存，只有整体 JSON 会。由于 favicon 数据不常变但也会偶尔变化（用户添加新源时），`no-store` 对客户端体验影响极小。
+
+**GReader subscription 图标**：通过 URL 指向独立端点，不走 `response.JSON`。
+
+GReader `subscriptionResponse.IconURL` 生成（`handler.go:518-523`）：
+```go
+func (h *greaderHandler) feedIconURL(f *model.Feed) string {
+    if f.Icon != nil && f.Icon.ExternalIconID != "" {
+        return config.Opts.BaseURL() + "/feed-icon/" + f.Icon.ExternalIconID
+    }
+    return ""
+}
+```
+
+实际图标端点（`ui/feed_icon.go:14-36`）**使用 `WithCaching()`，不受 `response.JSON` 修改影响**：
+```go
+response.NewBuilder(w, r).WithCaching(icon.Hash, 72*time.Hour, func(b *response.Builder) {
+    b.WithHeader("Content-Type", icon.MimeType)
+    b.WithBodyAsBytes(icon.Content)
+    ...
+})
+```
+
+`WithCaching()` 设置的头（`builder.go:87-92`）：
+```go
+b.headers.Set("ETag", etag)
+b.headers.Set("Cache-Control", fmt.Sprintf("public, max-age=%d, immutable", int64(duration.Seconds())))
+b.headers.Set("Expires", ...)
+```
+
+#### 10.3.2 所有使用 `WithCaching()` 的静态资源汇总
+
+| 端点 | 缓存策略 | 路径 | 是否走 response.JSON |
+|------|---------|------|---------------------|
+| `/favicon.ico` | ETag + public 48h immutable | `ui/static_favicon.go:22` | ❌ 否 |
+| `/feed-icon/{id}` | ETag + public 72h immutable | `ui/feed_icon.go:27` | ❌ 否 |
+| `/static/stylesheets/*.css` | ETag + public 48h immutable | `ui/static_stylesheet.go:22` | ❌ 否 |
+| `/static/javascripts/*.js` | ETag + public 48h immutable | `ui/static_javascript.go:28` | ❌ 否 |
+| `/static/app-icons/*` | ETag + public 72h immutable | `ui/static_app_icon.go:25` | ❌ 否 |
+| `/share/{code}` | ETag + public 72h immutable | `ui/share.go:45` | ❌ 否 |
+| `/proxy/{encryptedURL}` | ETag + public 72h immutable | `ui/proxy.go:145` | ❌ 否 |
+
+**关键结论**：所有二进制资源、静态资源、媒体代理都使用 `Builder.WithCaching()` 方法显式设置缓存头，**完全不经过 `response.JSON()` 的代码路径**。在 `response.JSON()` 中加 `no-store` 不会对这些合法缓存的资源产生任何负面影响。
+
+### 10.4 统一加 Cache-Control 头对各响应类型的影响评估
+
+#### 10.4.1 影响矩阵
+
+| 响应类型 | 代表端点 | 修改 `response.JSON` 加 no-store | 额外修改 `Text()` + `sendUnauthorized()` | 对合法缓存的影响 |
+|---------|---------|--------------------------------|----------------------------------------|---------------|
+| Fever 鉴权失败 200 | `auth:0` 响应 | ✅ 被覆盖（核心目标） | N/A | ✅ 正面：杜绝 CDN 缓存污染 |
+| Fever 业务 JSON | `?items`、`?feeds` 等 | ✅ 被覆盖 | N/A | 🟡 中性：客户端每次请求都会拉取，但文章状态实时变化本来就不应该缓存 |
+| GReader JSON 成功 | `subscription/list`、`stream/items/ids`、`stream/items/contents` | ✅ 被覆盖 | N/A | 🟡 中性：订阅/标签/文章状态实时变化，缓存反而导致脏数据 |
+| GReader JSON 错误 | 400/401/404/500 JSON | ✅ 被覆盖 | N/A | ✅ 正面：错误响应不应缓存 |
+| GReader "OK" 文本 | `edit-tag`、`subscription/edit`、`mark-all-as-read` | ❌ 未覆盖 | ✅ 需额外处理 | 🟢 影响极小：body 仅 "OK" 3 字节，不缓存也无性能损失 |
+| GReader ClientLogin 纯文本 | `SID=xxx\nAuth=xxx\n` | ❌ 未覆盖 | ✅ 需额外处理 | ✅ 正面：Token 明文绝对不应被缓存 |
+| GReader token 纯文本 | 编辑 Token | ❌ 未覆盖 | ✅ 需额外处理 | ✅ 正面：Token 不应被缓存 |
+| GReader 401 纯文本 | `/reader/api/0/*` 鉴权失败 | ❌ 未覆盖（走 NewBuilder） | ✅ 需额外处理 | ✅ 正面：401 虽默认可缓存性低，但显式 no-store 更安全 |
+| `/feed-icon/{id}` | 订阅源图标二进制 | ❌ 不经过 JSON | ❌ 不经过 Text | 🟢 完全不受影响，72h 缓存保持不变 |
+| UI 静态资源（CSS/JS/图片） | `/static/*` | ❌ 不经过 JSON | ❌ 不经过 Text | 🟢 完全不受影响 |
+| 媒体代理图片 | `/proxy/*` | ❌ 不经过 JSON | ❌ 不经过 Text | 🟢 完全不受影响，72h 缓存保持不变 |
+| Fever favicons JSON（base64） | `?favicons` 中的内嵌 data URI | ✅ 被覆盖 | N/A | 🟡 影响极小：JSON body 中内嵌，CDN 无法单独提取缓存 |
+| REST API `/v1/*`（如果启用） | Miniflux 自有 JSON API | ✅ 被覆盖（副作用） | N/A | ✅ 正面：同属用户数据，不应被公共 CDN 缓存 |
+
+#### 10.4.2 对「合法缓存」的客户端表现分析
+
+用户担忧的「订阅列表静态部分被缓存导致客户端刷新变慢」在实际场景中**不成立**：
+
+1. **GReader subscription/list 返回的不是静态数据**：用户随时可能在管理后台增删订阅、移动分类，客户端本地缓存列表会与服务器不一致。客户端实现中通常用 `Continuation` 机制增量同步，而不是依赖 HTTP 层缓存。
+
+2. **Fever feeds + feedsGroups 也会动态变化**：用户添加/删除 Feed、修改分类归属都会影响返回结构。Fever 协议中没有增量同步机制（`unread_item_ids`/`saved_item_ids` 仅针对文章），客户端每次都要全量拉取，no-store 不增加额外负担。
+
+3. **实际性能损失可以忽略**：
+   - 订阅列表 JSON 通常 < 50KB
+   - 文章列表每次最多 50 条，通常 < 200KB（Fever 固定限制 50 条）
+   - 这些 API 的典型调用频率是客户端后台 15~60 分钟一次，不是高频请求
+   - 与从 CDN 缓存命中节省的几百毫秒相比，返回脏数据导致的客户端逻辑错误成本高得多
+
+4. **唯一可能有性能收益的缓存已独立保护**：
+   - 订阅源图标（/feed-icon/）：72h immutable 缓存，完全独立
+   - 内嵌媒体图片（/proxy/）：72h immutable 缓存，完全独立
+   - 这些才是体积最大（单图几十 KB 到 MB 级）、请求最多（每篇文章多图）的部分，已经有缓存保护
+
+#### 10.4.3 修复方案的代码粒度建议
+
+从代码改动影响面和效果综合评估，**最优的修复粒度不是直接修改 `response.JSON`，而是在路由级别包裹**：
+
+| 方案 | 改动位置 | 覆盖范围 | 副作用 |
+|------|---------|---------|--------|
+| A. 改 `response.JSON()` | `json.go:18-28` | Fever + GReader + REST API 所有 JSON 响应 | 漏了 GReader 的 8 处 Text 响应和 sendUnauthorizedResponse()；可能影响未来新增的 JSON 静态资源端点（如果有的话） |
+| B. 改路由层 Fever/GReader middleware | `fever/middleware.go`、`googlereader/middleware.go`，在 `next.ServeHTTP` 之后写头 | Fever 所有端点 + GReader `/reader/api/0/*` 所有端点 + `/accounts/ClientLogin` | 最优：**精确覆盖目标路径**；不影响静态资源；不影响 REST API；不遗漏 Text 响应；不遗漏 sendUnauthorizedResponse |
+| C. 加全局中间件 | `server/middleware.go` | 所有 JSON/Text 响应 | 过宽：会影响 `/healthcheck`、`/metrics` 等运维端点的缓存能力 |
+
+**推荐方案 B 的伪代码**（Fever middleware 示例）：
+```go
+func Middleware(store *storage.Storage) func(http.Handler) http.Handler {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // ... 现有鉴权逻辑 ...
+            // 鉴权通过后，先写缓存头，再转发
+            w.Header().Set("Cache-Control", "no-store, private, no-cache, must-revalidate")
+            next.ServeHTTP(w, r.WithContext(ctx))
+        })
+    }
+}
+```
+
+GReader 需额外为 `POST /accounts/ClientLogin` 包裹相同逻辑（当前是 `HandleFunc`，没有中间件包裹）。这样修改可以保证：
+- Fever 的所有 30 处响应（含 JSONServerError）全被覆盖
+- GReader 的 79 处 JSON + 8 处 Text + `sendUnauthorizedResponse()` 全被覆盖
+- `/feed-icon/`、`/static/`、`/proxy/`、`/favicon.ico` 完全不受影响，72h 缓存策略保持不变
+- 不会误伤 REST API 之外的 JSON 端点（如 `metrics`）
