@@ -498,6 +498,55 @@ miniflux --config-file /etc/miniflux.conf --run-cleanup-tasks
 ```
 这条命令每次都会重新读文件和环境变量，所以能拿到最新值。
 
+### 5.1.2 信号处理与配置热重载：为什么 SIGHUP 无效？
+
+**结论：Miniflux 守护进程未实现任何信号驱动的配置热重载。SIGHUP/SIGUSR1/SIGUSR2 均未绑定回调。**
+
+#### 唯一注册的信号：仅用于优雅停机
+
+位置：`internal/cli/daemon.go:26-78`
+
+```go
+stop := make(chan os.Signal, 1)
+signal.Notify(stop, os.Interrupt)   // Ctrl+C
+signal.Notify(stop, syscall.SIGTERM) // systemd stop / container kill
+// ← 无 SIGHUP、SIGUSR1、SIGUSR2
+
+// ...启动 worker pool、HTTP 服务、metrics 收集器...
+
+<-stop   // 阻塞在此，直到收到上述任一信号
+slog.Debug("Shutting down the process")
+// 关 metrics、关 HTTP 服务、关 worker pool 后退出
+```
+
+收到 SIGTERM 后走标准优雅关闭流程：关闭 HTTP 连接 → Shutdown worker pool → 退出。
+
+#### 不存在的信号通路
+
+| 常见做法 | Miniflux 是否实现 | 说明 |
+|----------|-----------------|------|
+| `SIGHUP` → reload 配置 | ❌ 无 | 信号未注册，按 Unix 默认行为**直接终止进程** |
+| `SIGUSR1` → reload 配置 | ❌ 无 | 同上，收到即死 |
+| `SIGUSR2` → 递增日志级别 | ❌ 无 | 未使用 |
+| 文件监听 inotify | ❌ 无 | `config/parser.go` 是纯一次性解析，无监听器 |
+
+> **部署陷阱**：如果你在 systemd unit 或 SysVinit 脚本（见 `contrib/sysvinit/etc/init.d/miniflux:105` 的 `restart|force-reload`）里配置了 `ExecReload` 发 SIGHUP，实际效果等同于 `kill`。请务必将 reload 改成 `systemctl restart`，而不是 `kill -HUP`。
+
+#### 调整配置的标准方式
+
+1. **编辑配置文件** `/etc/miniflux.conf` 或更新环境变量
+2. **重启守护进程**：`systemctl restart miniflux`
+3. **验证新值**（可选）：执行 `miniflux --config-dump` 看解析后的配置快照
+
+如果不想中断服务，退而求其次是用 CLI 手动跑：
+```bash
+# 每次都是独立进程，会重新读配置
+miniflux --config-file /etc/miniflux.conf --run-cleanup-tasks
+```
+但这**只影响单次手动执行**，守护进程的调度器频率和默认阈值仍需重启。
+
+---
+
 ### 5.2 清理任务完整流程
 
 位置：`internal/cli/cleanup_tasks.go:16-58`
@@ -558,6 +607,85 @@ DELETE FROM icons WHERE NOT EXISTS (
 **产生孤立图标的场景**：
 - Feed 被删除：外键级联删 `feed_icons` 映射表，但 `icons` 主表是按 hash 去重的共享表，不级联
 - Feed 图标被替换：`StoreFeedIcon` 先插新映射再断旧关联，旧图标行悬空
+
+---
+
+### 5.3 并发冲突分析：手动 cleanup 与守护态调度同时执行
+
+**结论：不会产生数据错乱或死锁。PostgreSQL 的默认隔离级别 + 语句级原子性 + SKIP LOCKED 构成了完整的并发安全屏障。**
+
+#### 5.3.1 事务隔离级别
+
+Miniflux 使用 Go 标准库 `database/sql` 配 PostgreSQL 驱动 `github.com/lib/pq`。所有 SQL 通过两条路径执行：
+
+| 执行方式 | 代码模式 | 事务上下文 |
+|----------|---------|-----------|
+| 单语句（清理任务用） | `s.db.Exec(query, args...)` | 无显式事务 → PostgreSQL **隐式单语句事务** |
+| 多语句（Feed 刷新用）| `tx, _ := s.db.Begin()` ... `tx.Commit()` | 显式事务，默认隔离级别 |
+
+两者都没有通过 `BeginTx()` 设置隔离级别，因此使用 PostgreSQL 服务端的 **默认值 `READ COMMITTED`**。
+
+连接池配置位置：`internal/database/postgresql.go:14-24`
+```go
+db.SetMaxOpenConns(maxConnections)       // 默认 20
+db.SetMaxIdleConns(minConnections)       // 默认 1
+db.SetConnMaxLifetime(connectionLifetime) // 默认 5 分钟
+```
+连接回收通过 `ConnMaxLifetime = 5 分钟` 定时轮转，`sql.DB` 层没有任何隔离级别相关的 `SET` 语句。
+
+**READ COMMITTED 特性（与本文档相关的点）**：
+- 语句内的快照在语句开始时建立
+- 并发提交的 DELETE 对新语句可见
+- 不会出现脏读；不做重复读，所以不存在不可重复读问题
+
+#### 5.3.2 ArchiveEntries 的三层并发防护
+
+`internal/storage/entry.go:368-388` 的单条 SQL 本身就是并发安全的核心：
+
+```sql
+WITH to_delete AS (
+    SELECT id, feed_id, hash
+    FROM entries
+    WHERE status=$1 AND starred=false AND share_code='' 
+      AND created_at < now() - $2::interval
+    ORDER BY created_at ASC
+    FOR UPDATE SKIP LOCKED   -- ★ 第 1 层：行锁避让
+    LIMIT $3
+),
+deleted AS (
+    DELETE FROM entries
+    USING to_delete
+    WHERE entries.id = to_delete.id   -- ★ 第 2 层：仅删除已锁行
+    RETURNING entries.feed_id, entries.hash
+)
+INSERT INTO entry_tombstones (feed_id, hash)
+SELECT ... FROM deleted
+ON CONFLICT (feed_id, hash) DO NOTHING  -- ★ 第 3 层：主键去重
+```
+
+**第 1 层 — SKIP LOCKED**：如果守护进程已经锁定了一批待删行，手动进程会跳过那些行，选择下一批未锁的。两个进程拿到的候选集**完全不重叠**。结果是两个并行的 cleanup 会"瓜分"旧条目，各删各的，没有竞争也没有死锁。
+
+**第 2 层 — 基于主键的 DELETE**：`USING to_delete` 相当于 `JOIN to_delete USING (id)`，只删除 CTE 中已选出的行，不会误删其他行。
+
+**第 3 层 — ON CONFLICT DO NOTHING**：极端兜底场景。当用户同时点击 "清除历史"（FlushHistory）和调度器跑 ArchiveEntries 时，两者都会写墓碑；由于 SKIP LOCKED 只存在于 ArchiveEntries 中，理论上可能出现同一条 entry 两个路径各自尝试插墓碑。此时主键冲突被静默忽略，不报错。
+
+#### 5.3.3 另外三个子任务的并发情况
+
+| 子任务 | 并发执行的行为 | 是否安全 |
+|--------|---------------|---------|
+| `CleanOldWebSessions` | 两个并发 DELETE 条件相同。READ COMMITTED 下后开始的语句能看到先提交的删除，剩下的行重新判断条件；最终重复删除 0 行。| ✅ 幂等，无副作用 |
+| `CleanupOrphanIcons` | 同上。由于使用 `NOT EXISTS` 子查询，删除范围会因并发而逐步收敛。| ✅ 幂等 |
+| `runCleanupTasks` 整体 | 4 个子任务顺序串行；守护态调度也是顺序执行。不存在"归档和清理会话"交叉执行。 | ✅ 两个进程的执行整体也是交织而非冲突 |
+
+#### 5.3.4 潜在的性能影响（非正确性问题）
+
+虽然正确性无问题，但两个 cleanup 并发会造成额外开销：
+
+1. **两倍的 PostgreSQL 短查询压力**：两个进程各自跑 CTE + DELETE + INSERT，CPU/IO 翻倍
+2. **SKIP LOCKED 扫描浪费**：两个进程都扫描 `created_at` 索引找到候选，其中一个要跳过部分已锁行再重选
+3. **共享池连接争抢**：默认 `DATABASE_MAX_CONNS = 20`（`internal/config/options.go:169-175`），两个 cleanup 各持一个连接不影响，但如果同时有 HTTP 高峰可能加剧等待
+
+**建议**：避免主动并发。若守护进程已运行，不要手动 `--run-cleanup-tasks`；如想立即生效，可临时改小 `CLEANUP_FREQUENCY_HOURS` 后重启守护进程，或等待下一次定时触发。
 
 ---
 
@@ -623,9 +751,13 @@ users (1)
 | Feed 创建流程 | `internal/reader/handler/handler.go` | 104-192 |
 | 清理任务入口 | `internal/cli/cleanup_tasks.go` | 16-58 |
 | 清理调度器 | `internal/cli/scheduler.go` | 27-30, 53-57 |
+| 守护进程信号处理 | `internal/cli/daemon.go` | 26-78 |
 | CLI 入口与配置解析 | `internal/cli/cli.go` | 80-96 |
 | 配置全局单例 | `internal/config/config.go` | 8-9 |
 | 配置解析器 | `internal/config/parser.go` | 31-37, 39-51 |
 | 配置默认值与 getter | `internal/config/options.go` | 125-155, 655-667 |
+| 数据库连接池 | `internal/database/postgresql.go` | 13-24 |
 | 数据库初始 schema | `internal/database/migrations.go` | 47-121 |
 | Tombstones 迁移 | `internal/database/migrations.go` | 1470-1498 |
+| 清理旧会话 | `internal/storage/web_session.go` | 229-247 |
+| 清理孤立图标 | `internal/storage/icon.go` | 149-166 |
