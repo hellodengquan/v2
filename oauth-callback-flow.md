@@ -567,3 +567,291 @@ default:
 | `oauth2_callback` 回调 | 已按 `{provider}` 路由参数分发 | 已支持，无需改动 |
 
 > 结论：回调层和绑定层天然支持多 provider（因为 provider 是 URL 参数化的），瓶颈在配置层和模板渲染层人为限制了单 provider。
+
+---
+
+## 10. 第三方账号解绑流程的完整代码挂载点
+
+### 10.1 端到端调用链
+
+```
+用户在 Settings 页点击 "Unlink Google/OIDC Account" 按钮
+        ↓
+POST /oauth2/{provider}/unlink
+  csrf=<hidden token>
+        ↓
+┌── 中间件层（ui.go:184 的链式调用） ──────────────────────────────┐
+│                                                                 │
+│  ① webSessionMiddleware (web_session_middleware.go:27-67)        │
+│     → 从 cookie 加载 WebSession                                 │
+│     → 未认证 + 非公共路由 → 302 到 /login（解绑路由非公共，必须有登录态）│
+│     → session 存入 r.Context                                    │
+│                                                                 │
+│  ② csrfMiddleware (csrf_middleware.go:27-38)                     │
+│     → POST 方法，需要 CSRF 校验                                  │
+│     → 比对 session.CSRF() 与 form.csrf / X-Csrf-Token header    │
+│     → 使用 crypto.ConstantTimeCmp 常量时间比较                   │
+│     → 失败 → 400 Bad Request                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+        ↓ 校验通过，进入 handler
+┌── Handler 层 (oauth2_unlink.go:16-70) ──────────────────────────┐
+│                                                                 │
+│  ③ DisableLocalAuth 门禁 (:17-23)                               │
+│     config.Opts.DisableLocalAuth() == true                      │
+│     → slog.Warn + 302 到 "/"，完全阻断                           │
+│     设计意图：禁用本地认证后，解绑 OAuth 会让用户失去所有登录方式  │
+│                                                                 │
+│  ④ 路由参数解析 (:25-30)                                        │
+│     provider := request.RouteStringParam(r, "provider")         │
+│     → "" → 302 到 "/"                                           │
+│                                                                 │
+│  ⑤ getOAuth2Manager + FindProvider (:32-40)                     │
+│     每次 HTTP 请求都新建 Manager（见 §11 的"每次实例化"问题）      │
+│     FindProvider(provider) 失败 → 302 到 /settings              │
+│                                                                 │
+│  ⑥ 查询当前用户 (:42-46)                                        │
+│     h.store.UserByID(request.UserID(r))                         │
+│     从 session context 中取 userID → 查 DB                       │
+│                                                                 │
+│  ⑦ HasPassword 检查 (:48-60)                                    │
+│     h.store.HasPassword(request.UserID(r))                      │
+│     SQL: SELECT true FROM users WHERE id=$1 AND password <> ''  │
+│     → 无密码 → error.unlink_account_without_password            │
+│     → 302 到 /settings + 错误闪现消息                           │
+│     设计意图：确保用户解绑后仍能用密码登录                        │
+│                                                                 │
+│  ⑧ Provider.UnsetUserProfileID (:62)                            │
+│     Google: user.GoogleID = ""           (google.go:96-98)      │
+│     OIDC:   user.OpenIDConnectID = ""    (oidc.go:129-131)      │
+│     仅修改内存中 User struct 的字段，尚未落盘                    │
+│                                                                 │
+│  ⑨ h.store.UpdateUser(user) (:63-66)                            │
+│     storage/user.go:174 → SQL UPDATE users SET ...               │
+│     google_id=$16, openid_connect_id=$17 ... WHERE id=$31       │
+│     空字符串 "" 写入数据库 → 实际效果等于清空绑定                 │
+│                                                                 │
+│  ⑩ 成功反馈 (:68-69)                                            │
+│     sess.SetSuccessMessage(printer.Print("alert.account_unlinked"))│
+│     302 → /settings（闪现成功消息）                              │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 10.2 各挂载点文件与行号索引
+
+| 步骤 | 代码位置 | 职责 |
+|------|---------|------|
+| 路由注册 | `ui.go:152` | `POST /oauth2/{provider}/unlink` 仅在 `OAUTH2_PROVIDER != ""` 时注册 |
+| 会话中间件 | `web_session_middleware.go:27-67` | 加载 session、认证检查、脏写回存 |
+| CSRF 中间件 | `csrf_middleware.go:27-38` | POST 方法校验 CSRF token（常量时间比较） |
+| DisableLocalAuth 门禁 | `oauth2_unlink.go:17-23` | 阻止在禁用本地认证时解绑 |
+| Provider 查找 | `oauth2_unlink.go:32-40` | 每次请求新建 Manager + FindProvider |
+| 用户查询 | `oauth2_unlink.go:42-46` | 从 session userID 查完整 user 对象 |
+| 密码检查 | `oauth2_unlink.go:48-60` | `HasPassword` SQL 查询 |
+| UnsetUserProfileID | `oidc.go:129-131` / `google.go:96-98` | 内存中清空 provider ID 字段 |
+| UpdateUser | `storage/user.go:174` | SQL UPDATE 全字段（含 google_id / openid_connect_id） |
+| 闪现消息 | `oauth2_unlink.go:68-69` | session 中写入成功消息，下次页面渲染时消费 |
+
+### 10.3 Settings 模板渲染逻辑
+
+`settings.html:11-39` 的条件渲染链：
+
+```gotemplate
+{{ if and (not disableLocalAuth) (hasOAuth2Provider "google") }}
+    {{ if .user.GoogleID }}
+        <!-- 显示 "Unlink Google" 按钮（POST form + csrf token）-->
+    {{ else }}
+        <!-- 显示 "Link Google" 链接（GET /oauth2/google/redirect）-->
+    {{ end }}
+{{ else if and (not disableLocalAuth) (hasOAuth2Provider "oidc") }}
+    {{ if .user.OpenIDConnectID }}
+        <!-- 显示 "Unlink OIDC" 按钮 -->
+    {{ else }}
+        <!-- 显示 "Link OIDC" 链接 -->
+    {{ end }}
+{{ end }}
+```
+
+关键细节：
+
+- **外层 `if/else if`**：同一时间只显示一个 provider 的绑定/解绑区块（与 §9.3 的单 Provider 限制一致）
+- **内层 `if .user.GoogleID` / `if .user.OpenIDConnectID`**：根据数据库中对应字段是否为空决定显示"绑定"还是"解绑"
+- **`not disableLocalAuth`**：本地认证被禁用时，整个 fieldset 不渲染——与 `oauth2_unlink.go:17` 的门禁逻辑双重保障
+- **CSRF token**：解绑表单内嵌 `<input type="hidden" name="csrf" value="{{ .csrf }}">`，由 `csrf_middleware.go` 校验
+
+### 10.4 解绑后数据状态的完整视角
+
+```
+解绑前 (以 OIDC 为例):
+  users 表: openid_connect_id = "sub-12345"  (OIDC subject)
+  User struct: OpenIDConnectID = "sub-12345"
+
+UnsetUserProfileID:
+  User struct: OpenIDConnectID = ""           (内存修改)
+
+UpdateUser:
+  SQL: UPDATE users SET ... openid_connect_id='' ... WHERE id=$31
+  users 表: openid_connect_id = ""            (落盘)
+```
+
+**注意**：解绑只是清空了 `openid_connect_id` / `google_id` 字段，用户的 Miniflux 账号本身不受影响（username、password 等全部保留）。
+下次同一 OIDC 用户登录时，会走"用户不存在 + 自动创建"路径（如果 `OAUTH2_USER_CREATION=1`），创建一个全新的 Miniflux 账号——而非关联到原有账号。
+
+### 10.5 解绑与绑定的安全对称性
+
+| 维度 | 绑定（callback，已登录路径） | 解绑（unlink） |
+|------|--------------------------|---------------|
+| HTTP 方法 | GET（由 OAuth 回调触发） | POST（表单提交） |
+| CSRF 校验 | 无（GET 请求豁免，但 state 参数防 CSRF） | 有（csrfMiddleware 校验 form.csrf） |
+| 登录态要求 | 需要（`request.IsAuthenticated`） | 需要（路由非公共，webSessionMiddleware 拦截） |
+| 冲突检查 | `AnotherUserWithFieldExists` + `UserProfileID` | 无（清空操作无冲突可能） |
+| 退路保障 | 无（绑定不会丢失登录方式） | `HasPassword` / `DisableLocalAuth`（防止失去登录方式） |
+| Provider 实例化 | `getOAuth2Manager` 每次 new | `getOAuth2Manager` 每次 new |
+| 数据操作 | `PopulateUserWithProfileID` + `UpdateUser` | `UnsetUserProfileID` + `UpdateUser` |
+
+---
+
+## 11. OIDC Discovery 动态加载的代码路径
+
+### 11.1 核心机制
+
+Miniflux 使用 `github.com/coreos/go-oidc/v3` 库的 `oidc.NewProvider(ctx, discoveryEndpoint)` 实现 OIDC Discovery。
+该函数向 discovery endpoint 发起 HTTP GET 请求，获取并解析 OpenID Connect Discovery 文档（`.well-known/openid-configuration`），
+从中提取 `authorization_endpoint`、`token_endpoint`、`userinfo_endpoint`、`jwks_uri` 等关键端点，
+构造一个 `oidc.Provider` 对象，后续用于 token 验证和 userinfo 获取。
+
+### 11.2 完整调用链
+
+```
+┌── 每次请求触发 ────────────────────────────────────────────────┐
+│  oauth2_unlink.go:32 / oauth2_redirect.go:23 / oauth2_callback.go:49  │
+│    getOAuth2Manager(r.Context())                               │
+│        ↓                                                       │
+│  auth.go:55-64                                                 │
+│    oauth2.NewManager(                                          │
+│      ctx,                                                      │
+│      config.Opts.OAuth2Provider(),          // "oidc"          │
+│      config.Opts.OAuth2ClientID(),                           │
+│      config.Opts.OAuth2ClientSecret(),                       │
+│      config.Opts.OAuth2RedirectURL(),                        │
+│      config.Opts.OAuth2OIDCDiscoveryEndpoint(),              │
+│    )                                                           │
+│        ↓                                                       │
+│  manager.go:34-56  NewManager()                               │
+│    switch provider {                                           │
+│    case "oidc":                                                │
+│      NewOidcProvider(ctx, clientID, clientSecret,              │
+│                      redirectURL, oidcDiscoveryEndpoint)       │
+│        ↓                                                       │
+│  oidc.go:36-48  NewOidcProvider()                             │
+│    oidc.NewProvider(ctx, discoveryEndpoint)                    │
+│    ↑                                                           │
+│    │  这是 go-oidc/v3 库的核心调用                              │
+│    │  内部执行:                                                 │
+│    │    GET {discoveryEndpoint}                                │
+│    │    → 解析 JSON → 提取各端点 URL                            │
+│    │    → 预取 JWKS (JSON Web Key Set) 用于 id_token 签名验证   │
+│    │    → 返回 *oidc.Provider                                  │
+│    ↓                                                           │
+│  返回 &oidcProvider{                                           │
+│    clientID, clientSecret, redirectURL,                        │
+│    provider: *oidc.Provider  // 包含 discovery 结果             │
+│  }                                                             │
+│        ↓                                                       │
+│  manager.AddProvider("oidc", oidcProvider)                     │
+│  Manager.providers["oidc"] = oidcProvider                      │
+│        ↓                                                       │
+│  返回 Manager → FindProvider("oidc") → 使用                    │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 "每次请求实例化"的关键影响
+
+**`getOAuth2Manager` 不是单例，每次 HTTP 请求都重新创建 Manager + 重新执行 OIDC Discovery。**
+
+这意味着：
+
+| 影响 | 说明 |
+|------|------|
+| **性能开销** | 每次 OAuth 相关请求都发一次 GET 到 discovery endpoint + 可能的 JWKS 预取 |
+| **网络依赖** | 如果 discovery endpoint 不可达，所有 OAuth 请求（包括 redirect 和 callback）都会失败 |
+| **动态配置生效** | 修改 IdP 的 endpoint 配置后无需重启 Miniflux——下次请求自动获取最新值 |
+| **无缓存** | go-oidc 的 `NewProvider` 不内置缓存，每次调用都是完整的 HTTP roundtrip |
+
+### 11.4 Discovery 产出物的使用路径
+
+`oidcProvider` 保存 discovery 结果于 `o.provider` 字段，在以下两处被消费：
+
+#### 11.4.1 `Config()` — 构造 OAuth2 授权配置
+
+```go
+// oidc.go:54-61
+func (o *oidcProvider) Config() *oauth2.Config {
+    return &oauth2.Config{
+        RedirectURL:  o.redirectURL,
+        ClientID:     o.clientID,
+        ClientSecret: o.clientSecret,
+        Scopes:       []string{oidc.ScopeOpenID, "profile", "email"},
+        Endpoint:     o.provider.Endpoint(),   // ← discovery 结果
+    }
+}
+```
+
+`o.provider.Endpoint()` 返回 `oauth2.Endpoint{AuthURL, TokenURL, …}`，来源于 discovery 文档中的
+`authorization_endpoint` 和 `token_endpoint`。这些 URL 被用于：
+
+1. **redirect 阶段**：`authorization.go:49` → `config.AuthCodeURL(state, ...)` 构造授权 URL
+2. **callback 阶段**：`oidc.go:66` → `conf.Exchange(ctx, code, ...)` 换 token
+
+#### 11.4.2 `Profile()` — id_token 验证和 userinfo 获取
+
+```go
+// oidc.go:76
+verifier := o.provider.Verifier(&oidc.Config{ClientID: o.clientID})
+idToken, err := verifier.Verify(ctx, rawIDToken)
+```
+
+`o.provider.Verifier()` 创建一个 ID Token 验证器，内部使用 discovery 获取的 JWKS（`jwks_uri` 端点）
+来验证 id_token 的签名。验证内容包括：
+
+- 签名有效性（RSA/ECDSA 公钥验证）
+- `iss`（issuer）匹配 discovery 文档的 issuer
+- `aud`（audience）匹配 clientID
+- `exp`（过期时间）未过期
+- `iat`（签发时间）有效
+
+```go
+// oidc.go:82
+userInfo, err := o.provider.UserInfo(ctx, oauth2.StaticTokenSource(token))
+```
+
+`o.provider.UserInfo()` 使用 discovery 文档中的 `userinfo_endpoint` 获取用户信息。
+
+### 11.5 Discovery 失败的完整影响矩阵
+
+| 失败场景 | 发生阶段 | 代码位置 | 行为 |
+|---------|---------|---------|------|
+| discovery endpoint 不可达 | `getOAuth2Manager` → `NewOidcProvider` | `oidc.go:37-39` | `NewProvider` 返回 error → `NewManager` 不 AddProvider → `FindProvider` 返回 "provider not found" → redirect/callback/unlink 均 302 到首页或 /settings |
+| discovery endpoint 返回非法 JSON | 同上 | go-oidc 内部 | 同上 |
+| discovery 文档缺少 `authorization_endpoint` | `Config()` → `Endpoint()` | go-oidc 内部 | `AuthCodeURL` 构造失败或 URL 不合法 |
+| discovery 文档缺少 `token_endpoint` | `Profile()` → `Exchange()` | go-oidc 内部 | token exchange 请求发往空/错误 URL → Exchange 失败 → callback 302 到首页 |
+| `jwks_uri` 不可达 | `Profile()` → `Verifier.Verify()` | `oidc.go:76-79` | id_token 签名无法验证 → Verify 返回 error → callback 302 到首页 |
+| `userinfo_endpoint` 不可达 | `Profile()` → `UserInfo()` | `oidc.go:82-84` | 无法获取用户信息 → callback 302 到首页 |
+| discovery endpoint 响应慢 | 所有涉及 OAuth 的请求 | 全链路 | 每个 redirect/callback/unlink 请求都被阻塞直到 discovery 完成（无超时控制） |
+
+### 11.6 配置层约束
+
+`config/parser.go:55-57`：
+
+```go
+if c.OAuth2Provider() == "oidc" && c.OAuth2OIDCDiscoveryEndpoint() == "" {
+    return errors.New("OAUTH2_OIDC_DISCOVERY_ENDPOINT must be configured when using the OIDC provider")
+}
+```
+
+**启动时校验**：`OAUTH2_PROVIDER=oidc` 必须同时提供 `OAUTH2_OIDC_DISCOVERY_ENDPOINT`，否则拒绝启动。
+但仅校验非空，不校验 URL 可达性——可达性延迟到运行时首次请求才暴露。
+
+`OAUTH2_OIDC_PROVIDER_NAME`（默认值 `"OpenID Connect"`）纯粹是 UI 展示用，在 `login.html:53` 和 `settings.html:27,31,35`
+中作为模板变量显示，不参与任何 discovery 或认证逻辑。
