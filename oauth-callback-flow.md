@@ -855,3 +855,376 @@ if c.OAuth2Provider() == "oidc" && c.OAuth2OIDCDiscoveryEndpoint() == "" {
 
 `OAUTH2_OIDC_PROVIDER_NAME`（默认值 `"OpenID Connect"`）纯粹是 UI 展示用，在 `login.html:53` 和 `settings.html:27,31,35`
 中作为模板变量显示，不参与任何 discovery 或认证逻辑。
+
+---
+
+## 12. 第三方 Token 失效后用户主动绑定其他 Provider 的代码路径
+
+### 12.1 语义澄清：何为"Token 失效 + 绑定其他 Provider"
+
+在 Miniflux 的架构中，不存在"保存第三方 access_token → access_token 过期 → refresh → 失败"这条链路（参见 §7.1）。
+因此"第三方 token 失效后用户主动绑定其他 provider"在本系统中实际对应以下**三种业务场景**：
+
+| 场景编号 | 业务语义 | 触发原因 |
+|---------|---------|---------|
+| 场景 A | 用户 WebSession 过期（相当于"第三方登录态失效"），需要重新走 OAuth 登录，此时系统配置的 provider 与上次登录时**不同**（运维改了配置） | `OAUTH2_PROVIDER` 被从 `google` 改为 `oidc` 或反之 |
+| 场景 B | 用户已通过本地密码登录，想在 Settings 页面绑定一个**尚未绑定过**的 provider（此前用户可能用另一 provider 登录过，或者从未绑过任何 provider） | 用户主动操作 Settings 页的"Link XXX Account" |
+| 场景 C | 用户已通过 provider X 绑定了账号，但后来 provider X 侧的账号被封禁/注销（此时用户的 `google_id` / `openid_connect_id` 仍在 DB 中，但实际无法通过 X 登录），用户想改用密码登录后绑定 provider Y | 跨 provider 账号迁移/自救 |
+
+### 12.2 场景 A：Session 过期 + 系统切换到其他 Provider
+
+#### 触发条件
+- 用户上次以 `OAUTH2_PROVIDER=google` 登录，session 过期后 DB 中 `users.google_id="sub-abc"`
+- 运维将 `OAUTH2_PROVIDER` 改为 `oidc`（重启进程后生效）
+- 用户再次访问，被 302 到 `/login`
+
+#### 登录页渲染逻辑
+
+`login.html:47-55` 根据当前 `OAUTH2_PROVIDER` 渲染按钮：
+
+```gotemplate
+{{ if hasOAuth2Provider "google" }}      ← 现在是 oidc，走 else if 分支
+    Google Sign-in
+{{ else if hasOAuth2Provider "oidc" }}   ← 现在渲染 "Sign in with OpenID Connect"
+    Sign in with {{ oidcProviderName }}
+{{ end }}
+```
+
+#### 回调处理逻辑（未登录路径）
+
+用户点击 OIDC 按钮完成授权 → `oauth2_callback.go:110-154` 未登录分支：
+
+```
+oauth2_callback.go:115
+  store.UserByField(profile.Key, profile.ID)
+    → profile.Key = "openid_connect_id"
+    → profile.ID = OIDC 返回的 subject
+    → SELECT ... FROM users WHERE openid_connect_id=$1
+
+  ┌─ 结果: 未找到（DB 中 openid_connect_id 为空，只有 google_id 有值）
+  │
+  ├─ OAUTH2_USER_CREATION = 1
+  │   ├─ store.UserExists(username)
+  │   │   ├─ true（该用户名已被原有用户占用）
+  │   │   │   → oauth2_callback.go:131-136
+  │   │   │   → error.user_already_exists → 400 Bad Request
+  │   │   │
+  │   │   └─ false（username 不冲突）
+  │   │       → 创建新用户 + authenticateWebSession
+  │   │       → 后果: 同一人拥有两个独立账号
+  │   │
+  │   └─ OAUTH2_USER_CREATION != 1
+  │       → 403 Forbidden（oauth2_callback.go:125-128）
+  │
+  └─ 结果: 找到了（需要该 OIDC subject 恰好等于某个已存在用户的 openid_connect_id）
+      → 直接登录该用户
+```
+
+**关键发现：场景 A 存在"账号分裂"风险。**
+
+由于系统只按当前 provider 的 `profile.Key` 查找（单值 `OAUTH2_PROVIDER`），切换 provider 后
+`UserByField("openid_connect_id", …)` 找不到已有 `google_id` 的记录——如果 `OAUTH2_USER_CREATION=1`
+且用户名不冲突，会错误地创建第二个账号。
+
+#### 风险矩阵
+
+| `OAUTH2_USER_CREATION` | `UserExists(username)` | 结果 | 风险等级 |
+|------------------------|----------------------|------|---------|
+| 1 | true | 400 `error.user_already_exists` | 中（用户困惑，但没有数据分裂） |
+| 1 | false | 创建新用户，账号分裂 | **高**（同一人两个独立账号，feeds/favorites 不共享） |
+| != 1 | N/A | 403 Forbidden | 低（安全但用户无法登录） |
+
+#### 运维操作建议：切换 Provider 前的正确流程
+
+1. 要求所有用户先设置密码（Settings 页修改密码）
+2. 切换 `OAUTH2_PROVIDER` 前确保 `DISABLE_LOCAL_AUTH=false`
+3. 切换后用户先用密码登录，再在 Settings 页绑定新 provider（即走场景 B）
+4. 确认用户都迁移完成后再考虑 `DISABLE_LOCAL_AUTH`
+
+### 12.3 场景 B：已登录用户绑定另一个 Provider（通过 Settings 页）
+
+#### 页面渲染
+
+用户已通过本地密码登录 → 访问 `/settings`
+
+`settings_show.go:18-81` 渲染 Settings 页面，其中 `settings.html:11-39` 的 OAuth 区块：
+
+```gotemplate
+{{ if and (not disableLocalAuth) (hasOAuth2Provider "google") }}
+    {{ if .user.GoogleID }}
+        <!-- 已绑定: 显示 Unlink 按钮 -->
+    {{ else }}
+        <!-- 未绑定: 显示 Link Google 链接 → GET /oauth2/google/redirect -->
+    {{ end }}
+{{ else if and (not disableLocalAuth) (hasOAuth2Provider "oidc") }}
+    {{ if .user.OpenIDConnectID }}
+        <!-- 已绑定: 显示 Unlink 按钮 -->
+    {{ else }}
+        <!-- 未绑定: 显示 Link OIDC 链接 → GET /oauth2/oidc/redirect -->
+    {{ end }}
+{{ end }}
+```
+
+**关键约束**：外层 `if/else if` 意味着同一时间只能显示**当前配置的**那个 provider 的绑定入口。
+如果 `OAUTH2_PROVIDER=oidc`，即使该用户的 `google_id` 有值，也永远不会看到 Google 的绑定/解绑区域。
+
+#### 主动绑定的完整链路
+
+```
+用户在 Settings 点击 "Link OIDC Account"
+        ↓
+GET /oauth2/oidc/redirect  → oauth2_redirect.go:32-36
+  → 生成 state/code_verifier → StartOAuth2Flow
+  → 302 → OIDC 授权页
+        ↓
+OIDC 回调 → GET /oauth2/oidc/callback
+        ↓
+oauth2_callback.go:39-51
+  state 校验 → code_verifier 取出 → ClearOAuth2Flow
+        ↓
+oauth2_callback.go:55-67: request.IsAuthenticated(r) = true
+        ↓
+oauth2_callback.go:60-67: 冲突检查
+  ① AnotherUserWithFieldExists(loggedUser.ID, profile.Key, profile.ID)
+    → 是否有其他用户绑了同一个 OIDC subject？
+    → true: error.duplicate_linked_account → 302 /settings
+  ② existingProfileID := authProvider.UserProfileID(loggedUser)
+    → 即 loggedUser.OpenIDConnectID
+    → existingProfileID != "" && != profile.ID
+      → error.duplicate_linked_account → 302 /settings
+        ↓
+oauth2_callback.go:100-103: 冲突通过
+  authProvider.PopulateUserWithProfileID(loggedUser, profile)
+    → oidc.go:122-127: loggedUser.OpenIDConnectID = profile.ID
+  h.store.UpdateUser(loggedUser)
+    → storage/user.go:257-329: UPDATE ... openid_connect_id=$16 ...
+        ↓
+  alert.account_linked → sess.SetSuccessMessage
+  302 → /settings
+```
+
+#### 场景 B 的边界细节
+
+| 边界条件 | 检查点 | 结果 |
+|---------|-------|------|
+| 用户当前 `google_id="abc"`，系统配置 `OAUTH2_PROVIDER=oidc`，想绑 OIDC | `AnotherUserWithFieldExists` 查 `openid_connect_id`，`existingProfileID` 读 `OpenIDConnectID`（为空） | ✅ 通过，绑定成功。最终用户同时拥有 `google_id="abc"` + `openid_connect_id="xyz"` **两个字段都有值** |
+| 绑完 OIDC 后，用户想再绑 Google（切换回 `OAUTH2_PROVIDER=google`） | `AnotherUserWithFieldExists` 查 `google_id`（等于 "abc"，`id<>$1` 排除自身后无冲突）；`existingProfileID = "abc"`，且 Google 回调的 `profile.ID` 也为 "abc" | ✅ 通过，幂等 UPDATE，无变化 |
+| 绑完 OIDC 后，系统仍为 `OAUTH2_PROVIDER=oidc`，用户点击不同 OIDC 账号授权 | `existingProfileID != "" && != profile.ID`（新账号 subject 不同） | ❌ `error.duplicate_linked_account` |
+| `DISABLE_LOCAL_AUTH=true` 时尝试绑定 | Settings 模板 `if not disableLocalAuth` → 整个绑定区块不渲染 | ⚠️ 前端隐藏，但路由 `/oauth2/{provider}/redirect` 仍是公共路由——**理论上可手动构造请求** |
+
+> **重要**：场景 B 是**唯一能让一个用户同时拥有 `google_id` 和 `openid_connect_id` 两个非空值的路径**。
+> 因为只有先配一个 provider 绑定，再改配置配另一个 provider 再绑定——而回调冲突检查只检查"当前 provider 维度"，不阻塞"另一个 provider 字段已非空"。
+
+### 12.4 场景 C：原 Provider 账号失效 → 密码登录 → 绑定新 Provider
+
+这是场景 B 的前置 + 场景 A 的补救组合：
+
+```
+用户原 Google 账号被封禁 → 无法通过 Google OAuth 登录
+        ↓
+使用本地密码登录 /login（DISABLE_LOCAL_AUTH 必须为 false）
+  → webSessionMiddleware: 认证成功 → 建立 session
+        ↓
+（运维已切换 OAUTH2_PROVIDER=oidc，或用户等管理员切换）
+        ↓
+访问 /settings → 显示 "Link OIDC Account"（场景 B 路径）
+        ↓
+点击 Link OIDC Account → 完整 redirect → callback 流程
+        ↓
+绑定成功: 用户的 google_id 仍保留（但无法再用），openid_connect_id 新绑定
+        ↓
+用户未来可通过 OIDC 登录
+  → UserByField("openid_connect_id", ...) → 找到用户 → 正常登录
+```
+
+#### 场景 C 的关键约束
+
+| 约束 | 说明 |
+|------|------|
+| **必须有密码** | 原 Google 账号失效后，用户唯一能进入系统的方式是本地密码登录。如果用户从未设置过密码（纯 OAuth 注册），此路径关闭 |
+| **`DISABLE_LOCAL_AUTH` 必须为 false** | 如果设置了禁用本地认证，用户连登录都做不到 |
+| **原 `google_id` 不会自动清空** | 绑定 OIDC 后，Google ID 仍保留在 DB 中。如果未来恢复 Google 配置，用户可用两种方式登录 |
+| **管理员干预** | 若用户没有密码，管理员需通过 `miniflux -reset-password` CLI 命令重置（`cli.go:117-143`） |
+
+---
+
+## 13. OAuth Provider 配置热更新的代码挂载点
+
+### 13.1 核心结论：不支持真正的"热更新"
+
+Miniflux 没有配置热加载机制。`config.Opts` 是**启动时一次性初始化**的全局变量（`config/config.go:9`），
+没有任何在运行时重新读取环境变量或配置文件的代码路径。
+
+但由于 **OAuth 相关配置的读取方式** 与 **Provider 实例化模式** 的组合，存在一种"准热更新"的假象——
+下文详细拆解三层。
+
+### 13.2 配置初始化的唯一入口
+
+`cli.go:39-96`，启动时执行一次：
+
+```go
+// cli.go:80-96
+cfg := config.NewConfigParser()
+
+if flagConfigFile != "" {
+    config.Opts, err = cfg.ParseFile(flagConfigFile)   // ① 先读 --config-file
+    if err != nil { printErrorAndExit(err) }
+}
+
+config.Opts, err = cfg.ParseEnvironmentVariables()     // ② 环境变量覆盖文件
+if err != nil { printErrorAndExit(err) }
+
+if err := config.Opts.Validate(); err != nil {          // ③ 校验互斥关系
+    printErrorAndExit(err)                              //    不通过则退出进程
+}
+```
+
+`ParseEnvironmentVariables()`（`parser.go`）遍历 `configOptions.options` map 的每一项，
+从 `os.Getenv()` 读取值 → 解析 → 写入 `config.Opts`。**此后 `config.Opts` 不再被写入**。
+
+### 13.3 信号处理层：没有 SIGHUP
+
+`cli/daemon.go:26-28` 注册的信号：
+
+```go
+signal.Notify(stop, os.Interrupt)   // SIGINT
+signal.Notify(stop, syscall.SIGTERM)
+```
+
+**没有注册 SIGHUP**（常见于 Nginx 等服务的 reload 信号）。因此 `kill -HUP <pid>` 不会触发任何配置重载，
+反而会走默认行为——终止进程（或被忽略，取决于 Go runtime 版本）。
+
+### 13.4 三层"准热更新"的代码挂载点
+
+虽然没有真正的热加载，但有三个挂载点使得**某些 OAuth 相关配置变化**在不重启进程时就可体现：
+
+#### 挂载点 1：`getOAuth2Manager` 每次请求读 `config.Opts` — 配置值层面的"热"
+
+`internal/ui/auth.go:55-64`：
+
+```go
+func getOAuth2Manager(ctx context.Context) *oauth2.Manager {
+    return oauth2.NewManager(
+        ctx,
+        config.Opts.OAuth2Provider(),           // ← 每次请求实时读全局变量
+        config.Opts.OAuth2ClientID(),           // ← 每次请求实时读
+        config.Opts.OAuth2ClientSecret(),       // ← 每次请求实时读
+        config.Opts.OAuth2RedirectURL(),        // ← 每次请求实时读
+        config.Opts.OAuth2OIDCDiscoveryEndpoint(),  // ← 每次请求实时读
+    )
+}
+```
+
+`OAuth2Provider()` 等方法只是简单的 getter（`config/options.go` 的 accessor），从 `config.Opts.options` map 中读取已解析值。
+
+**关键点**：如果能在运行时**修改 `config.Opts.options` map** 中对应 key 的值（例如通过 unsafe 或反射），
+由于 `getOAuth2Manager` 每次请求都读，**新请求会立即使用新值**——无需重启。但这依赖于外部手段修改内存中的全局变量，
+不是 Miniflux 设计或维护的正式接口。
+
+**正常情况下**：修改环境变量后，已有进程的 `os.Getenv()` **不会**重新读取子进程环境变量表（操作系统语义），
+因此正常修改环境变量不能触发此挂载点生效——必须重启。
+
+#### 挂载点 2：OIDC Discovery 每次重新 HTTP GET — 端点发现层面的"热"
+
+参见 §11。`NewOidcProvider(ctx, discoveryEndpoint)` 每次调用都会向 discovery endpoint 发 HTTP GET：
+
+- 如果运维修改了 OIDC IdP 侧 discovery 文档内容（例如换了 `authorization_endpoint`、`token_endpoint` 或轮换了 `jwks_uri`），
+  **无需重启 Miniflux**，下一次 OAuth 相关请求的 `NewManager → NewOidcProvider → oidc.NewProvider` 会自动获取最新值
+- 这不是 Miniflux 的"配置热更新"，而是 IdP discovery 协议本身的"动态"特性
+
+**热生效路径**：
+```
+IdP 管理员修改 .well-known/openid-configuration
+        ↓
+下一次用户点击 OAuth 登录按钮
+        ↓
+GET /oauth2/oidc/redirect → getOAuth2Manager() → NewManager()
+        ↓
+NewOidcProvider → oidc.NewProvider(ctx, "https://idp.example.com/.well-known/openid-configuration")
+        ↓
+HTTP GET → 拿到最新的 authorization_endpoint / token_endpoint / jwks_uri
+        ↓
+用户被跳转到新的 authorization_endpoint（已热切换）
+```
+
+#### 挂载点 3：模板函数每次请求读 `config.Opts` — UI 展示层面的"热"
+
+`internal/template/functions.go:54-56, 60-62`：
+
+```go
+"hasOAuth2Provider": func(provider string) bool {
+    return config.Opts.OAuth2Provider() == provider   // ← 每次模板渲染实时读
+},
+"oidcProviderName": func() string {
+    return config.Opts.OAuth2OIDCProviderName()       // ← 每次模板渲染实时读
+},
+```
+
+这些函数在每次渲染登录页、设置页时被调用。假设通过某种手段（如反射修改）改变了 `config.Opts.OAuth2Provider()`，
+**下次页面刷新**就会：
+
+- `hasOAuth2Provider("google")` 从 true → false，Google 按钮消失
+- `hasOAuth2Provider("oidc")` 从 false → true，OIDC 按钮出现
+
+但同样——这不是受支持的热更新路径。
+
+### 13.5 路由注册层：永远的"冷"
+
+`internal/ui/ui.go:137-154`：
+
+```go
+if config.Opts.HasOAuth2Provider() {   // ← 仅在 StartServer 时判断一次
+    mux.HandleFunc("GET /oauth2/{provider}/redirect", handler.oauth2Redirect)
+    mux.HandleFunc("GET /oauth2/{provider}/callback", handler.oauth2Callback)
+    mux.HandleFunc("POST /oauth2/{provider}/unlink", handler.oauth2Unlink)
+}
+```
+
+**路由注册在进程启动时执行一次**（`StartWebServer`）。即使通过反射修改了 `config.Opts.HasOAuth2Provider()` 的返回值，
+已注册的路由不会消失，未注册的路由也不会出现——除非重启进程。
+
+这意味着：
+
+| 操作 | 不重启是否生效 | 说明 |
+|------|--------------|------|
+| 从 `""` → `"oidc"` 启用 OAuth | ❌ 不生效 | 路由没注册，访问 `/oauth2/oidc/redirect` 返回 404 |
+| 从 `"oidc"` → `""` 禁用 OAuth | ⚠️ 部分生效 | 路由仍存在，URL 可访问但 `FindProvider` 永远失败 → 302 到首页 |
+| 从 `"google"` → `"oidc"` 切换 provider | ⚠️ 部分生效 | 路由仍注册（都走通用参数化路径），`FindProvider` 会根据新值查找，**实际可工作** |
+
+最意外的是最后一行：**切换 provider（`google ↔ oidc`）在不重启进程时有可能部分工作**——
+因为路由是 `{provider}` 参数化的，`redirect`、`callback`、`unlink` 的 handler 内部都走 `getOAuth2Manager` → `FindProvider(provider)`，
+如果新的 `config.Opts.OAuth2Provider()` 值与 URL 中的 `{provider}` 参数匹配，流程就能正常走完。
+但这完全依赖于"用户恰好知道新的 provider 名称并手动构造 URL，或 `hasOAuth2Provider` 热更新后按钮渲染成正确的 URL"。
+
+### 13.6 OAuth 相关配置项在各层的"冷/热"全景
+
+| 配置项 | 类型 | config.Opts accessor | 启动时 Validate | 路由注册时读取 | 每次请求读取 | 每次模板渲染读取 | 准热更新 |
+|--------|------|---------------------|----------------|---------------|-------------|-----------------|---------|
+| `OAUTH2_PROVIDER` | 字符串 | `OAuth2Provider()` | validator 限制 `oidc`/`google` | `ui.go:137`（注册开关） | `auth.go:58`（getOAuth2Manager） | `functions.go:55`（hasOAuth2Provider） | ⚠️ 部分（路由已注册则 handler 生效；未注册则 404） |
+| `OAUTH2_CLIENT_ID` | 字符串 | `OAuth2ClientID()` | 非空校验 | 否 | `auth.go:59` | 否 | ✅（getOAuth2Manager 每次读取） |
+| `OAUTH2_CLIENT_SECRET` | 字符串 | `OAuth2ClientSecret()` | 非空校验 | 否 | `auth.go:60` | 否 | ✅ |
+| `OAUTH2_REDIRECT_URL` | 字符串 | `OAuth2RedirectURL()` | 非空校验 | 否 | `auth.go:61` | 否 | ✅ |
+| `OAUTH2_OIDC_DISCOVERY_ENDPOINT` | 字符串 | `OAuth2OIDCDiscoveryEndpoint()` | 当 provider=oidc 时非空 | 否 | `auth.go:62` | 否 | ✅（同时触发 §13.4 的 HTTP GET） |
+| `OAUTH2_OIDC_PROVIDER_NAME` | 字符串 | `OAuth2OIDCProviderName()` | 无 | 否 | 否 | `functions.go:62`（oidcProviderName） | ✅（模板层） |
+| `OAUTH2_USER_CREATION` | 布尔 | `OAuth2UserCreation()` | 无 | 否 | `oauth2_callback.go:124` | 否 | ✅（callback 每次判断） |
+| `DISABLE_LOCAL_AUTH` | 布尔 | `DisableLocalAuth()` | 与 AUTH_PROXY_HEADER/OAUTH2_PROVIDER 互斥校验 | 否 | `oauth2_unlink.go:17` | `settings.html:11,27` `login.html:44` | ✅（解绑门禁 + 模板渲染） |
+
+### 13.7 安全影响：`DISABLE_LOCAL_AUTH` 的准热生效漏洞
+
+根据上表，`DISABLE_LOCAL_AUTH` 的**启动时校验**（`parser.go`）保证了"禁用本地认证时必须有 OAuth 或 Auth Proxy"，
+但这只是一次性校验。
+
+假设：
+1. 启动时 `DISABLE_LOCAL_AUTH=true` + `OAUTH2_PROVIDER=oidc` → 校验通过，进程启动
+2. 此时如果通过某种手段将内存中 `config.Opts.OAuth2Provider()` 改为 `""`
+
+那么：
+- 路由注册保持（启动时 `HasOAuth2Provider()=true` 注册了三条路由）
+- 但 `FindProvider("oidc")` 永远找不到 → redirect/callback/unlink 全部 302
+- 本地认证 `DISABLE_LOCAL_AUTH=true` 仍生效 → `/login` 模板不渲染密码表单
+- `AUTH_PROXY_HEADER` 未配置
+
+**结果：用户失去所有登录方式，等价于"全部锁死"状态。**
+
+这不是严重漏洞（需要能修改进程内存的能力才能触发），但说明了校验层（启动时一次性）与执行层（每次请求读取）之间的**时间差风险**。
+正式环境中应通过不可变部署（容器、只读配置）来规避此类风险。
