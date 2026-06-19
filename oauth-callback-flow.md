@@ -1228,3 +1228,409 @@ if config.Opts.HasOAuth2Provider() {   // ← 仅在 StartServer 时判断一次
 
 这不是严重漏洞（需要能修改进程内存的能力才能触发），但说明了校验层（启动时一次性）与执行层（每次请求读取）之间的**时间差风险**。
 正式环境中应通过不可变部署（容器、只读配置）来规避此类风险。
+
+---
+
+## 14. 多 Provider 同时绑定时账户合并冲突的代码核对
+
+### 14.1 场景定义：何为"多 Provider 同时绑定"
+
+Miniflux v2 的配置层（§9.2）强制单 Provider，因此"同时绑定"只能通过**先配置 Provider A 绑定 → 改配置重启 → 再配置 Provider B 绑定**的方式实现。
+完成后，一个 `users` 表行的 `google_id` 和 `openid_connect_id` 字段同时非空：
+
+```
+users 表某行:
+  id = 42
+  username = "alice"
+  google_id = "sub-google-123"          ← 非空（阶段 1 绑定）
+  openid_connect_id = "sub-oidc-456"    ← 非空（阶段 2 绑定）
+  password = ""（未设置） or "$2a$10$..."（已设置）
+```
+
+这种状态在系统中是**合法的**——所有数据结构和 SQL 都不限制两列同时非空，但**所有查找和冲突检查逻辑只感知当前配置的 Provider**，
+由此产生一系列"半盲"行为，下文按代码路径逐一核对。
+
+### 14.2 已登录用户绑定另一 Provider 的冲突检查
+
+以 `OAUTH2_PROVIDER=oidc`、用户已绑 Google 为前提，走 OIDC 绑定流程：
+
+```
+oauth2_callback.go:71
+  request.IsAuthenticated(r) = true
+        ↓
+oauth2_callback.go:78:
+  h.store.AnotherUserWithFieldExists(loggedUser.ID, profile.Key, profile.ID)
+    → profile.Key = "openid_connect_id"
+    → profile.ID = "sub-oidc-456"
+    → SQL: SELECT true FROM users
+            WHERE id <> 42 AND "openid_connect_id"='sub-oidc-456' LIMIT 1
+    → 返回 false（没有其他用户占这个 OIDC subject）
+        ↓
+oauth2_callback.go:89:
+  existingProfileID := authProvider.UserProfileID(loggedUser)
+    → oidc.go:134-136: return user.OpenIDConnectID
+    → loggedUser.OpenIDConnectID = ""（当前尚未绑 OIDC）
+    → existingProfileID == "" → 检查跳过
+        ↓
+oauth2_callback.go:102:
+  authProvider.PopulateUserWithProfileID(loggedUser, profile)
+    → oidc.go:122-127: loggedUser.OpenIDConnectID = "sub-oidc-456"
+        ↓
+oauth2_callback.go:103:
+  h.store.UpdateUser(loggedUser)
+    → storage/user.go:257-329: UPDATE ... google_id=$15, openid_connect_id=$16 ...
+    → $15 = loggedUser.GoogleID = "sub-google-123"
+    → $16 = loggedUser.OpenIDConnectID = "sub-oidc-456"
+    → 两字段同时非空写入
+```
+
+**冲突检查结果**：✅ 通过。两次检查只在 `openid_connect_id` 维度上工作，`google_id` 全程不参与。
+系统**没有任何代码检查"该用户是否已在另一 provider 维度上有绑定"**。
+
+#### 关键 SQL 分析
+
+`AnotherUserWithFieldExists`（`storage/user.go:474-479`）：
+```go
+query := `SELECT true FROM users WHERE id <> $1 AND ` + pq.QuoteIdentifier(field) + `=$2 LIMIT 1`
+```
+
+- 使用 `pq.QuoteIdentifier(field)` 防止 SQL 注入，`field` 严格由 `Provider.UserExtraKey()` 返回
+- 只查单一字段，永远不会做类似 `google_id = $2 OR openid_connect_id = $2` 的跨字段查询
+- `id <> $1` 排除自己，所以**同一用户**绑 Google 再绑 OIDC 是完全无冲突的
+
+### 14.3 未登录回调查找：两字段都非空时的行为
+
+前提：用户 `google_id="sub-google-123"`，`openid_connect_id="sub-oidc-456"`，`OAUTH2_PROVIDER=google`
+
+```
+oauth2_callback.go:113
+  store.UserByField(profile.Key, profile.ID)
+    → profile.Key = "google_id"
+    → profile.ID = "sub-google-123"
+```
+
+`UserByField`（`storage/user.go:431-472`）：
+```go
+query := `SELECT ... google_id, openid_connect_id ...
+         FROM users WHERE ` + pq.QuoteIdentifier(field) + `=$1 LIMIT 1`
+→ WHERE google_id = 'sub-google-123' LIMIT 1
+```
+
+**行为**：正常命中，返回该用户 → 直接登录（`oauth2_callback.go:140-154`）。
+`openid_connect_id` 字段同时非空不影响查找——SELECT 里把它作为额外列读出来但不使用。
+
+> 如果此时把 `OAUTH2_PROVIDER` 切到 `oidc`，走 `UserByField("openid_connect_id", "sub-oidc-456")` 也能命中同一用户。
+> 换言之，**双绑定用户可以用任意一种 Provider 登录**，取决于系统当前配置。
+
+### 14.4 账户合并冲突：真正的风险场景
+
+"账户合并冲突"指的是：**两个不同的 OAuth identity 在两个不同绑定阶段分别被绑到了同一 Miniflux 用户**，
+但系统在**任一 Provider 的未登录查找路径**上都只能命中该用户一次——不会自动把两个 identity 合并，
+因为"合并"的含义是"两个 identity 指向同一个用户"，而这正是用户刻意制造的状态。
+
+#### 冲突类型 1：跨用户 identity 抢占
+
+| 步骤 | 操作 | DB 状态 |
+|------|------|---------|
+| 初始 | User A `google_id=G1`，User B 无任何绑定 | |
+| 操作 | 以 A 的身份登录 → Settings 页切换系统为 oidc → 绑 OIDC 时用了 User B 本来想用的 OIDC subject O1 | User A: `google_id=G1, openid_connect_id=O1`<br>User B: 无绑定 |
+| 冲突 | User B 之后尝试以 O1 身份首次登录 | `UserByField("openid_connect_id","O1")` 命中 User A → **B 登录进了 A 的账号** |
+
+**触发条件**：User B 从未以 OIDC 登录过系统（所以 `O1` 在系统中**此前**未被 User B 绑定），
+但 OIDC 侧 B 的账户恰好被 User A 在 B 之前先绑定了。
+
+**代码分析**：无任何冲突检测可以阻止此场景。
+- 绑定阶段只检查 `AnotherUserWithFieldExists`，即"O1 是否已被其他用户占"——此时没有，放行
+- B 以未登录身份回调时，`UserByField("openid_connect_id","O1")` 会返回 User A——因为确实匹配
+
+> 这不是代码 bug，而是多 Provider 切换场景下的**身份归属语义问题**。
+> 系统设计假设：一旦某 identity 绑定到某用户，该 identity 就永远代表该用户。
+> 防止 identity 抢占的责任在 OIDC/Google 管理员侧（确保 identity 归属与用户对应）。
+
+#### 冲突类型 2：未登录回调的用户名冲突
+
+用户 A 同时绑了 Google(`G1`) 和 OIDC(`O1`)，但 `profile.Username` 在两种 Provider 下不同。
+以 OIDC 身份从未登录路径回调（session 过期）：
+
+```
+oauth2_callback.go:113: UserByField("openid_connect_id", "O1") → 命中 User A → 登录成功
+```
+
+这里**不会**走到 `UserExists(profile.Username)` 分支——因为 `user != nil`。
+只有当 `UserByField` 没找到（即 identity 首次出现）时才会检查用户名。
+所以冲突类型 2 在"双绑定 + 已知 identity"场景下不会发生。
+
+冲突类型 2 发生在**首次通过另一 Provider 创建用户**的场景：
+- 先用 Google 注册用户 `username="alice@example.com"`（Google 的 profile.Username = email）
+- 系统切到 OIDC 后，OIDC 恰好也返回 `username="alice@example.com"`，但 `sub` 字段不同
+- 首次 OIDC 回调时：`UserByField("openid_connect_id", "different-sub")` = nil → 走创建路径
+  → `UserExists("alice@example.com")` = true → `error.user_already_exists` → 400 Bad Request
+
+**代码位置**：`oauth2_callback.go:125-128`。
+此时该用户被完全拒绝登录——不能以 OIDC 创建新账户，也不能以 OIDC 登录到已有账户（因为 `openid_connect_id` 为空）。
+**唯一解**：先以 Google 身份或密码登录，到 Settings 页绑定 OIDC。
+
+### 14.5 解绑时的跨 Provider 状态残留
+
+`oauth2_unlink.go:62-63` 执行解绑：
+
+```go
+authProvider.UnsetUserProfileID(user)   // 只清空当前 Provider 字段
+h.store.UpdateUser(user)                // 全字段 UPDATE，另一 Provider 字段保留
+```
+
+假设用户双绑定，`OAUTH2_PROVIDER=oidc`：
+- `UnsetUserProfileID` → `user.OpenIDConnectID = ""`
+- `UpdateUser` 时：`google_id=$15 = user.GoogleID = "sub-google-123"`（原值不变）
+- 结果：`openid_connect_id = ""`，`google_id = "sub-google-123"`（保留）
+
+**正确**。解绑的语义是"断开当前 Provider"，另一个 Provider 绑定不受影响。
+
+**但存在边界**：解绑完 OIDC 后，如果把配置切回 Google，用户仍能用 Google 登录——完全符合预期。
+
+### 14.6 冲突检查完整性矩阵
+
+下表列出所有"应该检查但可能遗漏"的冲突维度，按代码核对：
+
+| 检查维度 | 代码路径 | 是否实现 | 说明 |
+|---------|---------|---------|------|
+| 同一 identity 跨用户占用 | `AnotherUserWithFieldExists` | ✅ 是 | 防止两个用户共享同一个 OAuth identity |
+| 同一用户同一 provider 不同 identity 替换 | `UserProfileID` 比对 | ✅ 是 | 防止在未解绑旧 identity 的情况下切换新 identity |
+| 同一用户同时绑不同 provider 的 identity | —— | ❌ 否 | 不检测，也**无需检测**——合法状态，提供多 Provider 登录能力 |
+| 跨 provider 的 username 冲突（首次创建） | `UserExists(profile.Username)` | ✅ 是 | `oauth2_callback.go:125`，防止重复用户名 |
+| 跨 provider 的 identity 归属歧义（User A 绑了本该属于 B 的 identity） | —— | ❌ 否 | 超出代码职责边界，由 OIDC/Google 管理员保证 identity 语义正确 |
+| username 跨 provider 不一致导致的"同一人不同身份" | —— | ❌ 否 | 例如 Google 返回 `alice@gmail.com`、OIDC 返回 `alice@corp.com` → 系统认为是两个独立用户，除非管理员强制绑定 |
+
+### 14.7 代码级修复建议（非要求实现，仅供参考）
+
+如果要完全消除冲突类型 2（首次通过新 Provider 登录时用户名冲突 → 无法自动登录到已有账户），
+可在 `oauth2_callback.go:119`（`user == nil`）分支增加一次**按 username 的 fallback 查找**：
+
+```go
+// 伪代码：当前没有，但以下是建议修复方向
+if user == nil {
+    // 如果该 username 已存在，提示用户先登录该账户后绑定
+    if h.store.UserExists(profile.Username) {
+        // 返回明确错误信息：请先使用用户名/密码登录该账户，
+        // 再到设置页绑定当前 OAuth Provider
+        // 而不是直接返回 400 "用户已存在"
+    }
+}
+```
+
+当前代码的 `error.user_already_exists`（`oauth2_callback.go:126`）太模糊，
+用户无法理解"我本来就是用这个用户名注册过的，为什么不让我登录"——
+实际上他需要的是"先以别的方式登录 → 再绑定"，而不是创建账户。
+
+---
+
+## 15. Token 刷新失败时降级到用户名密码登录的回退路径
+
+### 15.1 前置语义：Miniflux 中没有"Token 刷新失败"
+
+再次强调 §7.1 中的架构事实：
+**Miniflux 不保存 access_token/refresh_token，OAuth 仅用于一次性换 profile。**
+
+因此传统 OAuth 场景中的"access_token 过期 → 用 refresh_token 续期 → refresh_token 也失败 → 降级"这条链路在 Miniflux 中完全不存在。
+本系统中的"token 刷新失败"语义等价于以下**三种触发条件**，全部指向同一个最终问题：**用户的 WebSession 过期了，且无法通过 OAuth 重新建立会话**。
+
+| 语义化触发条件 | 等价的技术表现 | 用户视角 |
+|--------------|--------------|---------|
+| A. 第三方 OAuth token（概念上）"失效" | WebSession 过期 + `oauth2_callback.go:59` `authProvider.Profile()` 失败（Provider 返回 invalid_grant 等） | 点击 OAuth 按钮 → Provider 授权 → 回来到首页，没登录上 |
+| B. Provider 侧用户账号被封禁 | `authProvider.Profile()` 中 token 交换或 userinfo 请求被 Provider 拒绝 | 同上 |
+| C. 运维切换了 `OAUTH2_PROVIDER`（从 Google 切到 OIDC 等） | `UserByField` 查找不到 → 创建路径受阻或产生分裂账号（参见 §12.2） | 用户想用熟悉的按钮登录但发现按钮变了，或仍点老 URL 失败 |
+
+以下逐一分析这些情况下的"降级到用户名密码登录"回退路径。
+
+### 15.2 回退路径全景图
+
+```
+用户无法通过 OAuth 登录（A/B/C 任意一种）
+        ↓
+被 302 重定向到首页 "/"（所有 OAuth 失败的统一行为）
+        ↓
+webSessionMiddleware 检测到未认证 → 302 → /login
+        ↓
+/login 页面渲染（login.html:6-56）
+  ┌──────────────────────────────────────────────────┐
+  │ 关键渲染条件：`{{ if not disableLocalAuth }}`     │
+  │   → DISABLE_LOCAL_AUTH=false → 渲染密码表单       │
+  │   → DISABLE_LOCAL_AUTH=true  → 不渲染密码表单      │
+  └──────────────────────────────────────────────────┘
+        ↓
+┌─ 条件分支 1: DISABLE_LOCAL_AUTH = false（回退可用）
+│
+│   用户看到用户名/密码表单
+│   填写 → POST /login → checkLogin.go:20-94
+│     ├─ ① login_check.go:26: DisableLocalAuth() 二次门禁检查
+│     │   → true: 直接返回，渲染 login 页面（静默拒绝）
+│     │   → false: 继续
+│     │
+│     ├─ ② login_check.go:35-50: AuthForm.Validate()
+│     │   → 用户名密码非空校验
+│     │
+│     ├─ ③ login_check.go:52: CheckPassword(username, password)
+│     │   → storage/user.go:672-688
+│     │     ├─ SELECT password FROM users WHERE username=LOWER($1)
+│     │     ├─ sql.ErrNoRows → dummy bcrypt 比对（防时序攻击）→ 返回错误
+│     │     └─ bcrypt.CompareHashAndPassword(hash, password)
+│     │        ├─ 匹配 → 通过
+│     │        └─ 不匹配 → 返回 error → 回 login 页面 + 错误消息
+│     │
+│     ├─ ④ login_check.go:64-72: UserByUsername(username)
+│     │   → 拿到完整 user 对象（含 google_id / openid_connect_id）
+│     │
+│     ├─ ⑤ login_check.go:82: SetLastLogin(user.ID)
+│     │
+│     └─ ⑥ login_check.go:83: authenticateWebSession(w, r, store, user)
+│          → auth.go:22-33:
+│              session.SetUser(user)
+│              oldID, secret = session.Rotate()   ← 防 session fixation
+│              store.RotateWebSession(oldID, session)
+│              setSessionCookie(w, session, secret)
+│          → 302 到用户 defaultHomePage
+│
+│   降级成功：用户通过密码登录进入系统
+│
+│   ├─ 用户有密码 → ✅ 登录成功
+│   └─ 用户无密码（纯 OAuth 注册）
+│        → CheckPassword: SELECT 返回 password=""
+│        → bcrypt.CompareHashAndPassword("", password)
+│            → bcrypt 无法对空字符串 hash（需要 $2a$ 前缀格式）
+│            → 返回错误
+│        → checkLogin.go:53-62: 渲染 login 页面 + error.bad_credentials
+│        → 用户被锁在外面，需要管理员 -reset-password（cli.go:117-143）
+│
+└─ 条件分支 2: DISABLE_LOCAL_AUTH = true（回退不可用）
+    │
+    ├─ /login 页面：`{{ if not disableLocalAuth }}` → 密码表单不渲染
+    ├─ POST /login 手动构造请求：checkLogin.go:26-33 直接阻止
+    ├─ 剩余可选登录方式：
+    │   ├─ OAuth 按钮（仍显示，§15.3 分析）
+    │   ├─ WebAuthn Passkey（如果已配置，login.html:28-42）
+    │   └─ Auth Proxy（`AUTH_PROXY_HEADER` 配置后生效）
+    │
+    └─ 全部失败 → 无法登录，需要运维干预
+```
+
+### 15.3 关键门禁：`DISABLE_LOCAL_AUTH` 的代码挂载点
+
+这个布尔变量是降级路径的"总开关"，在以下 **5 处** 生效：
+
+| 挂载点 | 代码位置 | 作用 |
+|-------|---------|------|
+| ① 启动配置校验 | `config/parser.go:50-60` | 与 `OAUTH2_PROVIDER != ""` 或 `AUTH_PROXY_HEADER != ""` 必须满足其一，否则启动报错 |
+| ② 登录模板渲染密码表单 | `login.html:8, 27` | `{{ if not disableLocalAuth }}` 控制密码表单是否出现在 DOM 中 |
+| ③ checkLogin handler 入口 | `login_check.go:26-33` | 后台双重保障，即使跳过前端直接 POST 也被拒绝 |
+| ④ Settings 修改 username | `form/settings.go:95-97` | `DISABLE_LOCAL_AUTH=true` 时 `Merge()` 不更新 username 字段 |
+| ⑤ OAuth 解绑门禁 | `oauth2_unlink.go:17-23` | 本地认证被禁用时不允许解绑 OAuth（否则失去登录方式）|
+| ⑥ Settings 模板绑定/解绑区块 | `settings.html:11,27` | `not disableLocalAuth` 前置条件，整个绑定区块不渲染 |
+
+挂载点 ① 和 ③+⑤ 构成了**三层防御**：
+- 配置层：确保有替代登录方式
+- Handler 层：直接拦截本地登录请求
+- 模板层：不让用户看到 UI（友好提示）
+
+### 15.4 纯 OAuth 用户无密码场景的降级死路
+
+最危险的场景：
+
+1. 用户 `alice` 通过 OAuth 注册（`OAUTH2_USER_CREATION=1`）→ DB 中 `password = ""`
+2. `DISABLE_LOCAL_AUTH = false`（本地认证开启，理论上有回退）
+3. OAuth 侧账号出了问题（Provider 永久下架、用户被封、配置切走等）
+
+**回退失败**：
+```
+checkLogin.go:52
+  → h.store.CheckPassword("alice", "随便输")
+      → storage/user.go:676: SELECT password FROM users WHERE username='alice'
+          → 返回 ""（空字符串，不是 bcrypt hash）
+          → storage/user.go:685: bcrypt.CompareHashAndPassword([]byte(""), password)
+```
+
+`bcrypt.CompareHashAndPassword` 对空字符串 hash 的行为：
+- Go `x/crypto/bcrypt` 检查 `$2a$` 前缀 → 找不到 → 返回错误 `crypto/bcrypt: hashedSecret too short to be a bcrypted password`
+- 外层包装成 `"store: invalid password for alice"`
+- `checkLogin.go:53-62` → 返回 login 页面 + `error.bad_credentials`
+
+**用户完全无法自救**。即使"记得用的是什么 OAuth"也没用，因为 OAuth 侧就是失败了。
+
+唯一解：**管理员 CLI 重置密码**
+
+```bash
+miniflux -reset-password
+# cli.go:117-143:
+#   → 读取用户名 → 读取新密码（Stdin 交互式）→ crypto.HashPassword()
+#   → storage.UpdateUser(user) → 设置 users.password 字段
+```
+
+重置后 `alice` 的 `password` 列从空字符串变为合法 bcrypt hash，走 §15.2 的 CheckPassword 流程即可登录成功。
+
+### 15.5 CheckPassword 的安全细节
+
+`storage/user.go:672-688` 中有两个关键设计：
+
+#### 15.5.1 用户不存在时走 dummy bcrypt
+
+```go
+if errors.Is(err, sql.ErrNoRows) {
+    _ = bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
+    return fmt.Errorf(`store: unable to find this user: %s`, username)
+}
+```
+
+`dummyBcryptHash` 是常量（`user.go:19`），任何不存在的用户都跑一遍相同耗时的 bcrypt 验证，
+防止**时序侧信道**（不存在的用户立即返回、存在的用户走 bcrypt 明显更慢，攻击者据此枚举合法用户名）。
+
+#### 15.5.2 LOWER(username) 的大小写归一
+
+```go
+username = strings.ToLower(username)
+// SELECT ... WHERE username=$1（$1 已是小写）
+```
+
+注册端（`CreateUser`、`UpdateUser`）也用 `LOWER($1)` 写入，保证了比较一致。
+
+### 15.6 降级失败后的最后救援手段
+
+按优先级：
+
+| 手段 | 实施方 | 代码入口 | 前提 |
+|------|-------|---------|------|
+| 管理员 `-reset-password` | 运维 | `cli.go:117-143` | 有 shell 访问数据库连接 |
+| 管理员 `-create-admin` | 运维 | `cli.go:145-177` | 同左；创建一个新 admin 登录后，在 UI 管理用户页重置原用户密码 |
+| 临时启用 Auth Proxy | 运维 | 设 `AUTH_PROXY_HEADER=X-Forwarded-User` 重启 | 有上游反向代理可注入 header |
+| 恢复 OAuth Provider 配置 | 运维 | 恢复/修正 `OAUTH2_PROVIDER` + 相关 env | Provider 侧问题已解决 |
+| 数据库直接 SQL UPDATE | DBA | `UPDATE users SET password='$2a$10$...' WHERE username='alice'` | 有 DB 访问权限 |
+
+### 15.7 回退路径代码设计总结
+
+```
+                              ┌── OAuth 回调成功 ── 正常登录
+OAuth 登录 ── 失败（§15.1 A/B/C）
+                              │
+                              ▼
+                       302 → /login
+                              │
+             ┌────────────────┴────────────────┐
+             │                                 │
+    DISABLE_LOCAL_AUTH=false           DISABLE_LOCAL_AUTH=true
+             │                                 │
+             ▼                                 ▼
+  渲染密码表单 + OAuth 按钮              仅渲染 OAuth 按钮
+             │                       （可加 WebAuthn / Auth Proxy）
+             ▼
+  POST /login → checkLogin
+    ┌─────────────────────────────────┐
+    │ CheckPassword(user, pass)       │
+    │   ├─ 有密码 + 正确 → ✅ 登录成功 │
+    │   ├─ 有密码 + 错误 → ❌ 重试     │
+    │   └─ 无密码 → ❌ 死路（需重置） │
+    └─────────────────────────────────┘
+```
+
+**回退成功的两个必要条件**（AND 关系）：
+1. `DISABLE_LOCAL_AUTH = false` → 开启本地认证通道
+2. 用户 `users.password` 列非空 + 用户知道密码 → 认证能通过
+
+任意一个不满足，降级到密码登录路径就不可用，必须走管理员干预。
