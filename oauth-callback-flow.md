@@ -294,3 +294,276 @@ POST /oauth2/{provider}/unlink
 | 解绑前密码检查 | `HasPassword` | 确保用户保留登录方式 |
 | DISABLE_LOCAL_AUTH 阻止解绑 | `oauth2_unlink.go:17` | 防止无登录方式 |
 | OIDC Subject 双重校验 | `oidc.go:87-89` | 确保 ID Token 与 UserInfo 一致 |
+
+---
+
+## 7. Token 续期失败时的回退路径
+
+### 7.1 核心前提：Miniflux 不保存 Access Token / Refresh Token
+
+**关键架构决策**：Miniflux 的 OAuth2 仅用于**首次身份认证**，换取用户 profile 后立即丢弃 access_token。
+数据库中**不保存**任何 OAuth access_token 或 refresh_token，也不存在 token 自动续期逻辑。
+用户后续的认证完全依赖 `WebSession` cookie（会话时长由 `CLEANUP_REMOVE_SESSIONS_INTERVAL` 控制）。
+
+因此，"token 续期"在 Miniflux v2 中不存在代码层面的实现，实际对应的是两条路径：
+
+### 7.2 路径一：授权码换 Token 阶段失败（回调中）
+
+在 `oauth2_callback.go:59` 调用 `authProvider.Profile()` 时，内部 `conf.Exchange()` 失败：
+
+```
+回调进入 → state 校验通过 → FindProvider
+        ↓
+authProvider.Profile(code, codeVerifier)
+        ↓
+    ┌─ conf.Exchange() 失败（授权码无效/过期/重放）
+    │   → 返回 wrapped error: "google/oidc: failed to exchange token: %w"
+    │   → oauth2_callback.go:60-71 捕获
+    │   → slog.Warn("Unable to get OAuth2 profile from provider")
+    │   → 302 重定向回首页 "/"（无任何错误提示）
+    │
+    ├─ id_token 验证失败（OIDC 专用）
+    │   → 签名无效 / audience 不匹配 / expired 等
+    │   → "oidc: failed to verify id token: %w"
+    │   → 同上，Warn 日志 + 302 到首页
+    │
+    ├─ id_token.Subject != userInfo.Subject（OIDC 专用）
+    │   → "oidc: id token subject %q does not match userinfo subject %q"
+    │   → 同上，Warn 日志 + 302 到首页
+    │
+    └─ userinfo 端点调用失败 / status != 200
+        → "oidc: failed to get user info: %w"
+        → "google: unexpected status code %d from userinfo endpoint"
+        → 同上，Warn 日志 + 302 到首页
+```
+
+**回退策略**：静默失败，不展示错误原因给终端用户（仅写 slog.Warn 日志），统一 302 到首页。
+这是基于 OAuth 失败通常是临时性/攻击性质的考虑——不让攻击者获得细节反馈，正常用户可重新点击登录按钮发起新一轮 OAuth 流程。
+
+### 7.3 路径二：会话过期后的"隐式续期"——重新登录
+
+当 WebSession 过期（超过 `CLEANUP_REMOVE_SESSIONS_INTERVAL`，默认值见 man page）：
+
+```
+用户请求受保护路由
+        ↓
+中间件检测到 WebSession 无效或已清除
+        ↓
+302 → /login（附带 redirect_url 参数）
+        ↓
+登录页根据配置显示：
+  ├─ disableLocalAuth=false → 用户名密码表单 + OAuth 按钮
+  ├─ disableLocalAuth=true  → 仅 OAuth 按钮（local 表单隐藏）
+  └─ WebAuthn 已配置 → 额外显示 Passkey 按钮
+        ↓
+用户点击 OAuth 按钮
+        ↓
+完整的 OAuth redirect → provider 授权 → callback 流程重新执行
+（视为全新登录，state/code_verifier 全部重新生成）
+```
+
+**关键区别**：传统 OAuth 资源服务器用 refresh_token 透明续期 access_token；
+Miniflux 采用的"会话 + 重登录"模式意味着——用户 OAuth session 过期 = 重新走一遍完整授权流程。
+如果用户在 provider 侧仍有登录态，通常会跳过授权确认页，实现透明"伪续期"。
+
+### 7.4 边界：OIDC 初始化失败的回退
+
+`NewManager`（`manager.go:34-56`）中，OIDC provider 初始化失败（discovery endpoint 不可用）时：
+
+```go
+if oidcProvider, err := NewOidcProvider(ctx, clientID, clientSecret, redirectURL, oidcDiscoveryEndpoint); err != nil {
+    slog.Error("Failed to initialize OIDC provider", slog.Any("error", err))
+    // 注意：不 return，继续执行。Manager 中该 provider 未被 AddProvider
+}
+```
+
+**后果**：`providers` map 中没有 `"oidc"` 条目，后续 `FindProvider("oidc")` 返回 error。
+此时即使 `OAUTH2_PROVIDER=oidc` 已配置，用户点击 OIDC 登录按钮后：
+`oauth2Redirect.go:24-29` → `FindProvider` 失败 → `slog.Error` + 302 到首页。
+这属于**启动时静默失败 + 运行时才暴露问题**的模式，运维需关注启动日志中的 `"Failed to initialize OIDC provider"`。
+
+---
+
+## 8. PKCE code_verifier 校验的完整代码挂载点
+
+PKCE 流程横跨 5 个文件，共 **8 个挂载点**，完整调用链如下：
+
+```
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  ① 生成 (redirect 阶段)                                               │
+ │  internal/oauth2/authorization.go:40-45                              │
+ │    codeVerifier := crypto.GenerateRandomStringHex(32)   // 64 hex 字符 │
+ │    sum := sha256.Sum256([]byte(codeVerifier))                        │
+ │    state := crypto.GenerateRandomStringHex(24)                       │
+ │    code_challenge = base64.RawURLEncoding.EncodeToString(sum[:])     │
+ └───────────────────────────┬─────────────────────────────────────────┘
+                             │ 返回到 Authorization{url, state, codeVerifier}
+                             ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  ② 存储入 session (redirect 阶段)                                     │
+ │  internal/ui/oauth2_redirect.go:35                                   │
+ │    sess.StartOAuth2Flow(auth.State(), auth.CodeVerifier())           │
+ └───────────────────────────┬─────────────────────────────────────────┘
+                             │ 内部写 WebSession.state.OAuth2 结构体
+                             ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  ③ session 持久化层封装                                               │
+ │  internal/model/web_session.go:48-52, 163-167, 229-234, 238-240       │
+ │    字段定义: CodeVerifier string `json:"code_verifier,omitempty"`      │
+ │    存储:   StartOAuth2Flow(state, codeVerifier) → 标记 dirty         │
+ │    读取:   OAuth2CodeVerifier() string                               │
+ │    清除:   ClearOAuth2Flow() → OAuth2 = nil, dirty=true              │
+ └───────────────────────────┬─────────────────────────────────────────┘
+                             │ 回调时从 session 读取
+                             ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  ④ 从 session 取出 + 一次性清除 (callback 阶段)                       │
+ │  internal/ui/oauth2_callback.go:46-49                                │
+ │    codeVerifier := sess.OAuth2CodeVerifier()                         │
+ │    sess.ClearOAuth2Flow()   // ← 关键: 校验通过后立即清除，防止重放     │
+ └───────────────────────────┬─────────────────────────────────────────┘
+                             │ 作为参数传入 Profile()
+                             ▼
+ ┌─────────────────────────────────────────────────────────────────────┐
+ │  ⑤ Provider 接口签名约束                                             │
+ │  internal/oauth2/provider.go:23                                      │
+ │    Profile(ctx context.Context, code, codeVerifier string)           │
+ └───────────────────────────┬─────────────────────────────────────────┘
+              ┌──────────────┴────────────────┐
+              ▼                               ▼
+ ┌─────────────────────────────┐  ┌───────────────────────────────┐
+ │  ⑥ Google 实现              │  │  ⑦ OIDC 实现                  │
+ │  internal/oauth2/google.go:57-60 │ │  internal/oauth2/oidc.go:64-68    │
+ │  conf.Exchange(ctx, code,    │  │  conf.Exchange(ctx, code,     │
+ │    oauth2.SetAuthURLParam(   │  │    oauth2.SetAuthURLParam(    │
+ │      "code_verifier",        │  │      "code_verifier",         │
+ │      codeVerifier))          │  │      codeVerifier))           │
+ └──────────────┬──────────────┘  └──────────────┬────────────────┘
+                │                                 │
+                └────────────────┬────────────────┘
+                                 ▼
+          ┌──────────────────────────────────────────────────────┐
+          │  ⑧ golang.org/x/oauth2 库内部校验                     │
+          │  oauth2.Config.Exchange() 发起到 provider Token 端点   │
+          │  的 POST 请求，body 包含:                              │
+          │    grant_type=authorization_code                      │
+          │    code=<授权码>                                       │
+          │    code_verifier=<明文 verifier>                      │
+          │  Provider 服务器端:                                    │
+          │    1. 取出该 code 对应的 code_challenge                │
+          │    2. SHA256(code_verifier) == code_challenge ?       │
+          │    3. 相等 → 发放 token；不相等 → 返回 invalid_grant   │
+          └──────────────────────────────────────────────────────┘
+```
+
+### 8.1 关键设计点
+
+| 关注点 | 位置 | 说明 |
+|--------|------|------|
+| **随机源** | `crypto.GenerateRandomStringHex` | 走 `crypto/rand`，不是伪随机 |
+| **长度** | `authorization.go:40` | 32 字节 → 64 hex 字符，超过 RFC 7636 要求的 43~128 字符下限 |
+| **清除时机** | `oauth2_callback.go:49` | 在调用 `FindProvider` **之前**清除——即使后续 provider 初始化失败，state 和 verifier 也已销毁，防止重放 |
+| **Session 恢复** | `web_session.go:280-286` `UnmarshalState` | code_verifier 通过 JSON blob 从 `web_sessions.state` 列反序列化恢复，因此 session 持久化必须在回调前不被清理 |
+| **OIDC 透传** | `oidc.go:66` | `conf.Exchange()` 自动把 `code_verifier` 放到 POST body，`golang.org/x/oauth2` 库负责 |
+
+### 8.2 失败时的状态
+
+如果 `Exchange()` 因 `code_verifier` 不匹配返回 `invalid_grant`：
+- 回到 **7.2** 的回退路径 → slog.Warn + 302 到首页
+- 由于 `ClearOAuth2Flow()` 已在前面执行，用户必须发起全新 OAuth 流程（不能重试同一个 code）
+
+---
+
+## 9. 多 Provider 同时存在时优先级合并的代码路径
+
+### 9.1 核心结论：单 Provider 独占模式，不存在真正的"合并"
+
+**配置层硬性限制**：`OAUTH2_PROVIDER` 是单值字符串，`config/options.go:468-472` 的 validator：
+
+```go
+validator: func(rawValue string) error {
+    return validateChoices(rawValue, []string{"oidc", "google"})
+}
+```
+
+只能二选一：`"oidc"` 或 `"google"`，不能同时指定。因此"多 provider 同时存在"在 Miniflux v2 中仅在以下两个语义层面发生：
+
+### 9.2 层面一：Manager 内部 map 结构理论上支持多 Provider（但永远不会被用到）
+
+`oauth2/manager.go` 的设计采用 `map[string]Provider`：
+
+```go
+type Manager struct {
+    providers map[string]Provider
+}
+func (m *Manager) AddProvider(name string, provider Provider) { ... }
+func (m *Manager) FindProvider(name string) (Provider, error) { ... }
+```
+
+但 **唯一调用 `AddProvider` 的入口** `NewManager()`（`manager.go:34-56`）使用 `switch`，一次只走一个 case：
+
+```go
+switch provider {      // provider = config.Opts.OAuth2Provider()，单值
+case "oidc":
+    m.AddProvider("oidc", oidcProvider)
+case "google":
+    m.AddProvider("google", NewGoogleProvider(...))
+default:
+    slog.Error("Unsupported OAuth2 provider")
+}
+```
+
+**结果**：Manager 的 map 在运行时永远只有 0 或 1 个条目。
+`FindProvider` 本质是"按名称查找唯一可能的 provider"，不存在多 provider 之间的优先级或 fallback 逻辑。
+
+### 9.3 层面二：登录模板渲染层的互斥优先级
+
+在 `login.html:47-55` 模板中，**使用 `if/else if` 而不是两个独立的 `if`**，这是全代码库中唯一出现"两个 provider 并列判断"的位置：
+
+```gotemplate
+{{ if hasOAuth2Provider "google" }}
+    <a href="/oauth2/google/redirect">Google Sign-in</a>
+{{ else if hasOAuth2Provider "oidc" }}
+    <a href="/oauth2/oidc/redirect">Sign in with {{ oidcProviderName }}</a>
+{{ end }}
+```
+
+其中 `hasOAuth2Provider`（`template/functions.go:54-56`）定义为：
+
+```go
+"hasOAuth2Provider": func(provider string) bool {
+    return config.Opts.OAuth2Provider() == provider
+}
+```
+
+**优先级结果**：当（不可能的情况下）`OAUTH2_PROVIDER` 同时等于两个值，`google` 优先于 `oidc` 被渲染。
+但由于配置 validator 只允许二选一，`else if` 实际上是一个**防御性编程**，而不是真实路径。
+
+### 9.4 配置互斥关系汇总（与非 OAuth 登录方式一起）
+
+| 组合 | `OAUTH2_PROVIDER` | `DISABLE_LOCAL_AUTH` | `AUTH_PROXY_HEADER` | 结果 |
+|------|-------------------|----------------------|---------------------|------|
+| A | 空 | false | 空 | 仅本地用户名密码登录 |
+| B | google | false | 空 | 本地表单 + Google 按钮（Google 优先级见模板） |
+| C | oidc | false | 空 | 本地表单 + OIDC 按钮 |
+| D | google | true | 空 | ✅ 仅 Google 按钮（通过 Validate） |
+| E | oidc | true | 空 | ✅ 仅 OIDC 按钮（通过 Validate） |
+| F | 空 | true | X-Forwarded-User | ✅ 仅 Auth Proxy |
+| G | google | true | X-Forwarded-User | ✅ Google + Auth Proxy 共存（但模板只显示 OAuth，Auth Proxy 在请求头层生效） |
+| H | 空 | true | 空 | ❌ Validate 报错：必须启用 OAuth 或 Auth Proxy 之一 |
+| I | invalid_value | - | - | ❌ validator 报错：必须是 oidc 或 google |
+| J | oidc + 缺 DISCOVERY_ENDPOINT | - | - | ❌ Validate 报错：discovery endpoint 必配 |
+
+### 9.5 假设扩展：若要真正支持多 Provider 同时启用
+
+当前架构需要修改的层：
+
+| 层 | 当前 | 修改方向 |
+|----|------|---------|
+| 配置 | `OAUTH2_PROVIDER` 单值 | 改为多值（逗号分隔或按 provider 拆分配置项） |
+| Manager | `NewManager` switch 单例 | `AddProvider` 在多个分支都执行，每个 provider 有独立的 clientID/secret/redirectURL |
+| 模板 | `if/else if` 互斥 | 改为独立的 `range` 或多个 `if`，同时显示多个 OAuth 按钮 |
+| settings 页面 | 绑定/解绑逻辑按 provider | 已支持（路由用 `{provider}` 参数化），无需改动 |
+| `oauth2_callback` 回调 | 已按 `{provider}` 路由参数分发 | 已支持，无需改动 |
+
+> 结论：回调层和绑定层天然支持多 provider（因为 provider 是 URL 参数化的），瓶颈在配置层和模板渲染层人为限制了单 provider。
