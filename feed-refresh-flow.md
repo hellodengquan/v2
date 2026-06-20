@@ -676,3 +676,492 @@ func (f *Feed) ScheduleNextCheck(weeklyCount int, refreshDelay time.Duration) ti
 | `SCHEDULER_ENTRY_FREQUENCY_MAX_INTERVAL` | 1440 分钟 | 频率调度最大间隔 |
 | `SCHEDULER_ENTRY_FREQUENCY_FACTOR` | 1 | 频率调度因子 |
 | `HTTP_CLIENT_TIMEOUT` | 20 秒 | HTTP 请求超时时间 |
+
+---
+
+## 七、分布式部署下的多 Worker 抓取去重
+
+### 7.1 问题背景
+
+Miniflux 的 feed 数据模型中，同一个 feed URL 在**同一用户**下是唯一的（数据库约束 `unique (user_id, feed_url)`），但**不同用户**可以订阅同一个 feed URL。这意味着当多个用户订阅了同一个源时，调度器可能在同一批次中为不同用户生成多个指向同一源站的 Job。同时，在分布式部署场景下，多个 Miniflux 实例可能同时调度到相同的 feed。
+
+### 7.2 调度层面的去重：next_check_at 的预推进
+
+**核心机制**: `RefreshFeed` 在发出 HTTP 请求**之前**就更新了 `next_check_at`。
+
+```go
+// handler.go:220-221 — 在 HTTP 请求之前！
+originalFeed.CheckedNow()
+originalFeed.ScheduleNextCheck(weeklyEntryCount, time.Duration(0))
+```
+
+**工作原理**:
+
+1. 当 Scheduler 周期性触发时，`BatchBuilder` 通过 SQL 条件 `next_check_at < now()` 筛选待刷新 feed
+2. Worker 从 Job channel 中取出任务并调用 `RefreshFeed`
+3. `RefreshFeed` 在**第一件事**就是把 `next_check_at` 推进到未来（至少 `SCHEDULER_ROUND_ROBIN_MIN_INTERVAL` 之后）
+4. 即使另一个调度周期在当前刷新未完成时到来，`next_check_at < now()` 条件也不会再匹配到这个 feed
+
+**但在分布式场景下存在窗口期**: 由于 `next_check_at` 的更新是在内存中修改 `originalFeed` 对象，直到 `UpdateFeed` 或 `UpdateFeedError` 写入数据库才真正生效。在读取 feed 和写回数据库之间有一个时间窗口。如果两个实例几乎同时读取到同一个 feed 的 `next_check_at < now()`，可能会同时开始刷新。
+
+### 7.3 数据库层面：无显式分布式锁
+
+经代码审查，Miniflux **没有**使用 PostgreSQL 的以下分布式协调机制：
+
+- 无 `SELECT ... FOR UPDATE` / `FOR UPDATE SKIP LOCKED` 保护 feed 行的读取
+- 无 `pg_advisory_lock` 咨询锁
+- 无 `SELECT ... FOR NO KEY UPDATE`
+
+唯一的 `FOR UPDATE SKIP LOCKED` 出现在 `ArchiveEntries` (`entry.go:378`) 中，用于归档旧条目时防止并发归档冲突，而非 feed 刷新去重。
+
+### 7.4 实际的容错设计：幂等性代替互斥
+
+Miniflux 选择了**幂等性**而非**互斥锁**来处理并发刷新问题：
+
+1. **feed 级别**: `UpdateFeed` 写入的是全量字段覆盖，两次并发刷新的结果是"最后写入者赢"（Last Writer Wins），不会导致数据损坏
+2. **entry 级别**: 依赖数据库的 `unique (feed_id, hash)` 约束（`migrations.go:88`），即使两个 Worker 同时处理同一 feed，同一 entry 也只会被插入一次
+
+```
+entries 表约束:
+  unique (feed_id, hash)   ← 防止同一 feed 下重复插入相同 entry
+
+entry_tombstones 表约束:
+  primary key (feed_id, hash)  ← 防止已删除的 entry 被重新引入
+```
+
+3. **条件请求保护**: 即使两个 Worker 同时请求同一源，第二个请求也会因为携带 `If-None-Match` / `If-Modified-Since` 头而收到 304 响应，节省带宽
+
+### 7.5 单实例内的去重保证
+
+在单个 Miniflux 实例内部，去重是完全可靠的：
+
+- **一个 Scheduler goroutine**: `feedScheduler` 在单个 goroutine 中运行，每轮生成的批次不会重复
+- **Worker 从同一 channel 消费**: 每个 Job 只会被一个 Worker 取走
+- **`limitPerHost`**: 在批次层面限制同主机的并发请求数
+
+### 7.6 建议与局限
+
+| 场景 | 去重保证 | 说明 |
+|------|----------|------|
+| 单实例 | ✅ 完全保证 | Scheduler 单 goroutine + channel 单消费 |
+| 多实例同 feed | ⚠️ 最终一致 | 可能重复请求，但幂等写入保证数据正确 |
+| 多实例同 entry | ✅ 数据库保证 | `unique (feed_id, hash)` 约束防止重复插入 |
+| 手动刷新 + 自动调度 | ⚠️ 可能重复 | API/UI 手动刷新不检查 `next_check_at` |
+
+**结论**: Miniflux 的设计哲学是"宁可多请求一次，也不引入复杂的分布式锁"。对于 RSS 刷新这种非关键路径，偶尔的重复请求是可接受的代价。
+
+---
+
+## 八、用户级 vs 全局级 Feed 配置覆盖优先级
+
+### 8.1 配置层级概述
+
+Miniflux 中存在三层配置影响 feed 的刷新行为：
+
+```
+┌─────────────────────────────────────────────┐
+│  全局级 (Application-Level)                 │
+│  - config.Opts 中的环境变量/配置文件参数     │
+│  - 适用于所有 feed 的默认值                  │
+└──────────────────────┬──────────────────────┘
+                       │ 被用户级覆盖
+                       ▼
+┌─────────────────────────────────────────────┐
+│  用户级 (User-Level)                        │
+│  - User 模型中的字段                        │
+│  - 对该用户的所有 feed 生效                  │
+└──────────────────────┬──────────────────────┘
+                       │ 被 feed 级覆盖
+                       ▼
+┌─────────────────────────────────────────────┐
+│  Feed 级 (Feed-Level)                       │
+│  - Feed 模型/FeedCreationRequest 中的字段   │
+│  - 仅对该 feed 生效                         │
+└─────────────────────────────────────────────┘
+```
+
+### 8.2 各层级的配置项对应关系
+
+#### User-Agent 覆盖
+
+**代码位置**: `request_builder.go:75-81`
+
+```go
+func (r *RequestBuilder) WithUserAgent(userAgent string, defaultUserAgent string) *RequestBuilder {
+    if userAgent != "" {
+        r.headers.Set("User-Agent", userAgent)      // feed 级
+    } else {
+        r.headers.Set("User-Agent", defaultUserAgent) // 全局级
+    }
+    return r
+}
+```
+
+**调用位置**: `handler.go:225`
+
+```go
+requestBuilder.WithUserAgent(originalFeed.UserAgent, config.Opts.HTTPClientUserAgent())
+```
+
+**优先级**: `feed.UserAgent`（feed 级） > `config.Opts.HTTPClientUserAgent()`（全局级）
+
+逻辑: 如果 feed 上设置了自定义 User-Agent，使用 feed 级的；否则使用全局默认值。
+
+#### 代理 (Proxy) 覆盖
+
+**代码位置**: `request_builder.go:143-157`
+
+```go
+func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, error) {
+    var clientProxyURL *url.URL
+    switch {
+    case r.feedProxyURL != "":
+        // 1. Feed 级别的代理（最高优先级）
+        clientProxyURL, err = url.Parse(r.feedProxyURL)
+    case r.useClientProxy && r.clientProxyURL != nil:
+        // 2. 全局级别的代理（通过 FetchViaProxy 启用）
+        clientProxyURL = r.clientProxyURL
+    case r.proxyRotator != nil && r.proxyRotator.HasProxies():
+        // 3. 代理轮换池（最低优先级）
+        clientProxyURL = r.proxyRotator.GetNextProxy()
+    }
+}
+```
+
+**优先级**: `feed.ProxyURL`（feed 级） > `config.Opts.HTTPClientProxyURL()`（全局级，需 `feed.FetchViaProxy=true`） > `proxyRotator`（轮换池）
+
+#### 条目过滤规则覆盖
+
+**代码位置**: `processor.go:40-41`, `filter.go:74-87`
+
+```go
+// processor.go
+blockRules := filter.ParseRules(user.BlockFilterEntryRules, feed.BlockFilterEntryRules)
+allowRules := filter.ParseRules(user.KeepFilterEntryRules, feed.KeepFilterEntryRules)
+```
+
+```go
+// filter.go
+func ParseRules(userRules, feedRules string) filterRules {
+    rules := make(filterRules, 0)
+    // 先解析用户级规则
+    for line := range strings.SplitSeq(strings.TrimSpace(userRules), "\n") {
+        if valid, filterRule := parseRule(line); valid {
+            rules = append(rules, filterRule)
+        }
+    }
+    // 再解析 feed 级规则
+    for line := range strings.SplitSeq(strings.TrimSpace(feedRules), "\n") {
+        if valid, filterRule := parseRule(line); valid {
+            rules = append(rules, filterRule)
+        }
+    }
+    return rules
+}
+```
+
+**优先级**: 用户级和 feed 级规则**合并**（非覆盖），用户级规则先执行，feed 级规则后追加。
+
+`IsBlockedEntry` 中的判定顺序 (`filter.go:101-127`):
+
+1. **用户级 block filter 规则** (`user.BlockFilterEntryRules` + `feed.BlockFilterEntryRules` 合并)
+2. **Feed 级 blocklist 正则** (`feed.BlocklistRules`)
+3. **用户级 keep filter 规则** (`user.KeepFilterEntryRules` + `feed.KeepFilterEntryRules` 合并)
+4. **Feed 级 keeplist 正则** (`feed.KeeplistRules`)
+
+```
+判定流程:
+  用户 block filter 规则 → 匹配则阻止
+  Feed blocklist 正则    → 匹配则阻止
+  用户 keep filter 规则  → 不匹配则阻止
+  Feed keeplist 正则     → 不匹配则阻止
+  全部通过               → 允许
+```
+
+#### HTTP 缓存策略覆盖
+
+```go
+// handler.go:235
+ignoreHTTPCache := originalFeed.IgnoreHTTPCache || forceRefresh
+```
+
+**优先级**: `feed.IgnoreHTTPCache`（feed 级）或 `forceRefresh`（请求级）可以覆盖全局的默认缓存行为。
+
+#### HTTP/2 和 TLS 覆盖
+
+```go
+requestBuilder.
+    IgnoreTLSErrors(originalFeed.AllowSelfSignedCertificates).
+    DisableHTTP2(originalFeed.DisableHTTP2)
+```
+
+这些是 **feed 级独占配置**，没有全局级的对应项，只能在每个 feed 上单独设置。
+
+### 8.3 覆盖优先级汇总表
+
+| 配置项 | 全局级 | 用户级 | Feed 级 | 覆盖策略 |
+|--------|--------|--------|---------|----------|
+| User-Agent | `HTTP_CLIENT_USER_AGENT` | - | `feed.UserAgent` | Feed 级非空则覆盖全局 |
+| Proxy URL | `HTTP_CLIENT_PROXY` | - | `feed.ProxyURL` | Feed 级 > 全局(需 FetchViaProxy) > 轮换池 |
+| Proxy 轮换池 | `HTTP_CLIENT_PROXIES` | - | - | 无 feed 级覆盖 |
+| HTTP 缓存忽略 | - | - | `feed.IgnoreHTTPCache` | Feed 级覆盖默认缓存行为 |
+| TLS 证书验证 | - | - | `feed.AllowSelfSignedCertificates` | Feed 级独占 |
+| HTTP/2 禁用 | - | - | `feed.DisableHTTP2` | Feed 级独占 |
+| Cookie | - | - | `feed.Cookie` | Feed 级独占 |
+| 认证信息 | - | - | `feed.Username/Password` | Feed 级独占 |
+| Block/Keep 过滤 | - | `user.BlockFilterEntryRules` | `feed.BlockFilterEntryRules` | 合并（非覆盖），用户级先执行 |
+| 正则 Blocklist | - | - | `feed.BlocklistRules` | Feed 级独占 |
+| 正则 Keeplist | - | - | `feed.KeeplistRules` | Feed 级独占 |
+| Crawler (抓取原文) | - | - | `feed.Crawler` | Feed 级独占 |
+| 忽略条目更新 | - | - | `feed.IgnoreEntryUpdates` | Feed 级独占 |
+| 调度策略 | `POLLING_SCHEDULER` | - | - | 全局级，无 feed 级覆盖 |
+| 刷新间隔范围 | `SCHEDULER_*_INTERVAL` | - | - | 全局级，无 feed 级覆盖 |
+| 错误限制 | `POLLING_PARSING_ERROR_LIMIT` | - | - | 全局级，无 feed 级覆盖 |
+| 强制刷新间隔 | `FORCE_REFRESH_INTERVAL` | - | - | 全局级，会话级别限流 |
+| 条目阅读速度 | - | `user.DefaultReadingSpeed` | - | 用户级独占 |
+
+### 8.4 设计特点总结
+
+1. **Feed 级优先**: 几乎所有网络请求相关配置都可以在 feed 级别覆盖，因为不同源站可能需要不同的请求策略
+2. **用户级过滤合并**: 过滤规则采用合并而非覆盖策略，用户可以设置全局过滤，feed 可以追加更细粒度的过滤
+3. **全局级不可覆盖的**: 调度策略、间隔范围、错误限制等运维级别的配置无法被用户或 feed 级覆盖，确保系统稳定性
+4. **无用户级网络配置**: 代理、TLS、HTTP/2 等网络配置没有用户级别的设置，只有全局和 feed 级
+
+---
+
+## 九、Feed 内容增量更新与全量替换的判定逻辑
+
+### 9.1 核心问题
+
+当 Miniflux 从源站获取到 feed 内容后，需要决定对每个 entry 执行**新增**（INSERT）还是**更新**（UPDATE）。这个判定基于 entry 的 **hash** 值。
+
+### 9.2 Entry Hash 的生成
+
+Hash 是 entry 的唯一标识，在 feed 解析阶段生成。不同格式的 feed 有不同的 hash 生成策略：
+
+#### RSS 2.0 (`internal/reader/rss/adapter.go:123-138`)
+
+```go
+switch {
+case item.GUID.Data != "":
+    n := seenGUIDs[item.GUID.Data]
+    seenGUIDs[item.GUID.Data] = n + 1
+    switch {
+    case n == 0:
+        entry.Hash = crypto.SHA256(item.GUID.Data)           // 优先: GUID
+    case entry.URL != "":
+        entry.Hash = crypto.SHA256(item.GUID.Data + "|" + entry.URL)  // GUID 重复: GUID+URL
+    default:
+        entry.Hash = crypto.SHA256(item.GUID.Data + "|" + strconv.Itoa(n))  // 最后手段: GUID+序号
+    }
+case entryURL != "":
+    entry.Hash = crypto.SHA256(entryURL)                     // 无 GUID: URL
+default:
+    entry.Hash = crypto.SHA256(entry.Title + entry.Content)  // 无 GUID 无 URL: 标题+内容
+}
+```
+
+**关键**: RSS 规范要求 `<guid>` 唯一标识 item，但有些 feed 每个 item 使用相同的 GUID。Miniflux 通过 `seenGUIDs` 计数器检测重复 GUID，并用 URL 或序号消歧。
+
+#### Atom 1.0 (`internal/reader/atom/atom_10_adapter.go:149-155`)
+
+```go
+for _, value := range []string{atomEntry.ID, atomEntry.Links.originalLink()} {
+    if value != "" {
+        entry.Hash = crypto.SHA256(value)
+        break
+    }
+}
+```
+
+优先级: `atom:entry/id` > `atom:entry/link` (原始链接)
+
+#### JSON Feed (`internal/reader/json/adapter.go:175-181`)
+
+```go
+for _, value := range []string{item.ID, item.URL, item.ExternalURL, item.ContentText + item.ContentHTML + item.Summary} {
+    value = strings.TrimSpace(value)
+    if value != "" {
+        entry.Hash = crypto.SHA256(value)
+        break
+    }
+}
+```
+
+优先级: `id` > `url` > `external_url` > `content_text + content_html + summary`
+
+#### RDF/RSS 1.0 (`internal/reader/rdf/adapter.go:79`)
+
+```go
+entry.Hash = crypto.SHA256(hashValue)  // hashValue 来自 rdf:about 属性
+```
+
+### 9.3 增量更新判定流程
+
+**代码位置**: `internal/storage/entry.go:315-360` — `RefreshFeedEntries` 函数
+
+```go
+func (s *Storage) RefreshFeedEntries(userID, feedID int64, entries model.Entries, updateExistingEntries bool) (newEntries model.Entries, err error) {
+    for _, entry := range entries {
+        entry.UserID = userID
+        entry.FeedID = feedID
+
+        tx, err := s.db.Begin()
+
+        entryExists, err := s.entryExists(tx, entry)
+        // entryExists 查询: SELECT true FROM entries WHERE feed_id=$1 AND hash=$2 LIMIT 1
+
+        if entryExists {
+            if updateExistingEntries {
+                err = s.updateEntry(tx, entry)   // UPDATE: 增量更新
+            }
+            // 如果 updateExistingEntries == false，直接跳过，不做任何操作
+        } else {
+            err = s.createEntry(tx, entry)       // INSERT: 新增
+            switch {
+            case errors.Is(err, ErrEntryTombstoned):
+                err = nil                         // 墓碑条目，静默跳过
+            case err == nil:
+                newEntries = append(newEntries, entry)  // 记录新 entry 用于推送通知
+            }
+        }
+
+        tx.Commit()
+    }
+    return newEntries, nil
+}
+```
+
+#### 判定流程图
+
+```
+                         ┌─────────────────┐
+                         │  解析 entry      │
+                         │  计算 hash       │
+                         └────────┬────────┘
+                                  │
+                                  ▼
+                    ┌──────────────────────────┐
+                    │  SELECT FROM entries     │
+                    │  WHERE feed_id=? AND     │
+                    │        hash=?            │
+                    └──────────┬───────────────┘
+                               │
+                 ┌─────────────┴─────────────┐
+                 │                           │
+                 ▼                           ▼
+          entryExists=true           entryExists=false
+          (entry 已存在)              (entry 不存在)
+                 │                           │
+                 │                           ▼
+                 │                 ┌─────────────────────┐
+                 │                 │  INSERT INTO entries │
+                 │                 │  检查 entry_tombstones│
+                 │                 └──────────┬──────────┘
+                 │                            │
+                 │               ┌────────────┴────────────┐
+                 │               │                         │
+                 │               ▼                         ▼
+                 │        插入成功                  被 tombstone 阻止
+                 │        (新 entry)                (ErrEntryTombstoned)
+                 │        加入 newEntries            静默跳过
+                 │
+                 ▼
+        updateExistingEntries?
+           /          \
+         true        false
+          │            │
+          ▼            ▼
+    updateEntry()   跳过(不做任何操作)
+    更新 title,
+    content, url,
+    author, tags
+```
+
+### 9.4 `updateExistingEntries` 标志的判定
+
+**代码位置**: `handler.go:323`
+
+```go
+updateExistingEntries := forceRefresh || (!originalFeed.Crawler && !originalFeed.IgnoreEntryUpdates)
+```
+
+| forceRefresh | Crawler | IgnoreEntryUpdates | 结果 | 说明 |
+|:---:|:---:|:---:|:---:|------|
+| true | * | * | **true** | 强制刷新总是更新 |
+| false | true | * | **false** | Crawler 只抓新条目的原文 |
+| false | false | true | **false** | 显式忽略条目更新 |
+| false | false | false | **true** | 默认行为，更新已有条目 |
+
+**设计意图**:
+- `Crawler=true` 时，已有条目的内容是通过爬取原始网页获取的，RSS 中的内容可能更旧或不完整，因此不更新
+- `IgnoreEntryUpdates=true` 时，用户显式选择不更新已有条目（保留阅读进度等状态）
+- `forceRefresh=true` 时，无视以上规则强制更新
+
+### 9.5 updateEntry 更新了哪些字段
+
+**代码位置**: `entry.go:166-210`
+
+```go
+func (s *Storage) updateEntry(tx *sql.Tx, entry *model.Entry) error {
+    query := `
+        UPDATE entries SET
+            title=$1,
+            url=$2,
+            comments_url=$3,
+            content=$4,
+            author=$5,
+            reading_time=$6,
+            document_vectors = ...,
+            tags=$12
+        WHERE user_id=$9 AND feed_id=$10 AND hash=$11
+        RETURNING id
+    `
+}
+```
+
+**更新**: title, url, comments_url, content, author, reading_time, tags
+
+**不更新**: `published_at`（发布日期）、`status`（已读/未读状态）、`starred`（收藏）
+
+注释明确说明 (`entry.go:164-165`):
+
+> Note: we do not update the published date because some feeds do not contains any date, it default to time.Now() which could change the order of items on the history page.
+
+### 9.6 Entry Tombstone 机制：防止"僵尸"条目
+
+当条目被归档删除后，Miniflux 使用 `entry_tombstones` 表记录已删除条目的 `(feed_id, hash)` 对。
+
+**代码位置**: `entry.go:81-146`
+
+```go
+func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
+    query := `
+        INSERT INTO entries (...)
+        SELECT $1, $2, ...
+        WHERE NOT EXISTS (
+            SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+        )
+        RETURNING id, status, created_at, changed_at
+    `
+    // 如果被 tombstone 阻止，sql.ErrNoRows → ErrEntryTombstoned
+}
+```
+
+**关键特性**:
+1. `INSERT ... WHERE NOT EXISTS` 子查询使 tombstone 检查与插入操作**原子化**，消除了 TOCTOU（Time-of-Check to Time-of-Use）竞态
+2. `ArchiveEntries` (`entry.go:362-404`) 在删除旧条目的同时写入 tombstone
+3. `IsNewEntry` (`entry.go:278-293`) 同时检查 entries 表和 tombstones 表，确保 Crawler 不会对已删除条目做无用的网页抓取
+
+### 9.7 增量更新 vs 全量替换总结
+
+| 场景 | 行为 | 依据 |
+|------|------|------|
+| 新 entry (hash 不存在) | INSERT | `entryExists=false` |
+| 已有 entry + 默认配置 | UPDATE (title, content 等) | `updateExistingEntries=true` |
+| 已有 entry + Crawler=true | 跳过 | `updateExistingEntries=false` |
+| 已有 entry + IgnoreEntryUpdates=true | 跳过 | `updateExistingEntries=false` |
+| 已有 entry + forceRefresh=true | UPDATE | `updateExistingEntries=true` |
+| 已删除 entry (tombstone) | 静默跳过 | `WHERE NOT EXISTS` 原子检查 |
+| 条目发布日期 | 永不更新 | 防止排序混乱 |
+| 条目阅读状态 | 永不更新 | 保留用户状态 |
