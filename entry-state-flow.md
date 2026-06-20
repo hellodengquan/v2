@@ -2379,7 +2379,320 @@ func (s *Storage) WeeklyFeedEntryCount(userID, feedID int64) (int, error) {
 
 ---
 
-## 二十一、总结
+## 二十一、Entry 状态变更触发 Webhook 与第三方通知的代码链路
+
+### 21.1 核心结论：状态变更本身不触发通知，只有"Save"和"新条目推送"触发
+
+Miniflux 的 entry 状态（read/unread/starred）变更**不会**触发 Webhook 或邮件通知。触发通知的只有两类场景：
+
+| 触发场景 | 触发条件 | 通知类型 |
+|---------|---------|---------|
+| **Save Entry** | 用户点击"保存到第三方服务"按钮 | `save_entry` Webhook 事件 + 28 种第三方书签/稍后读服务推送 |
+| **New Entries Push** | Feed 刷新发现新条目 | `new_entries` Webhook 事件 + Telegram/Discord/Slack/Ntfy/Pushover/Matrix 等即时推送 |
+
+> **重要**：Miniflux **没有内置邮件通知功能**。邮件通知需通过 Apprise、Ntfy、Pushover 等第三方集成间接实现。
+
+### 21.2 Save Entry 的触发链路
+
+`integration.SendEntry()` 函数是 Save 通知的入口，被四个协议入口调用：
+
+**调用入口总览**：
+
+| 协议层 | 文件位置 | 调用方式 |
+|--------|---------|---------|
+| Web UI | `ui/entry_save.go:36` | `go integration.SendEntry(entry, userIntegrations)` |
+| REST API v1 | `api/entry_handlers.go:263` | `go integration.SendEntry(entry, settings)` |
+| Fever API | `fever/handler.go:458-460` | `go func() { integration.SendEntry(entry, settings) }()` |
+| Google Reader API | `googlereader/handler.go:311-316` | 循环每个 starred entry: `go func() { integration.SendEntry(e, settings) }()` |
+
+**Fever API 的 Save 触发上下文**（`fever/handler.go:442-460`）：
+
+```go
+case "saved":
+    h.store.ToggleStarred(userID, entryID)  // 先切换收藏状态
+    settings, _ := h.store.Integration(userID)
+    go func() {
+        integration.SendEntry(entry, settings)  // 再异步推送
+    }()
+```
+
+**Google Reader API 的 Save 触发上下文**（`googlereader/handler.go:296-316`）：
+
+```go
+if len(starredEntryIDs) > 0 {
+    h.store.SetEntriesStarredState(userID, starredEntryIDs, true)
+}
+// ...
+for _, entry := range entries {
+    e := entry
+    go func() {
+        integration.SendEntry(e, settings)  // 每个被收藏的条目都单独推送
+    }()
+}
+```
+
+### 21.3 New Entries Push 的触发链路
+
+Feed 刷新完成后，在 `reader/handler/handler.go:330-339` 中触发：
+
+```go
+userIntegrations, intErr := store.Integration(userID)
+if intErr != nil {
+    slog.Error("Fetching integrations failed; ...")
+} else if userIntegrations != nil && len(newEntries) > 0 {
+    go integration.PushEntries(originalFeed, newEntries, userIntegrations)
+}
+```
+
+关键细节：
+- **条件严格**：必须同时满足「集成配置获取成功」+「有新条目」才触发
+- **失败不阻断**：集成配置获取失败只打日志，不影响 Feed 刷新主流程
+- **异步执行**：所有推送都在 goroutine 中执行，不阻塞 HTTP 响应
+
+### 21.4 Webhook URL 覆盖优先级
+
+在 `integration.SendEntry()` 中（`integration/integration.go:422-428`）和 `integration.PushEntries()` 中（`integration/integration.go:536-542`），Webhook URL 有两级覆盖：
+
+```go
+var webhookURL string
+if entry.Feed != nil && entry.Feed.WebhookURL != "" {
+    webhookURL = entry.Feed.WebhookURL   // Feed 级配置优先
+} else {
+    webhookURL = userIntegrations.WebhookURL  // 回退到用户级配置
+}
+```
+
+**优先级链**：`Feed.WebhookURL` (per-Feed) > `Integration.WebhookURL` (per-User)
+
+### 21.5 Webhook 事件格式与签名
+
+两种事件类型定义在 `integration/webhook/webhook.go:24-26`：
+
+```go
+const (
+    NewEntriesEventType = "new_entries"
+    SaveEntryEventType  = "save_entry"
+)
+```
+
+**请求头**（`webhook.go:132-135`）：
+
+| Header | 含义 |
+|--------|------|
+| `Content-Type` | `application/json` |
+| `User-Agent` | `Miniflux/{version}` |
+| `X-Miniflux-Event-Type` | `new_entries` 或 `save_entry` |
+| `X-Miniflux-Signature` | SHA256 HMAC 签名，密钥为用户配置的 Webhook Secret |
+
+**安全性**：默认 Block 私有网络请求，除非 `INTEGRATION_ALLOW_PRIVATE_NETWORKS=true`（`webhook.go:137`）。
+
+### 21.6 第三方集成的触发范围
+
+`SendEntry()` 覆盖 28 种第三方服务：
+- 书签类：Pinboard、Shaarli、LinkAce、Linkding、LinkTaco、Linkwarden、Raindrop、Shiori、Espial、Cubox、Betula、Karakeep、Omnivore
+- 稍后读类：Instapaper、Wallabag、Notion、NunuxKeeper、Readeck、Readwise
+- 归档类：Archive.org
+- 通用 Webhook：用户自定义 URL
+
+`PushEntries()` 覆盖 8 种即时通知服务：
+- 聊天类：Telegram Bot、Discord、Slack、Matrix Bot
+- 推送类：Pushover、Ntfy
+- 通用通知：Apprise、Webhook
+
+---
+
+## 二十二、Entry Retention 配置覆盖优先级分析
+
+### 22.1 核心结论：没有 User-Level 或 Feed-Level Retention，只有全局配置
+
+经过对 User 模型、Feed 模型和 Storage 层的全面排查，Miniflux **不存在 per-User 或 per-Feed 的 entry retention 配置**。所有 retention 参数都是全局级别的，通过环境变量配置。
+
+### 22.2 全局配置参数
+
+定义在 `config/options.go:651-665`：
+
+| 环境变量 | 默认值 | Go 访问方法 | 含义 |
+|---------|-------|------------|------|
+| `CLEANUP_ARCHIVE_READ_DAYS` | 60 天 | `CleanupArchiveReadInterval()` | 已读条目的保留天数 |
+| `CLEANUP_ARCHIVE_UNREAD_DAYS` | 180 天 | `CleanupArchiveUnreadInterval()` | 未读条目的保留天数 |
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | `CleanupArchiveBatchSize()` | 每批删除的条目数 |
+| `CLEANUP_FREQUENCY_HOURS` | 24 小时 | `CleanupFrequency()` | 清理任务执行频率 |
+
+### 22.3 配置的消费点
+
+在 `cli/cleanup_tasks.go:16-58` 中直接使用全局 config，**不做任何 user/feed 级覆盖**：
+
+```go
+func runCleanupTasks(store *storage.Storage) {
+    // ...
+    store.ArchiveEntries(
+        model.EntryStatusRead,
+        config.Opts.CleanupArchiveReadInterval(),   // 直接取全局配置
+        config.Opts.CleanupArchiveBatchSize(),
+    )
+    store.ArchiveEntries(
+        model.EntryStatusUnread,
+        config.Opts.CleanupArchiveUnreadInterval(), // 直接取全局配置
+        config.Opts.CleanupArchiveBatchSize(),
+    )
+    // ...
+}
+```
+
+`ArchiveEntries` 函数签名（`storage/entry.go:363`）：
+```go
+func (s *Storage) ArchiveEntries(status string, interval time.Duration, limit int) (int64, error)
+```
+
+该函数没有 `userID` 参数，是**全表扫描删除**，不区分用户。
+
+### 22.4 唯一的 User-Level 清理操作：`FlushHistory`
+
+`FlushHistory(userID)`（`storage/entry.go:491-508`）是唯一按 user 区分的清理操作，但它是**用户主动触发的即时删除**，不涉及 retention 天数配置：
+
+```sql
+DELETE FROM entries
+WHERE user_id=$1 AND status=$2 AND starred is false AND share_code=''
+```
+
+它删除某个用户的**全部**非收藏、非分享的已读条目，没有时间窗口参数。
+
+### 22.5 配置优先级总结
+
+```
+全局环境变量 (CLEANUP_ARCHIVE_*)
+    └──► cli/cleanup_tasks.go 直接消费
+            └──► storage.ArchiveEntries() 全表删除
+                    └──► 无 per-User / per-Feed 覆盖
+```
+
+**User 模型相关字段核查**（`model/user.go:12-46`）：无任何 retention / archive_days 字段。
+**Feed 模型相关字段核查**（`model/feed.go:24-77`）：无任何 retention / archive_days 字段。
+
+> 设计意图：Miniflux 将 entry 保留策略视为服务器运维层面的全局配置（类似数据库磁盘配额），而非用户偏好。不同用户如果需要不同保留策略，需部署多个独立实例。
+
+---
+
+## 二十三、Archive Entry 与活跃 Entry 的查询合并路径
+
+### 23.1 核心结论：Miniflux 没有"归档状态"，Archive = 物理删除
+
+这是理解该问题的关键：Miniflux 的 entry **只有两种状态**（`model/entry.go:11-16`）：
+
+```go
+const (
+    EntryStatusUnread = "unread"
+    EntryStatusRead   = "read"
+)
+```
+
+**不存在 `archived` 状态**。所谓的"归档"（Archive）在代码中就是**物理 DELETE**，不是软删除。被 Archive 的条目从 `entries` 表中永久消失，只在 `entry_tombstones` 表留下 (feed_id, hash) 记录防止爬虫重新摄入。
+
+### 23.2 Entry 查询的唯一来源：`entries` 表
+
+所有 entry 查询都走 `EntryQueryBuilder`，其核心 SQL（`storage/entry_query_builder.go:291-342`）只查一张表：
+
+```sql
+SELECT e.id, e.status, e.starred, ...
+FROM entries e
+INNER JOIN feeds f ON f.id=e.feed_id
+INNER JOIN categories c ON c.id=f.category_id
+-- JOIN 其他关联表...
+WHERE e.user_id = $1 AND [其他条件]
+```
+
+没有 `archived_entries` 表、没有 `status='archived'` 过滤条件、也没有 UNION 合并两张表。
+
+### 23.3 用户感知的"归档页"实现方式
+
+用户在 UI 中看到的"历史记录"（History）页面，实际上是**过滤 `status='read'`** 的查询结果，不是从独立的归档存储读取：
+
+查询构建器的状态过滤方法（`entry_query_builder.go:147-157`）：
+
+```go
+func (e *EntryQueryBuilder) WithStatuses(statuses ...string) *EntryQueryBuilder {
+    if len(statuses) == 1 {
+        e.conditions = append(e.conditions, fmt.Sprintf("e.status = $%d", len(e.args)+1))
+        e.args = append(e.args, statuses[0])
+    } else if len(statuses) > 1 {
+        e.conditions = append(e.conditions, fmt.Sprintf("e.status = ANY($%d)", len(e.args)+1))
+        e.args = append(e.args, pq.StringArray(statuses))
+    }
+    return e
+}
+```
+
+**各视图的状态过滤参数**：
+
+| UI 视图 | WithStatuses 参数 | 实际含义 |
+|--------|------------------|---------|
+| Unread (未读) | `WithStatuses("unread")` | 未读条目 |
+| History (历史) | `WithStatuses("read")` | 已读条目（即用户感知的"归档"） |
+| Starred (收藏) | 无状态过滤 + `WithStarred(true)` | 收藏条目（无论读/未读） |
+| All (全部) | 无状态过滤（等价于 unread + read） | 所有未删除条目 |
+
+### 23.4 收藏条目对清理的豁免
+
+`ArchiveEntries`（自动清理）和 `FlushHistory`（手动清理）都豁免收藏条目：
+
+```sql
+-- ArchiveEntries: storage/entry.go:372-375
+WHERE status=$1
+  AND starred is false      -- 跳过收藏
+  AND share_code=''         -- 跳过已分享
+  AND created_at < now() - $2::interval
+
+-- FlushHistory: storage/entry.go:496
+WHERE user_id=$1 AND status=$2 AND starred is false AND share_code=''
+```
+
+因此**收藏条目永远存在于 `entries` 表中**，直到用户主动取消收藏且过了 retention 周期才会被清理。这就是"收藏夹"视图能查到久远条目的原因——它们从未被归档删除。
+
+### 23.5 聚合查询同样不区分 Archive/Active
+
+Per-Feed 计数（`storage/feed_query_builder.go`）和 Per-Category 计数（`storage/category.go`）同样只查 `entries` 表：
+
+```sql
+SELECT e.feed_id, e.status, count(*)
+FROM entries e
+WHERE e.user_id = $1 AND e.status IN ('unread', 'read')
+GROUP BY e.feed_id, e.status
+```
+
+被物理删除的条目自然不会出现在计数中。**不存在单独的"已归档计数"**。
+
+### 23.6 查询合并路径全景
+
+```
+                        ┌─────────────────────┐
+                        │    entries 表        │
+                        │  (唯一数据来源)      │
+                        └─────────┬───────────┘
+                                  │
+                ┌─────────────────┼─────────────────┐
+                ▼                 ▼                 ▼
+     WithStatuses(unread)  WithStatuses(read)   WithStarred(true)
+         (未读视图)           (历史视图)           (收藏视图)
+                │                 │                 │
+                └─────────────────┴─────────────────┘
+                                  │
+                                  ▼
+                        EntryQueryBuilder.GetEntries()
+                     (单次查询，无 UNION，无合并)
+                                  │
+                                  ▼
+                              UI 渲染
+```
+
+**关键点**：
+- 没有"Archive 表"→"Active 表"的合并，所有数据都在同一张 `entries` 表中
+- 归档 = 物理 DELETE，归档后的数据不可查询
+- 历史视图本质是 `status='read'` 过滤，不是查询"归档区"
+- 收藏条目通过 `starred is false` 条件豁免清理，实现"永久保存"
+
+---
+
+## 二十四、总结
 
 ### 状态同步的核心设计原则
 
@@ -2415,6 +2728,12 @@ func (s *Storage) WeeklyFeedEntryCount(userID, feedID int64) (int, error) {
 
 11. **聚合查询的实时一致性**：Per-Feed 和 Per-Category 计数均为实时 `GROUP BY` 查询，无计数器表、无缓存、无触发器。状态变更提交后，下次聚合查询立即可见。使用覆盖索引（`entries_user_status_feed_idx`）实现 Index Only Scan，保证查询性能。
 
+12. **状态变更不触发通知**：Entry 的 read/unread/starred 状态变更不会触发 Webhook 或第三方通知。只有两类事件会触发通知：用户主动 Save Entry（`save_entry` 事件）和 Feed 刷新发现新条目（`new_entries` 事件）。Webhook URL 支持 per-Feed 覆盖 per-User 配置。
+
+13. **Retention 配置为全局运维参数**：entry 保留天数是服务器级全局配置（环境变量 `CLEANUP_ARCHIVE_*`），不支持 per-User 或 per-Feed 覆盖。`ArchiveEntries` 是全表删除，不区分用户。唯一的用户级清理是 `FlushHistory`，但它是即时手动操作，不涉及 retention 天数。
+
+14. **无归档状态，Archive = 物理删除**：entry 只有 `unread` 和 `read` 两种状态，不存在 `archived` 软删除状态。"归档"就是物理 DELETE，被删条目仅在 `entry_tombstones` 留痕防止复活。UI 中的"历史记录"页面本质是 `status='read'` 过滤，不是查询独立归档存储。收藏条目（`starred=true`）被清理逻辑豁免，实现"永久保存"。
+
 ### 注意事项与潜在问题
 
 - **Fever 收藏翻转风险**：`saved`/`unsaved` 操作使用 `ToggleStarred` 而非显式 `SetEntriesStarredState`，存在客户端重复调用时状态意外翻转的风险（`fever/handler.go:447,466`）。代码已经 SELECT 了 entry 但未做条件判断，是可修复的缺陷。
@@ -2434,3 +2753,9 @@ func (s *Storage) WeeklyFeedEntryCount(userID, feedID int64) (int, error) {
 - **清理调度无并发保护**：`cleanupScheduler` 使用 `time.Tick` 驱动，如果上一轮清理未完成，下一轮会并发执行。虽然数据层面受 `FOR UPDATE SKIP LOCKED` 保护无冲突，但可能产生不必要的资源消耗。
 
 - **聚合查询的非即时性**：标记已读后，导航栏未读计数即时更新（通过返回值），但侧边栏 Feed 列表和分类列表的计数**不会即时更新**，需要刷新页面或重新进入列表页才能看到变化。
+
+- **Save 通知无状态关联**：Fever 的 `saved` 操作使用 `ToggleStarred` 切换收藏后立即触发 `SendEntry`，但发送的 entry 是 Toggle 之前查询的，`entry.Starred` 字段可能与数据库实际状态不一致。同样，Google Reader 批量标记收藏时，SendEntry 使用的是变更前的 entry 对象，状态字段不保证同步。
+
+- **通知推送无重试机制**：所有第三方集成推送（Webhook、Telegram、Pushover 等）都是 fire-and-forget 的 goroutine，无失败重试、无持久化队列、无死信处理。第三方服务临时不可用时，该次推送永久丢失。
+
+- **无 per-User Retention 带来的多租户风险**：`ArchiveEntries` 是全表删除，不区分用户。多用户部署场景下，所有用户共享同一保留周期。重度用户和轻度用户的历史条目保留时间完全相同，无法个性化。如果某用户希望永久保留已读条目，只能通过"全部收藏"这种非预期用法实现。
