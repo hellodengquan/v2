@@ -1105,9 +1105,327 @@ if config.Opts.DisableLocalAuth() {
 
 此外还检查用户是否有密码（`hasPassword`），没有密码则不允许 unlink。这防止了用户在唯一的登录方式是 OAuth2 的情况下解绑后无法登录。但这个保护与"登录页跳转"是两个独立的安全机制。
 
-## 十一、设计决策总结与潜在问题
+---
 
-### 11.1 为什么没有 Token 缓存和刷新？
+## 十一、深度补全：多 Provider 串行场景下已成功写入的回滚清理路径
+
+### 11.1 问题拆解："已成功 Provider 的 token 写入"具体指什么？
+
+在分析回滚路径之前，必须明确：Miniflux 的代码架构中，不存在"多个 Provider 串行 refresh token 并写入数据库"的操作场景。这个问题需要拆分为两个独立场景：
+
+- **场景 A：OAuth2 用户登录/绑定流程** —— 涉及多个数据库写入步骤（创建用户、创建分类、创建 integration 行、更新用户 profile ID、写入 session、更新 last_login），可能有部分成功部分失败
+- **场景 B：PushEntries/SendEntry 向多个第三方集成推送** —— 22 个集成串行调用，部分成功部分失败，但**没有任何数据库 token 写入**（集成 token 是预先静态存储的）
+
+两者的回滚机制完全不同。
+
+### 11.2 场景 A：OAuth2 Callback 多步骤写入的事务/回滚分析
+
+**代码路径：** `oauth2_callback.go:19-155` 的 `oauth2Callback()` 函数。
+
+这个流程包含多个独立的数据库写入操作，**逐一检查每个操作失败后的回滚：**
+
+**子场景 A1：新建用户（未登录状态下 OAuth2 首次登录）**
+
+```
+oauth2Callback()
+  ├── authProvider.Profile()                     // 远程 API 调用（不可回滚）
+  ├── h.store.UserByField()                      // 只读查询
+  ├── h.store.UserExists()                       // 只读查询
+  ├── h.store.CreateUser(userCreationRequest)    // 第一个写操作
+  │   └── storage/user.go:58-170
+  │       ├── tx = s.db.Begin()                  // ← 开启事务
+  │       ├── INSERT INTO users (...)            // 步骤1
+  │       │   └── 失败 → tx.Rollback() → return error
+  │       ├── INSERT INTO categories (All)       // 步骤2
+  │       │   └── 失败 → tx.Rollback() → return error
+  │       ├── INSERT INTO integrations (空行)    // 步骤3
+  │       │   └── 失败 → tx.Rollback() → return error
+  │       └── tx.Commit()                        // 三操作原子提交
+  │
+  ├── h.store.SetLastLogin(user.ID)              // 第二个写操作（独立 Exec！）
+  │   └── UPDATE users SET last_login_at=now()
+  │       └── 失败 → 500 HTMLServerError
+  │           ↑ **用户已被创建，但 last_login 未更新，无回滚**
+  │
+  └── authenticateWebSession()                   // 第三个写操作（独立 Exec！）
+      ├── session.Rotate()
+      ├── store.RotateWebSession(oldID, session) // UPDATE web_sessions
+      │   └── 失败 → 500 HTMLServerError
+      │       ↑ **用户已创建 + last_login 已更新，但 session 未轮换，无回滚**
+      └── setSessionCookie()
+```
+
+**关键发现：** `CreateUser()` 内部是有事务的（三个 INSERT 原子执行），但**事务边界只限于 CreateUser 内部**。后续的 `SetLastLogin()` 和 `authenticateWebSession()` 是独立的 `db.Exec` 调用，不在事务内。
+
+如果 `SetLastLogin()` 失败：
+- `users` 行已存在（已提交）
+- `categories` 行已存在（已提交）
+- `integrations` 行已存在（已提交）
+- `last_login_at` 仍为 NULL
+- **没有自动清理回滚用户**——用户账户"孤儿化"存在于数据库中
+
+如果 `authenticateWebSession()` 失败（`RotateWebSession` 失败）：
+- 用户已创建、last_login 已更新
+- Web session 中的 `user_id` 尚未绑定（因为 Rotate 中包含 UPDATE ... user_id）
+- 用户被重定向到 500 错误页
+- **下次重试 OAuth2 登录时，`UserByField()` 能查到已创建的用户，继续走已有用户的路径**
+
+**子场景 A2：绑定已登录用户（Settings 页面链接 OAuth2 账户）**
+
+```
+oauth2Callback()
+  ├── h.store.UserByID(request.UserID(r))        // 只读
+  ├── h.store.AnotherUserWithFieldExists()       // 只读
+  ├── authProvider.PopulateUserWithProfileID()   // 修改内存中 user 对象
+  └── h.store.UpdateUser(loggedUser)             // 单一 UPDATE
+      └── UPDATE users SET google_id=$2, openid_connect_id=$3, ... WHERE id=$1
+          └── 失败 → 500 HTMLServerError
+              ↑ **只是单条 UPDATE，事务性由数据库保证**
+```
+
+绑定场景只有一个写操作，不存在"部分成功部分失败"的多步骤问题。
+
+### 11.3 场景 B：PushEntries/SendEntry 部分成功的回滚——不存在"token 写入撤销"
+
+**核心事实：PushEntries/SendEntry 不写入任何集成 token。**
+
+集成 token 是用户在 Settings 页面提交时通过 `UpdateIntegration()` 一次性写入数据库的。`PushEntries/SendEntry` 只是**读取**这些 token，用于发起 HTTP 请求。
+
+因此，"已成功 Provider 的 token 写入撤销"这个场景在代码中**根本不存在**：
+
+| 概念 | 代码中的事实 |
+|---|---|
+| 串行 refresh | 22 个集成串行调用，但没有任何一个做 token refresh（都是静态 token 或每次重取） |
+| token 写入 | PushEntries/SendEntry 中没有数据库写入 |
+| 部分成功 | 只是部分第三方 API 调用成功、部分失败 |
+| 回滚清理 | 不需要——没有产生本地状态变更，也就没有需要撤销的写入 |
+
+```go
+// integration.go — 典型模式
+if userIntegrations.WallabagEnabled {
+    if err := wallabag.CreateEntry(...); err != nil {
+        slog.Error(...)  // 只记录日志，不写数据库
+    }
+}
+if userIntegrations.NotionEnabled {
+    if err := notion.UpdateDocument(...); err != nil {
+        slog.Error(...)  // 即使 Wallabag 成功 Notion 失败，也不需要撤销 Wallabag
+    }
+}
+```
+
+**值得注意的边界情况：** 如果 Wallabag 推送成功（条目已保存到 Wallabag 服务器），Notion 推送失败，代码中**不会回滚 Wallabag 端已创建的条目**——因为这需要调用 Wallabag 的 DELETE API，而所有集成客户端都没有实现删除/回滚操作。
+
+### 11.4 storage 层事务使用范围
+
+代码库中使用事务（`db.Begin()` / `tx.Rollback()` / `tx.Commit()`）的地方仅有以下四处：
+
+| 位置 | 事务范围 | 作用 |
+|---|---|---|
+| `database/database.go:22-48` | 单次迁移 + schema_version 更新 | 数据库迁移的原子执行 |
+| `storage/user.go:105-166` | INSERT users + INSERT categories + INSERT integrations | **CreateUser 内部的三行原子创建** |
+| `storage/icon.go:101-142` | SELECT/INSERT icons + DELETE/INSERT feed_icons | Feed 图标去重与关联 |
+| `storage/entry.go` / `feed.go` / `category.go` / `enclosure.go` | 各有独立事务 | Feed 刷新、条目创建等批量操作 |
+
+**没有任何事务跨越"集成 token 写入"与其他操作。**
+
+### 11.5 小结：回滚清理路径的真实情况
+
+| 场景 | 回滚机制 | 部分成功的后果 |
+|---|---|---|
+| CreateUser 内部三操作 | **有事务回滚**（tx.Rollback） | 三操作要么全成功要么全失败 |
+| OAuth2 callback 中 CreateUser → SetLastLogin → authenticateWebSession | **无跨步骤回滚** | 用户可能被创建但未绑定 session（需重新登录） |
+| UpdateUser（绑定 OAuth2） | **单条 UPDATE，数据库自身原子** | 无部分成功问题 |
+| PushEntries/SendEntry 多集成调用 | **不涉及数据库写入，无需回滚** | 部分第三方 API 调用永久成功，无回滚 |
+| UpdateIntegration（用户保存配置） | **单条 UPDATE，数据库自身原子** | 无部分成功问题 |
+
+---
+
+## 十二、深度补全：ActivityPub Provider 的 Token 失效检测路径与 OAuth Provider 的对比
+
+### 12.1 代码事实：ActivityPub 相关实现完全不存在
+
+全库搜索 `mastodon`、`pleroma`、`activitypub` 三个关键词**零命中**。进一步确认：
+
+- `internal/integration/` 目录下有 20+ 个子目录（wallabag、shaarli、matrixbot、telegrambot 等），**没有 mastodon/pleroma/activitypub 目录**
+- `model/integration.go` 的结构体中没有 `MastodonEnabled` / `PleromaToken` / `ActivityPubEndpoint` 等字段
+- `storage/integration.go` 的 SQL 中没有 Mastodon/Pleroma 列
+- `database/migrations.go` 中没有 Mastodon/Pleroma 相关 DDL
+- `oauth2/manager.go` 的 `NewManager()` switch 只处理 `"oidc"` 和 `"google"`
+
+**因此，不存在"ActivityPub provider 的 token 失效检测路径"。** 代码中没有这个 Provider，也就谈不上与 OAuth Provider 的一致性对比。
+
+### 12.2 对比分析：如果接入 ActivityPub，失效检测路径会怎样？
+
+虽然代码中不存在，但可以基于 OAuth Provider（Google/OIDC）的现有失效检测模式来推演对比：
+
+| 失效检测维度 | 当前 OAuth Provider 的模式 | 如果接入 ActivityPub 会走什么模式 |
+|---|---|---|
+| **Web Session 层面** | `WebSessionByID()` → nil → 视为失效 → 创建新 session → 跳转登录 | **相同**：Session 失效检测与 Provider 类型无关，完全是 Miniflux 内部机制（见第十章） |
+| **OAuth2 access_token 层面** | ❌ **不检测**：Miniflux 只在 callback 时用一次 code 换 profile，之后不持有 access_token/refresh_token | **大概率相同**：如果 Mastodon 走用户自行填入 `access_token`（像 Notion 那样的模式），则不做 token 有效性检测，失败时只看 HTTP 状态码 |
+| **第三方 API 调用层面** | OAuth2 provider 本身不参与 Miniflux 对第三方服务的推送调用 | 如果 Mastodon 作为**推送目标**（类似 Telegram），则失效检测看 HTTP 401 → slog.Error → 无回退 |
+| **OAuth2 callback 失败** | `authProvider.Profile()` 失败 → 重定向到 `/`（首页，公开路由） | **相同**：如果实现 ActivityPub OAuth2，callback 失败也会走同样的重定向路径 |
+| **instance domain 不可达** | ❌ **不存在此场景**：Google/OIDC 是中心化服务，不涉及用户自定义的 instance domain | 如果有 Mastodon，instance 不可达会在 `client.Do()` 时返回连接错误 → 记录 slog.Error → 流程终止（无重试） |
+
+### 12.3 instance domain 不可达场景的具体推演
+
+对于支持自定义 instance domain 的 ActivityPub 客户端（如 Mastodon/Pleroma），domain 不可达的典型失败路径如下（基于现有 HTTP 客户端模式）：
+
+```
+Mastodon.CreatePost(entry.URL, entry.Title)
+  ├── client.NewClientWithOptions({Timeout: 10s, BlockPrivateNetworks: true})
+  │   └── http.Client { Timeout: 10 * time.Second }
+  ├── http.NewRequest("POST", "https://{mastodon_instance}/api/v1/statuses", body)
+  └── httpClient.Do(request)
+      ├── DNS 解析失败
+      │   └── &net.DNSError → fmt.Errorf("mastodon: unable to send request: %v") → slog.Error
+      ├── TCP 连接超时（10s）
+      │   └── context.DeadlineExceeded → 同上
+      ├── TLS 握手失败
+      │   └── tls.RecordHeaderError / x509.UnknownAuthorityError → 同上
+      └── HTTP 401 Unauthorized（instance 返回但 token 已失效）
+          └── fmt.Errorf("mastodon: unable to send request, status=%d") → slog.Error
+```
+
+与现有 OAuth Provider（Google/OIDC）的区别：
+
+- **Google/OIDC**：domain 是硬编码的（`https://accounts.google.com` / OIDC discovery endpoint 配置的），Miniflux 管理员配置；**不可达时是系统级故障**——所有用户都无法使用 OAuth2 登录
+- **ActivityPub**：domain 是每个用户单独配置的 instance（`mastodon.social`、`hachyderm.io` 等）；**不可达时是用户级故障**——只影响该用户的推送
+
+但两者的**错误处理模式完全一致**：无论是系统级的 Google 服务不可达，还是用户级的 Mastodon instance 不可达，代码都是：
+1. HTTP 客户端返回 error
+2. 封装成 `fmt.Errorf("xxx: unable to ...")`
+3. 调用方 `slog.Error/Warn`
+4. 流程终止，无重试、无标记失效、无用户通知
+
+### 12.4 与现有所有集成的失效检测路径完全一致
+
+总结：虽然 ActivityPub provider 不存在于代码中，但其 token 失效和 instance 不可达的处理模式，如果按照代码库的现有设计风格实现，**会与 OAuth Provider 和所有 22 个集成的失效检测路径保持完全一致**——即仅通过 HTTP 客户端的返回值判断，没有专门的 token 健康检查、没有 instance reachability probe、没有预检测、没有回退重试。
+
+---
+
+## 十三、深度补全：AES 加密密钥来源是否支持 KMS/Vault 等 Secret Manager
+
+### 13.1 代码事实：不存在任何 KMS/Vault/Secrets Manager 集成
+
+从多个维度交叉验证：
+
+**维度一：直接关键词搜索——零有效命中**
+
+| 关键词 | 搜索结果 |
+|---|---|
+| `kms` / `KMS` | 零命中 |
+| `vault` / `Vault` / `hashicorp` | 零命中（排除文档本身） |
+| `secretsmanager` / `secret_manager` | 零命中 |
+| `aws.*secret` / `aws_ssm` | 零命中（go.sum 中的 transitive dependency 不代表使用） |
+| `gcp.*secret` / `azure.*vault` | 零命中 |
+
+**维度二：go.mod / go.sum 中没有 KMS/Vault 相关依赖**
+
+Go module 的直接依赖中不包含：
+- `github.com/hashicorp/vault/api`
+- `github.com/aws/aws-sdk-go-v2/service/secretsmanager`
+- `github.com/aws/aws-sdk-go-v2/service/kms`
+- `cloud.google.com/go/secretmanager`
+- `github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azsecrets`
+
+这些包在 go.sum 中的可能出现只能是 transitive dependency（通过其他库间接引入），**不代表 Miniflux 实际使用了它们**。
+
+**维度三：配置系统没有 Secret Provider 抽象**
+
+`internal/config/` 包的配置解析只支持三种来源：
+1. **环境变量**（优先）
+2. **命令行 flag**（其次）
+3. **配置文件**（最后，通过 `--config` flag 指定）
+
+配置项的解析流程在 `config/parser.go:48-68`：
+
+```go
+// 伪代码还原
+func NewConfigParser() *configParser {
+    cp := &configParser{options: newDefaultConfigOptions()}
+    cp.parseFlags()        // 解析命令行参数
+    cp.parseConfigFile()   // 读取配置文件
+    cp.parseEnvVariables() // 覆盖环境变量
+    cp.validate()          // 校验（如 OAUTH2_PROVIDER=oidc 需要 discovery endpoint）
+    return cp
+}
+```
+
+**没有 `lookupSecret` / `fetchFromKMS` / `resolveVaultPath` 这类 hook。** 配置值就是字符串字面量，不做任何二次解析。
+
+### 13.2 当前所有 secret 类配置项的来源方式
+
+以下是代码中所有 `secret: true` 的配置项及其实际存储/读取方式：
+
+| 配置项 | 来源支持 | 加密/解密 |
+|---|---|---|
+| `ADMIN_PASSWORD` | env / flag / file | 明文 → 首次运行时 bcrypt 哈希存入 DB |
+| `DATABASE_URL` | env / flag / file | 明文 → 直接传给 `sql.Open()` |
+| `AUTH_PROXY_HEADER_SECRET` | env / flag / file | 明文 → 用于 HMAC 验证 |
+| `OAUTH2_CLIENT_SECRET` | env / flag / file | 明文 → 传给 `oauth2.Config{ClientSecret}` |
+| `HTTPS_CERT_FILE` | env / flag / file | 文件路径（非 secret 内容） |
+| `HTTPS_KEY_FILE` | env / flag / file | 文件路径（非 secret 内容） |
+| `WEB_PASSPHRASE` | env / flag / file | 明文 → WebAuthn 相关 |
+
+所有配置项都只支持三种原生来源（env/flag/file），**没有任何 secret:/// arn:aws:kms:/// vault:/// 之类的 URI scheme 解析**。
+
+### 13.3 加密密钥不存在，KMS/Vault 集成也就无意义
+
+回到 AES-256 加密密钥的话题——第九章和第八章已经 100% 确认：
+- 代码库中**没有对称加密基础设施**（没有 AES、没有 cipher、没有 encrypt/decrypt 函数）
+- 集成 token 以明文形式存储在 PostgreSQL 的 `integrations` 表中
+- 不存在任何加密密钥（KEK/DEK）的配置项
+
+因此，"KMS/Vault 作为加密密钥来源"这个问题的**前提不成立**——没有加密密钥，就不存在"密钥从哪里来"的问题，更谈不上"从 KMS/Vault 获取密钥"。
+
+### 13.4 如果未来要支持 KMS/Vault，需要构建的基础设施
+
+假设 Miniflux 未来要实现：
+1. 集成 token 应用层加密（AES-256-GCM）
+2. 从 KMS/Vault 获取加密密钥
+
+需要实现的组件清单：
+
+| 层级 | 需要的组件 | 当前状态 |
+|---|---|---|
+| **Secret Provider 接口** | `type SecretProvider interface { Get(key string) ([]byte, error) }` | ❌ 不存在 |
+| **Vault Provider** | 实现 `hashicorp/vault/api` 的逻辑逻辑读取 | ❌ 不存在 |
+| **AWS KMS Provider** | 实现 `aws-sdk-go-v2/service/kms` 的加密切钥解包 | ❌ 不存在 |
+| **GCP Secret Manager** | 实现 `secretmanager` 客户端 | ❌ 不存在 |
+| **配置 URI 解析** | 解析 `vault://secret/data/miniflux` 格式的配置值 | ❌ 不存在 |
+| **对称加密层** | `Encrypt(plaintext, key)` / `Decrypt(ciphertext, key)`（AES-GCM） | ❌ 不存在 |
+| **SQL Transparent Layer** | `sql.Scanner` / `driver.Valuer` 自动加解密 | ❌ 不存在 |
+| **密钥版本管理** | `key_id` / `encryption_version` 字段 + 数据迁移 | ❌ 不存在 |
+| **密钥轮换调度** | 定时任务重加密旧数据 | ❌ 不存在 |
+
+这些组件在当前代码库中**全部缺失**，需要从零构建。
+
+### 13.5 间接方式：通过部署环境实现 KMS/Vault
+
+虽然 Miniflux 应用层不支持 KMS/Vault，但部署层面有两种"间接"方式：
+
+**方式一：Vault Agent / Consul Template**
+
+通过 sidecar 模式运行 Vault Agent，将 secret 渲染到本地文件，Miniflux 通过 `--config` 读取该文件：
+```
+Vault → Vault Agent → /etc/miniflux/secrets.conf → Miniflux --config /etc/miniflux/secrets.conf
+```
+这是部署层面的方案，Miniflux 代码层面完全无感知，仍走原生的"配置文件解析"路径。
+
+**方式二：PostgreSQL pgcrypto + TDE**
+
+在 PostgreSQL 层面启用：
+- `pgcrypto` 扩展：`pgp_sym_encrypt()` / `pgp_sym_decrypt()` 列级加密（需要修改 SQL，但代码不需要了解 KMS）
+- Transparent Data Encryption（TDE）：文件系统级磁盘加密（PostgreSQL 16+ 或云厂商 RDS 自带）
+
+这些都是数据库层面的方案，Miniflux 应用层同样无感知。
+
+**但这两种方式都属于"绕过"应用层加密的外部方案，不是代码层面的实现。**
+
+## 十四、设计决策总结与潜在问题
+
+### 14.1 为什么没有 Token 缓存和刷新？
 
 Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每次请求都重新获取 token（类型 B）或本地生成 token（类型 C）。这带来了：
 
@@ -1121,7 +1439,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 - 对第三方服务造成不必要的认证负载（特别是 Matrix 的设备注册问题）
 - Wallabag 集成忽略了 refresh_token，无法利用 OAuth2 的标准刷新机制
 
-### 11.2 潜在问题
+### 14.2 潜在问题
 
 1. **Wallabag 的 `grant_type=password`**：OAuth2 规范中，Resource Owner Password Grant 已被废弃（RFC 6819），且每次都走密码授权而非 refresh_token，既不安全也不高效
 2. **Matrix 设备累积**：每次推送都通过 `m.login.password` 登录，Matrix 服务端会为每次登录创建一个新的 device session，长期运行可能产生大量设备
@@ -1129,7 +1447,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 4. **无集成健康状态**：Token 失效不会反馈到 UI，用户无法感知集成是否正常工作
 5. **Ntfy 的认证优先级**：当 API Token 和用户名密码同时设置时，两者都会被加到请求头，而非互斥回退
 
-### 11.3 与 Web Session 轮换的对比
+### 14.3 与 Web Session 轮换的对比
 
 Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"防 session fixation 的机制，但它也缺少：
 - 滚动续期（每次活跃使用时延长有效期）
@@ -1138,7 +1456,7 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 
 ---
 
-## 十二、代码文件索引
+## 十五、代码文件索引
 
 | 文件路径 | 作用 |
 |---|---|
@@ -1182,3 +1500,7 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 | `internal/config/parser.go` | 配置解析（含 OAUTH2_PROVIDER 校验） |
 | `internal/template/functions.go` | 模板函数 hasOAuth2Provider |
 | `internal/template/templates/views/login.html` | 登录页模板（OAuth2 按钮显隐逻辑） |
+| `internal/storage/user.go` | 用户存储（CreateUser 内部事务：users+categories+integrations） |
+| `internal/storage/icon.go` | Feed 图标存储（事务使用示例） |
+| `internal/database/database.go` | 数据库迁移（唯一显式使用 tx.Rollback 的业务层） |
+| `internal/config/parser.go` | 配置解析（env/flag/file 三来源解析流程） |
