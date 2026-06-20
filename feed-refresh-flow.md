@@ -1851,3 +1851,774 @@ Worker A (refresh)                Worker B (archive)
                                     
 结果: 原子检查阻止了已删除条目的复活。
 ```
+
+---
+
+## 十三、Feed 抓取的 Timeout 分级策略与分支
+
+### 13.1 Timeout 层级总览
+
+Miniflux 的 HTTP 超时并非单一值，而是在三个不同层级上分别控制的分级策略：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  层级 1: http.Client.Timeout（全局请求超时）                        │
+│  - 从 DNS 解析到响应读取完毕的总时间上限                            │
+│  - 包含所有 TCP/TLS 握手 + 服务器处理 + 响应读取                    │
+│  - Feed 抓取: 20s (HTTP_CLIENT_TIMEOUT)                             │
+│  - Media 代理: 120s (MEDIA_PROXY_HTTP_CLIENT_TIMEOUT)               │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  层级 2: net.Dialer.Timeout（连接建立超时）                         │
+│  - 仅控制 TCP 连接建立阶段                                         │
+│  - 直连/代理均使用 10s                                             │
+│  - 硬编码在 request_builder.go:159-167                              │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  层级 3: http.Transport.IdleConnTimeout（空闲连接超时）             │
+│  - 控制 Transport 连接池中空闲连接的保活时间                        │
+│  - 固定 10s（默认 90s）                                            │
+│  - 硬编码在 request_builder.go:197                                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 层级 1: http.Client.Timeout 的分级
+
+**代码位置**: `request_builder.go:240-242`
+
+```go
+client := &http.Client{
+    Timeout: r.clientTimeout,
+}
+```
+
+`http.Client.Timeout` 是 Go 的"总超时"——从拨号开始到响应体读取完毕。它覆盖了整个请求生命周期。
+
+#### 两档配置
+
+| 场景 | 配置项 | 默认值 | 说明 |
+|------|--------|--------|------|
+| Feed 抓取 / Scraper / WatchTime | `HTTP_CLIENT_TIMEOUT` | 20s | 所有 reader 和 processor 内的 HTTP 请求 |
+| Media 代理 | `MEDIA_PROXY_HTTP_CLIENT_TIMEOUT` | 120s | UI proxy 代理多媒体资源（图片/视频） |
+
+**设计意图**: Media 代理需要更长超时，因为它代理的是图片、视频等大文件，传输时间远超 RSS XML 文件。
+
+#### 调用点对照
+
+```
+HTTP_CLIENT_TIMEOUT (20s) 使用场景:
+├── handler.go:119          — CreateFeed (创建 feed 预抓取)
+├── handler.go:227          — RefreshFeed (周期性刷新)
+├── processor.go:56         — ProcessFeedEntries (scraper 请求构建器)
+├── processor.go:187        — ProcessEntryWebPage (单条目网页抓取)
+├── reading_time.go:23      — fetchWatchTime (YouTube/Nebula/Odysee/Bilibili)
+├── youtube.go:96           — fetchYouTubeWatchTimeInBulk (批量 YouTube)
+├── bilibili.go:47          — fetchBilibiliWatchTime (Bilibili)
+├── icon/checker.go:32      — NewIconChecker (feed icon 抓取)
+├── subscription_submit.go:61 — 订阅发现
+└── opml_upload.go:94       — OPML 导入
+
+MEDIA_PROXY_HTTP_CLIENT_TIMEOUT (120s) 使用场景:
+└── ui/proxy.go:90          — WebUI 媒体代理 (图片/视频代理)
+```
+
+### 13.3 层级 2: net.Dialer.Timeout
+
+**代码位置**: `request_builder.go:159-167`
+
+```go
+directDialer := &net.Dialer{
+    Timeout:   10 * time.Second, // Default is 30s.
+    KeepAlive: 15 * time.Second, // Default is 30s.
+}
+
+proxyDialer := &net.Dialer{
+    Timeout:   10 * time.Second, // Default is 30s.
+    KeepAlive: 15 * time.Second, // Default is 30s.
+}
+```
+
+| 参数 | 值 | Go 默认值 | 说明 |
+|------|-----|-----------|------|
+| `Dialer.Timeout` | 10s | 30s | TCP 连接建立超时 |
+| `Dialer.KeepAlive` | 15s | 30s | TCP keepalive 探测间隔 |
+
+**设计意图**: 将连接超时从 30s 缩短到 10s，避免对不可达源站长时间阻塞。这对 RSS 刷新场景尤为重要——快速失败可以让 Worker 尽快处理下一个 Job。
+
+### 13.4 层级 3: http.Transport 连接池参数
+
+**代码位置**: `request_builder.go:192-198`
+
+```go
+transport := &http.Transport{
+    Proxy:             http.ProxyFromEnvironment,
+    ForceAttemptHTTP2: true,
+    MaxIdleConns:      50,               // Default is 100.
+    IdleConnTimeout:   10 * time.Second, // Default is 90s.
+}
+```
+
+| 参数 | 值 | Go 默认值 | 说明 |
+|------|-----|-----------|------|
+| `MaxIdleConns` | 50 | 100 | 最大空闲连接数 |
+| `IdleConnTimeout` | 10s | 90s | 空闲连接保活时间 |
+| `ForceAttemptHTTP2` | true | false | 尝试 HTTP/2（即使自定义了 DialContext） |
+
+**注意**: 每次 `ExecuteRequest` 都创建新的 `http.Transport` 和 `http.Client`，这意味着**连接池不会被复用**。`MaxIdleConns` 和 `IdleConnTimeout` 主要作用于同一请求内的 redirect 链，而非跨请求复用。
+
+### 13.5 超时触发的错误处理路径
+
+当超时发生时，Go 标准库返回的错误会被 `ResponseHandler.LocalizedError()` 分类：
+
+```go
+// response_handler.go:183
+case os.IsTimeout(r.clientErr):
+    return locale.NewLocalizedErrorWrapper(err, "error.network_timeout", r.clientErr)
+```
+
+在 RefreshFeed 中，超时错误的处理链路：
+
+```
+http.Client.Timeout 触发
+    │
+    ▼
+ResponseHandler.clientErr = context.DeadlineExceeded
+    │
+    ▼
+LocalizedError() → error.network_timeout
+    │
+    ▼
+getTranslatedLocalizedError()
+    │
+    ├── originalFeed.WithTranslatedErrorMessage(err)  → ParsingErrorCount++
+    ├── store.UpdateFeedError(originalFeed)            → 保存错误到数据库
+    └── return localizedError                          → Worker 记录指标，继续下一个 Job
+```
+
+### 13.6 一次 Feed 刷新请求的超时预算
+
+对于一次完整的 RefreshFeed，涉及的 HTTP 请求及其超时预算：
+
+```
+RefreshFeed 总耗时预算（无上限，但受 Worker 串行处理约束）
+│
+├── 1. 抓取 Feed XML: 1 次 HTTP 请求
+│   └── http.Client.Timeout = 20s
+│
+├── 2. ProcessFeedEntries: N 次 HTTP 请求（每个 entry 一次）
+│   ├── Scraper 抓取原文: 每个 entry 1 次 HTTP 请求 × 20s
+│   ├── YouTube WatchTime: 可能 1 次 HTTP 请求 × 20s
+│   ├── Bilibili WatchTime: 可能 1 次 HTTP 请求 × 20s
+│   └── ... 其他平台
+│
+└── 3. Icon 抓取: 1 次 HTTP 请求
+    └── http.Client.Timeout = 20s
+
+理论最大耗时 = (1 + N + 1) × 20s
+一个 feed 有 50 个 entry 时的最大耗时 ≈ 52 × 20s ≈ 17 分钟
+```
+
+**关键问题**: 单次 RefreshFeed 的总耗时没有上限。当一个 feed 配置了 Crawler 且有大量新 entry 时，Worker 可能被阻塞很长时间。这就是为什么 `WORKER_POOL_SIZE` 需要根据订阅源的 Crawler 配置合理设置。
+
+---
+
+## 十四、规则/重写过滤器在抓取后的执行链路
+
+### 14.1 处理管线总览
+
+Entry 在被抓取后经过一个**严格有序的处理管线**，每个阶段都在前一个阶段完成后执行：
+
+```
+Feed XML 解析完成
+       │
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  ProcessFeedEntries (processor.go:27-177)                    │
+│                                                              │
+│  对每个 entry，按以下顺序执行:                                │
+│                                                              │
+│  1. 过滤（第一次） ──── before_scrape                        │
+│  2. URL 清洗 ──── 移除跟踪参数                               │
+│  3. URL 重写 ──── RewriteEntryURL                            │
+│  4. 新旧检测 ──── IsNewEntry                                 │
+│  5. 内容抓取 ──── Crawler/Scraper（仅新条目）                 │
+│  6. 内容重写 ──── ApplyContentRewriteRules                    │
+│  7. 过滤（第二次）── after_scrape（仅 Crawler 成功时）        │
+│  8. HTML 消毒 ──── SanitizeHTML                              │
+│  9. 阅读时间 ──── updateEntryReadingTime                     │
+│  10. 加入 filteredEntries                                    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 14.2 阶段 1: 第一次过滤（before_scrape）
+
+**代码位置**: `processor.go:75-86`
+
+```go
+if filter.IsBlockedEntry(blockRules, allowRules, feed, entry) {
+    slog.Debug("Entry is blocked by filter rules", ..., slog.String("filter_stage", "before_scrape"))
+    continue  // 直接跳过，不执行后续任何步骤
+}
+```
+
+**目的**: 在抓取前就过滤掉不需要的条目，节省后续 Scraper 的 HTTP 请求。
+
+**过滤规则执行顺序**（`filter.go:101-127`）：
+
+```
+1. Block filter rules (user + feed 合并)  → 匹配则阻止
+2. Feed blocklist regex                   → 匹配则阻止
+3. Keep filter rules (user + feed 合并)   → 不匹配则阻止
+4. Feed keeplist regex                    → 不匹配则阻止
+5. 全部通过 → 允许
+```
+
+**可用的 filter rule 类型**（`filter.go:179-205`）：
+
+| 规则类型 | 匹配目标 | 说明 |
+|----------|----------|------|
+| `EntryTitle` | `entry.Title` | 标题正则匹配 |
+| `EntryURL` | `entry.URL` | URL 正则匹配 |
+| `EntryCommentsURL` | `entry.CommentsURL` | 评论 URL 正则匹配 |
+| `EntryContent` | `entry.Content` | 内容正则匹配 |
+| `EntryAuthor` | `entry.Author` | 作者正则匹配 |
+| `EntryTag` | `entry.Tags` | 标签正则匹配 |
+| `EntryDate` | `entry.Date` | 日期匹配（before/after/between/future/max-age） |
+
+**正则缓存优化**（`filter.go:48-72`）：
+
+```go
+var compiledRegexesCache sync.Map
+const maxCachedRegexes = 1024
+
+func cachedRegex(pattern string) *regexp.Regexp {
+    if v, ok := compiledRegexesCache.Load(pattern); ok {
+        return v.(*regexp.Regexp)  // 缓存命中
+    }
+    re, _ := regexp.Compile(pattern)
+    compiledRegexesCache.Store(pattern, re)
+    if compiledRegexesCacheSize.Add(1) >= maxCachedRegexes {
+        compiledRegexesCache.Clear()  // 缓存满时清空
+        compiledRegexesCacheSize.Store(0)
+    }
+    return re
+}
+```
+
+### 14.3 阶段 2: URL 清洗（移除跟踪参数）
+
+**代码位置**: `processor.go:88-91`
+
+```go
+parsedInputUrl, _ := url.Parse(entry.URL)
+if cleanedURL, err := urlcleaner.RemoveTrackingParameters(parsedFeedURL, parsedSiteURL, parsedInputUrl); err == nil {
+    entry.URL = cleanedURL
+}
+```
+
+**代码位置**: `internal/reader/urlcleaner/urlcleaner.go`
+
+移除的跟踪参数包括：
+
+| 类别 | 参数 |
+|------|------|
+| Facebook | `fbclid`, `_openstat`, `fb_action_ids`, `fb_action_types`, `fb_ref`, `fb_source`, `fb_comment_id` |
+| Google | `gclid`, `dclid`, `gbraid`, `wbraid`, `gclsrc`, `srsltid` |
+| Google Analytics | `campaign_id`, `campaign_medium`, `campaign_name`, `campaign_source`, `campaign_term`, `campaign_content` |
+| Yandex | `yclid`, `ysclid` |
+| Twitter | `twclid` |
+| Microsoft | `msclkid` |
+| Mailchimp | `mc_cid`, `mc_eid`, `mc_tc` |
+| HubSpot | `hsa_cam`, `_hsenc`, `__hssc`, `__hstc`, `__hsfp`, `_hsmi`, `hsctatracking` |
+| UTM 系列 | 所有 `utm_` 前缀 |
+| Matomo | 所有 `mtm_` 前缀 |
+| Outbound | `ref`（仅当值匹配 feed/site 域名时） |
+
+### 14.4 阶段 3: URL 重写
+
+**代码位置**: `processor.go:94`
+
+```go
+entry.URL = rewrite.RewriteEntryURL(feed, entry)
+```
+
+**代码位置**: `internal/reader/rewrite/url_rewrite.go`
+
+```go
+func RewriteEntryURL(feed *model.Feed, entry *model.Entry) string {
+    if feed.UrlRewriteRules == "" {
+        return entry.URL  // 无重写规则，直接返回
+    }
+
+    // 格式: rewrite("正则表达式"|"替换字符串")
+    parts := customReplaceRuleRegex.FindStringSubmatch(feed.UrlRewriteRules)
+    if len(parts) == 3 {
+        re, _ := regexp.Compile(parts[1])
+        return re.ReplaceAllString(entry.URL, parts[2])
+    }
+    return entry.URL
+}
+```
+
+**用途**: 某些 feed 的 entry URL 不直接指向原文，而是经过中间跳转页。URL 重写规则可以修正这些 URL。
+
+### 14.5 阶段 4: 新旧检测 + 阶段 5: 内容抓取
+
+**代码位置**: `processor.go:95-142`
+
+```go
+entryIsNew := store.IsNewEntry(feed.ID, entry.Hash)
+contentExtractedSuccessfully := false
+if feed.Crawler && (entryIsNew || forceRefresh) {
+    scrapedPageBaseURL, extractedContent, scraperErr := scraper.ScrapeWebsite(
+        requestBuilder,
+        entry.URL,
+        feed.ScraperRules,
+    )
+    // ...
+    if scraperErr != nil {
+        // 抓取失败，保留原始 feed 内容
+    } else if extractedContent != "" {
+        entry.Content = minifyContent(extractedContent)
+        contentExtractedSuccessfully = true  // 标记抓取成功
+    }
+}
+```
+
+**Scraper 的内容提取策略**（`scraper.go:21-71`）：
+
+```
+ScrapeWebsite
+    │
+    ├── 1. HTTP 请求抓取网页
+    │   └── 使用与 feed 相同的 RequestBuilder（超时/代理/TLS 等配置共享）
+    │
+    ├── 2. 检查 Content-Type
+    │   └── 仅接受 text/html 和 application/xhtml+xml
+    │
+    ├── 3. 判断是否同站
+    │   └── 比较 entry URL 和有效 URL 的域名
+    │
+    ├── 4. 选择提取策略
+    │   ├── 同站 + 有自定义规则 → findContentUsingCustomRules (goquery CSS 选择器)
+    │   ├── 同站 + 无自定义规则 → getPredefinedScraperRules → findContentUsingCustomRules
+    │   └── 不同站 → readability.ExtractContent (Readability 算法)
+    │
+    └── 5. 返回 baseURL + extractedContent
+```
+
+**HTML Minify**（`utils.go:69-72`）:
+
+Scraper 提取的内容会经过 `minifyContent` 压缩，移除注释、多余空白、默认属性等。
+
+### 14.6 阶段 6: 内容重写规则
+
+**代码位置**: `processor.go:144`
+
+```go
+rewrite.ApplyContentRewriteRules(entry, feed.RewriteRules)
+```
+
+**代码位置**: `internal/reader/rewrite/content_rewrite.go:104-121`
+
+```go
+func ApplyContentRewriteRules(entry *model.Entry, customRewriteRules string) {
+    rulesList := getPredefinedRewriteRules(entry.URL)
+    if customRewriteRules != "" {
+        rulesList = customRewriteRules  // 自定义规则覆盖预定义规则
+    }
+
+    rules := parseRules(rulesList)
+    rules = append(rules, rule{name: "add_pdf_download_link"})  // 始终追加
+
+    for _, rule := range rules {
+        rule.applyRule(entry.URL, entry)
+    }
+}
+```
+
+**优先级**: `feed.RewriteRules`（非空） > `getPredefinedRewriteRules(entry.URL)`（按域名匹配）
+
+**可用的内容重写规则**：
+
+| 规则名 | 作用 |
+|--------|------|
+| `add_image_title` | 将 img alt 属性添加为图片标题 |
+| `add_dynamic_image` | 替换 data-src 为 src（懒加载图片） |
+| `add_dynamic_iframe` | 替换 data-src 为 src（懒加载 iframe） |
+| `add_youtube_video` | 嵌入 YouTube 视频播放器 |
+| `add_invidious_video` | 嵌入 Invidious 视频播放器 |
+| `add_youtube_video_using_invidious_player` | YouTube 链接用 Invidious 播放器 |
+| `add_youtube_video_from_id` | 从 YouTube video ID 嵌入播放器 |
+| `add_pdf_download_link` | 添加 PDF 下载链接（始终追加） |
+| `add_mailto_subject` | 将 mailto 链接主题添加为文本 |
+| `add_enclosure_links` | 将附件链接添加到内容中 |
+| `add_castopod_episode` | 嵌入 Castopod 播客播放器 |
+| `nl2br` | 换行符转 `<br>` |
+| `convert_text_link` / `convert_text_links` | 纯文本链接转 HTML 超链接 |
+| `fix_medium_images` | 修复 Medium 图片加载 |
+| `use_noscript_figure_images` | 使用 noscript 中的图片 |
+| `replace("search"|"replace")` | 自定义正则搜索替换（内容） |
+| `replace_title("search"|"replace")` | 自定义正则搜索替换（标题） |
+| `remove("selector")` | CSS 选择器移除元素 |
+| `base64_decode("selector")` | Base64 解码指定元素内容 |
+| `add_hn_links_using_hack` | Hacker News 链接转换（hack） |
+| `add_hn_links_using_opener` | Hacker News 链接转换（opener） |
+| `remove_tables` | 移除 HTML 表格 |
+| `remove_clickbait` | 标题去标题党 |
+| `fix_ghost_cards` | 修复 Ghost 博客卡片 |
+| `remove_img_blur_params` | 移除图片模糊参数 |
+
+**预定义规则**（`content_rewrite_rules.go`）：
+
+为特定网站内置了重写规则，如 `xkcd.com` → `add_image_title`、`youtube.com` → `add_youtube_video`、`medium.com` → `fix_medium_images` 等。
+
+### 14.7 阶段 7: 第二次过滤（after_scrape）
+
+**代码位置**: `processor.go:147-158`
+
+```go
+// Re-run filters only when extracted content replaced entry.Content.
+if contentExtractedSuccessfully && filter.IsBlockedEntry(blockRules, allowRules, feed, entry) {
+    slog.Debug("Entry is blocked by filter rules", ..., slog.String("filter_stage", "after_scrape"))
+    continue
+}
+```
+
+**设计意图**: Crawler 抓取到的全文内容可能与 RSS 中的摘要不同。用户可能希望基于全文内容进行过滤（例如 `EntryContent` 规则匹配抓取后的完整正文）。
+
+**条件**: 只有当 Scraper 成功提取了内容（`contentExtractedSuccessfully=true`）时才重新过滤。如果 Scraper 失败，保留的是原始 RSS 内容，不需要重新过滤（已在第一次过滤中检查过）。
+
+### 14.8 阶段 8: HTML 消毒
+
+**代码位置**: `processor.go:164-165`
+
+```go
+// The sanitizer should always run at the end of the process to make sure unsafe HTML is filtered out.
+entry.Content = sanitizer.SanitizeHTML(webpageBaseURL, entry.Content, &sanitizer.SanitizerOptions{OpenLinksInNewTab: user.OpenExternalLinksInNewTab})
+```
+
+**作为最后一道防线**: 无论内容经过多少次变换，HTML 消毒始终最后执行，确保输出安全。
+
+### 14.9 阶段 9: 阅读时间计算
+
+**代码位置**: `processor.go:167`
+
+```go
+updateEntryReadingTime(store, feed, entry, entryIsNew, user)
+```
+
+**代码位置**: `reading_time.go:61-107`
+
+```
+阅读时间计算优先级:
+
+1. 视频 WatchTime（仅新条目）
+   ├── YouTube → fetchYouTubeWatchTimeForSingleEntry
+   ├── Nebula → fetchNebulaWatchTime
+   ├── Odysee → fetchOdyseeWatchTime
+   └── Bilibili → fetchBilibiliWatchTime
+
+2. 已有条目 → store.GetReadTime(feed.ID, entry.Hash)  // 从数据库读取
+
+3. 文本估算 → readingtime.EstimateReadingTime
+   └── 基于 content 字数 / 用户配置的阅读速度
+```
+
+### 14.10 处理顺序：旧条目优先
+
+**代码位置**: `processor.go:64-65`
+
+```go
+// Processing older entries first ensures that their creation timestamp is lower than newer entries.
+for _, entry := range slices.Backward(feed.Entries) {
+```
+
+使用 `slices.Backward` 从列表末尾向前遍历（即先处理最旧的条目），确保旧条目的 `created_at` 时间戳小于新条目。这在条目没有发布日期时尤为重要——此时 `created_at` 就是排序依据。
+
+### 14.11 完整处理管线数据流图
+
+```
+entry (来自 feed 解析)
+  │
+  ├─ ① IsBlockedEntry? ──── 是 ──→ 丢弃
+  │   (block filter + blocklist + keep filter + keeplist)
+  │
+  ├─ ② RemoveTrackingParameters ──→ entry.URL (移除 utm_*, fbclid 等)
+  │
+  ├─ ③ RewriteEntryURL ─────────→ entry.URL (正则替换)
+  │
+  ├─ ④ IsNewEntry? ─────────────→ entryIsNew (决定是否 Crawler)
+  │
+  ├─ ⑤ Crawler? && (isNew || force)?
+  │   ├── 是 → ScrapeWebsite ──→ entry.Content (全文替换)
+  │   │         └── minifyContent
+  │   └── 否 → 保留原始 feed 内容
+  │
+  ├─ ⑥ ApplyContentRewriteRules → entry.Content / entry.Title (规则变换)
+  │
+  ├─ ⑦ contentExtractedSuccessfully? && IsBlockedEntry?
+  │   └── 是 ──→ 丢弃 (二次过滤)
+  │
+  ├─ ⑧ SanitizeHTML ────────────→ entry.Content (安全消毒)
+  │
+  ├─ ⑨ updateEntryReadingTime ──→ entry.ReadingTime
+  │   ├── Video WatchTime (YouTube/Nebula/Odysee/Bilibili)
+  │   ├── 数据库已有值
+  │   └── 文本估算
+  │
+  └─ ⑩ 加入 filteredEntries ───→ 最终写入数据库
+```
+
+---
+
+## 十五、Scheduler Ticker 与 Worker 信号通信代码
+
+### 15.1 通信架构总览
+
+```
+┌──────────────┐     channel     ┌──────────────┐
+│  Scheduler   │ ──── Push ────▶ │  Worker Pool │
+│  (1 goroutine)│               │  (N goroutines)│
+│              │                │              │
+│  time.Tick   │                │  for range c │
+│  (ticker)    │                │              │
+└──────────────┘                └──────────────┘
+       │                              │
+       │ 每轮生成 Job 列表             │ 每个 Worker 串行消费
+       │ 推入 channel                 │ 调用 RefreshFeed
+       ▼                              ▼
+  BatchBuilder                    handler.RefreshFeed
+  (数据库查询)                    (HTTP + 解析 + 存储)
+```
+
+### 15.2 信号通信的原语：Go Channel
+
+**代码位置**: `internal/worker/pool.go`
+
+```go
+type Pool struct {
+    queue chan model.Job   // 无缓冲 channel
+    wg    sync.WaitGroup
+}
+```
+
+**关键设计决策**: 使用**无缓冲 channel** (`make(chan model.Job)`)，而非带缓冲的 channel。
+
+#### 无缓冲 Channel 的语义
+
+- 每个 `p.queue <- job` 调用会**阻塞**，直到有 Worker 从 channel 中取走这个 Job
+- 这意味着 `pool.Push(jobs)` 的发送速率受限于 Worker 的消费速率
+- 如果所有 Worker 都在忙，`Push` 会阻塞整个 Scheduler goroutine
+
+#### 为什么选择无缓冲？
+
+1. **天然限流**: Scheduler 不会堆积大量未处理的 Job，避免内存压力
+2. **背压传导**: 当 Worker 处理慢时，Scheduler 自动减速，不会无限生成 Job
+3. **简化设计**: 不需要额外的 Job 队列管理和超时机制
+
+### 15.3 Scheduler 端：Ticker 驱动的生产循环
+
+**代码位置**: `internal/cli/scheduler.go:33-51`
+
+```go
+func feedScheduler(store *storage.Storage, pool *worker.Pool, frequency time.Duration, batchSize, errorLimit, limitPerHost int) {
+    for range time.Tick(frequency) {
+        jobs, err := store.NewBatchBuilder().
+            WithBatchSize(batchSize).
+            WithErrorLimit(errorLimit).
+            WithoutDisabledFeeds().
+            WithNextCheckExpired().
+            WithLimitPerHost(limitPerHost).
+            FetchJobs()
+
+        if err != nil {
+            slog.Error("Unable to fetch jobs from database", slog.Any("error", err))
+        } else if len(jobs) > 0 {
+            pool.Push(jobs)
+        }
+    }
+}
+```
+
+#### 时序分析
+
+```
+时间轴:
+  T+0s        T+60s       T+120s      T+180s
+    │           │            │           │
+    ▼           ▼            ▼           ▼
+  Tick①      Tick②       Tick③       Tick④
+    │           │            │           │
+    ├─ FetchJobs             ├─ FetchJobs
+    ├─ Push(jobs)            ├─ Push(jobs)
+    │  (可能阻塞)            │
+    │                        │
+  如果 Push 阻塞:         如果上一轮 Push
+  Scheduler 等待          还没完成:
+  Worker 消费             Tick② 的 FetchJobs
+                          被延迟执行
+
+关键: time.Tick 是固定间隔的 ticker，
+不管上一轮 Push 是否完成，下一轮 Tick 都会准时到来。
+但由于 Push 可能阻塞，实际执行频率可能低于 ticker 频率。
+```
+
+**注意**: `time.Tick` 返回的是一个只读 channel，`for range time.Tick(frequency)` 等价于每次从 ticker channel 中接收一个时间信号。如果 `Push` 阻塞时间超过 `frequency`，下一个 tick 会被"吞掉"（Go ticker channel 在没人接收时会丢弃信号）。
+
+### 15.4 Push 的阻塞行为
+
+**代码位置**: `internal/worker/pool.go:20-24`
+
+```go
+func (p *Pool) Push(jobs model.JobList) {
+    for _, job := range jobs {
+        p.queue <- job  // 阻塞直到有 Worker 接收
+    }
+}
+```
+
+**行为分析**:
+
+| 场景 | Push 行为 | 耗时 |
+|------|-----------|------|
+| Worker 空闲 | 每个 Job 立即被接收 | ≈ 0 |
+| Worker 忙，但队列可消化 | 每个 Job 短暂等待 | 毫秒级 |
+| Worker 长时间忙（Crawler feed） | Push 严重阻塞 | 可能数分钟 |
+| 所有 Worker 在 Crawler，50 个 entry | 50 个 Job 排队 | 可能 > 10 分钟 |
+
+**无超时保护**: `Push` 没有设置超时。如果 Worker 全部阻塞在长时间的 RefreshFeed 上，Scheduler goroutine 也会被阻塞。
+
+### 15.5 Worker 端：消费循环
+
+**代码位置**: `internal/worker/worker.go:24-49`
+
+```go
+func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
+    defer wg.Done()
+
+    for job := range c {
+        startTime := time.Now()
+        localizedError := feedHandler.RefreshFeed(w.store, job.UserID, job.FeedID, false)
+
+        if config.Opts.HasMetricsCollector() {
+            status := metric.StatusSuccess
+            if localizedError != nil {
+                status = metric.StatusError
+            }
+            metric.BackgroundFeedRefreshDuration.WithLabelValues(status).Observe(time.Since(startTime).Seconds())
+        }
+    }
+}
+```
+
+**`for job := range c` 的语义**:
+
+- 从 channel 中取出一个 Job，**同时解除 Scheduler 的 `Push` 阻塞**
+- 如果 channel 被关闭（`close(p.queue)`），循环自动退出
+- 每个 Worker 串行处理：取出一个 Job → 执行 RefreshFeed → 取下一个 Job
+
+### 15.6 信号流完整时序图
+
+```
+Scheduler goroutine                    Worker 0              Worker 1
+      │                                   │                      │
+  time.Tick 触发                           │                      │
+      │                                   │                      │
+  FetchJobs()                              │                      │
+  ┌─── 耗时: DB 查询 ───┐                  │                      │
+      │                                   │                      │
+  jobs = [J0, J1, J2, J3, J4]             │                      │
+      │                                   │                      │
+  Push(jobs)                               │                      │
+      │                                   │                      │
+  p.queue <- J0 ──────────────────────▶  收到 J0                  │
+      │                               RefreshFeed(J0)             │
+  p.queue <- J1 ─────────────────────────────────────────────▶  收到 J1
+      │                                                       RefreshFeed(J1)
+  p.queue <- J2 ──── 阻塞，等 Worker 空闲 ────                   │
+      │                                   │                      │
+      │                             (J0 完成)                     │
+      │                                   │                      │
+  p.queue <- J2 ──────────────────────▶  收到 J2                  │
+      │                               RefreshFeed(J2)             │
+  p.queue <- J3 ──── 阻塞...              │                      │
+      │                                                          │
+      │                                                    (J1 完成)
+      │                                                          │
+  p.queue <- J3 ─────────────────────────────────────────────▶  收到 J3
+      │                                                       RefreshFeed(J3)
+  p.queue <- J4 ──── 阻塞...              │                      │
+      │                                   │                      │
+      │                             (J2 完成)                     │
+      │                                   │                      │
+  p.queue <- J4 ──────────────────────▶  收到 J4                  │
+      │                               RefreshFeed(J4)             │
+  Push 完成，等待下一个 Tick               │                      │
+```
+
+### 15.7 优雅关闭
+
+**代码位置**: `internal/worker/pool.go:27-30` + `internal/cli/daemon.go:77-99`
+
+```go
+// Pool.Shutdown 关闭 channel 并等待所有 Worker 完成
+func (p *Pool) Shutdown() {
+    close(p.queue)    // 关闭 channel → Worker 的 for-range 循环退出
+    p.wg.Wait()       // 等待所有 Worker 的 goroutine 结束
+}
+```
+
+```
+关闭时序:
+
+主 goroutine
+    │
+    ├── <-stop (收到 SIGTERM/SIGINT)
+    │
+    ├── 关闭 HTTP 服务器 (5s 超时)
+    │
+    ├── pool.Shutdown()
+    │   ├── close(p.queue)     → Worker 的 for-range 退出循环
+    │   └── p.wg.Wait()        → 等待 Worker 完成当前正在处理的 Job
+    │
+    └── 进程退出
+```
+
+**注意**: Worker 不会中断正在执行的 `RefreshFeed`。如果一个 Worker 正在处理一个需要 10 分钟的 Crawler feed，`Shutdown()` 会等待它完成。没有强制的 Job 超时或取消机制。
+
+### 15.8 设计特点与局限
+
+| 特点 | 说明 |
+|------|------|
+| **无缓冲 channel** | 天然背压，但可能导致 Scheduler 阻塞 |
+| **Scheduler 单 goroutine** | 简单可靠，但一次只能处理一个批次 |
+| **无 Job 优先级** | 所有 Job 平等，手动刷新和自动刷新在同一个队列 |
+| **无 Job 超时** | Worker 不取消长时间运行的 Job |
+| **无 Job 去重** | 同一 feed 可能在连续两轮 Tick 中被调度（如果上一轮 Push 还在阻塞，下一轮 FetchJobs 可能再次选到同一个 feed） |
+| **优雅关闭** | 通过 channel close + WaitGroup 实现，但可能等待时间较长 |
+| **Ticker 信号丢失** | 如果 Push 阻塞超过 PollingFrequency，中间的 tick 信号会被丢弃 |
+
+### 15.9 手动刷新如何进入同一队列
+
+手动刷新（UI/API）**不经过** Scheduler 的 channel，而是直接调用 `RefreshFeed`：
+
+```
+自动刷新路径:
+  Scheduler → BatchBuilder → FetchJobs → pool.Push → Worker → RefreshFeed
+
+手动刷新路径 (UI):
+  ui/feed_refresh.go → 直接调用 feedHandler.RefreshFeed (在 HTTP handler goroutine 中)
+
+手动刷新路径 (API):
+  api/feed_handlers.go → 直接调用 feedHandler.RefreshFeed (在 HTTP handler goroutine 中)
+```
+
+**关键区别**:
+- 自动刷新经过 Worker Pool 的 channel，受 Worker 池并发度限制
+- 手动刷新在 HTTP handler 的 goroutine 中直接执行，不受 Worker 池限制
+- 这意味着在 Worker 全部忙碌时，手动刷新仍可立即执行（但会增加并发压力）
