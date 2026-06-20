@@ -483,6 +483,38 @@ Shift 不在 `isModifierKeyDown()` 的检查列表中。Shift 的作用是**改�
 
 Miniflux 的 `KeyboardHandler` 是一个**极简实现**，只支持"单键"和"空格分隔的按键序列"两种模式，不支持任何修饰键 chord。
 
+### 9.5 modifier_chord_serialize：修饰键顺序归一化不存在
+
+#### 9.5.1 代码事实：无此函数、无归一化逻辑
+
+对全代码库搜索 `modifier_chord_serialize`、`normalize`、`canonical`、`normalise`、`sort.*key` 等标识符的结果：
+- **零个匹配**。不存在修饰键序列化/归一化函数。
+- `keyboard_handler.js` 中唯一与"键名规范化"相关的代码是 `static getKey(event)`（第 57-66 行），仅处理浏览器兼容别名（`Esc` → `Escape`、`Up` → `ArrowUp` 等），不涉及修饰键顺序。
+- `config/options.go` 中无任何 keyboard/modifier 相关配置项。
+
+#### 9.5.2 假设性分析：如果支持修饰键 chord，归一化是必需的
+
+修饰键组合存在顺序歧义问题：
+- 用户按下 `Shift+Ctrl+K` 和 `Ctrl+Shift+K`，物理按键顺序不同，但语义完全相同
+- 如果序列化时不做归一化，`"shift-ctrl-k"` 和 `"ctrl-shift-k"` 会被视为两个不同的快捷键
+- 注册表 `Map.set()` 不会自动识别它们的等价性，导致冲突检测失效（两个不同的 key 都能注册成功，但实际触发时只能命中一个）
+
+业界标准归一化方案（如 VS Code、Mousetrap.js、Atom）都是：**修饰键按字典序排序后拼接**：
+```
+原始按键顺序 → 提取修饰键集合 → 排序 → 拼接
+"shift-ctrl-k"   → {Control, Shift}   → ["Control","Shift"] → "ctrl-shift-k"
+"ctrl-shift-k"   → {Control, Shift}   → ["Control","Shift"] → "ctrl-shift-k"
+```
+
+#### 9.5.3 Miniflux 当前为何不需要归一化
+
+因为 `isModifierKeyDown()` 在入口处就过滤了所有 Ctrl/Alt/Meta 组合：
+- 修饰键 chord 根本不进入匹配逻辑
+- Shift 通过 `event.key` 的大小写间接处理（`k` vs `K`），不存在"Shift 顺序"问题
+- 序列键（`g u`）是严格顺序敏感的（先 g 后 u ≠ 先 u 后 g），不能排序归一化
+
+**结论**：在当前架构下，修饰键顺序归一化是一个"不存在的问题"。如果未来要扩展支持 Ctrl/Alt chord，首要任务不是写冲突检测，而是先实现修饰键的提取 + 字典序归一化序列化函数。
+
 ---
 
 ## 十、keymap JSONB 字段：不存在，偏好全部存为扁平列
@@ -669,6 +701,84 @@ PostgreSQL 的 GIN 索引有两个与更新相关的膨胀机制：
 - 索引膨胀（频繁更新 + FASTUPDATE 合并）
 - 类型不安全
 - 查询性能无提升（仍然走主键索引）
+
+### 10.7 VACUUM ANALYZE 触发频率：完全交给 PostgreSQL autovacuum
+
+#### 10.7.1 代码事实：Miniflux 不主动触发 VACUUM
+
+对全代码库搜索 `VACUUM`、`vacuum`、`ANALYZE`、`analyze`（排除 feed parser 语义）、`pg_stat`、`autovacuum` 的结果：
+- **零个匹配**。Go 代码中不存在任何 `db.Exec("VACUUM")` 或 `db.Exec("ANALYZE")` 调用。
+- `config/options.go` 的 60+ 个配置项中，没有任何与 VACUUM 频率、阈值、成本限制相关的参数。
+- `internal/cli/cleanup_tasks.go` 的 `runCleanupTasks()` 只执行 4 项清理：旧 web sessions、归档已读条目、归档未读条目、清理孤立图标 —— **不包含数据库维护任务**。
+
+#### 10.7.2 清理调度器的实际内容
+
+`internal/cli/scheduler.go:27-30` 启动清理调度器：
+```go
+go cleanupScheduler(
+    store,
+    config.Opts.CleanupFrequency(),  // 默认 24 小时
+)
+```
+
+`config/options.go:143-150` 的 `CLEANUP_FREQUENCY_HOURS` 定义：
+```go
+"CLEANUP_FREQUENCY_HOURS": {
+    parsedDuration: time.Hour * 24,  // 默认 24h
+    rawValue:       "24",
+    valueType:      hourType,
+    validator:      validateGreaterOrEqualThan(1, rawValue),  // ≥1h
+},
+```
+
+这个频率控制的是**应用层业务数据清理**（条目归档、会话删除），不是 PostgreSQL 的 VACUUM。
+
+运维侧可配置的清理参数完整清单（`config/options.go`）：
+
+| 环境变量 | 默认值 | 用途 | 与 VACUUM 的关系 |
+|---------|--------|------|----------------|
+| `CLEANUP_FREQUENCY_HOURS` | 24 | 清理任务调度周期 | 无。只决定业务清理运行频率 |
+| `CLEANUP_ARCHIVE_READ_DAYS` | 60 | 已读条目保留天数 | 间接：删除条目产生死元组，触发 autovacuum |
+| `CLEANUP_ARCHIVE_UNREAD_DAYS` | 180 | 未读条目保留天数 | 同上 |
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | 每次归档的条目数量上限 | 间接：批量大小影响死元组产生速率 |
+| `CLEANUP_REMOVE_SESSIONS_DAYS` | 30 | web session 保留天数 | 同上 |
+
+#### 10.7.3 VACUUM 完全依赖 PostgreSQL 原生 autovacuum
+
+Miniflux 的运维文档（README / man page / Docker 配置）中没有任何 VACUUM 相关说明。运维侧实际配置 VACUUM 策略的方式是通过 **PostgreSQL 自身配置**，与 Miniflux 应用层无关：
+
+```ini
+# postgresql.conf 中的相关参数（运维侧配置，不在 Miniflux 中）
+autovacuum = on                    # 默认开启
+autovacuum_vacuum_threshold = 50   # 表死元组达到 50 条触发
+autovacuum_vacuum_scale_factor = 0.2  # 表大小的 20% 作为附加阈值
+autovacuum_analyze_threshold = 50
+autovacuum_analyze_scale_factor = 0.1
+autovacuum_vacuum_cost_delay = 2ms
+autovacuum_vacuum_cost_limit = -1  # 使用系统全局限制
+```
+
+这些参数完全由 DBA 在 PostgreSQL 配置文件或 `ALTER TABLE ... SET (...)` 中设置，Miniflux 应用层不暴露、不管理、也不感知。
+
+#### 10.7.4 运维侧配置 vs 应用层配置的边界
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     运维可配置范围                            │
+├──────────────────────────┬──────────────────────────────────┤
+│  Miniflux 环境变量        │  PostgreSQL postgresql.conf      │
+│  (config/options.go)      │  (DBA 直接操作数据库)            │
+├──────────────────────────┼──────────────────────────────────┤
+│  CLEANUP_FREQUENCY_HOURS  │  autovacuum                      │
+│  CLEANUP_ARCHIVE_*_DAYS   │  autovacuum_vacuum_threshold    │
+│  CLEANUP_ARCHIVE_BATCH    │  autovacuum_analyze_threshold   │
+│  CLEANUP_REMOVE_SESSIONS  │  autovacuum_vacuum_cost_delay   │
+│  ...                      │  gin_pending_list_limit         │
+│                          │  work_mem / maintenance_work_mem │
+└──────────────────────────┴──────────────────────────────────┘
+```
+
+**结论**：VACUUM ANALYZE 触发频率**完全没有暴露给 Miniflux 运维侧配置**，运维必须通过 PostgreSQL 原生参数进行管理。这符合"数据库职责归数据库"的设计哲学——应用层只管业务数据清理，DBMS 的内部维护由 DBA 负责。
 
 ---
 
@@ -912,3 +1022,91 @@ func (s *WebSession) Theme() string {
 | 前端 `data-*` 属性 | HTML 属性 | 模板不输出该属性 | 前端按默认行为运行 | 是"不注入"，前端用默认逻辑，本质是回退 |
 
 **最容易产生误解的是 webSessionState 层**：`omitempty` + getter fallback 的组合，让"设零值"这个操作在 DB 层面表现为"删除键"，在行为层面表现为"回退默认"，容易让人以为有一套自动的"删除键→回退默认"机制。实际上是两个独立机制碰巧叠在了一起：序列化时的省略规则 + 读取时的零值回退。
+
+### 11.8 keymap_tombstone：不存在该概念，但 entry_tombstones 有无限增长隐患
+
+#### 11.8.1 代码事实：没有 keymap_tombstone JSONB 数组
+
+对全代码库搜索 `keymap_tombstone`、`key_map_tomb`、`tombstone`、`graveyard` 的结果：
+- **`keymap_tombstone` 零匹配**。不存在任何与快捷键/keymap 相关的墓碑表或 JSONB 数组。
+- 唯一实际存在的墓碑机制是 `entry_tombstones` 表（`internal/database/migrations.go:1472-1480`），用于**已删除 RSS 条目的去重防护**，与键盘快捷键完全无关。
+
+由于用户提到的是"keymap_tombstone JSONB 数组"，这是一个与实际代码不匹配的假设概念。但我们可以顺着代码中唯一存在的 `entry_tombstones` 表来分析"墓碑无限增长"这个通用问题。
+
+#### 11.8.2 entry_tombstones 的表结构与写入路径
+
+`migrations.go:1472-1480` 定义：
+```sql
+CREATE TABLE entry_tombstones (
+    feed_id bigint not null references feeds(id) on delete cascade,
+    hash text not null check (hash <> ''),
+    deleted_at timestamp with time zone not null default now(),
+    primary key (feed_id, hash)
+);
+
+CREATE INDEX entry_tombstones_deleted_at_idx
+    ON entry_tombstones (deleted_at);
+```
+
+写入发生在两处（`storage/entry.go`）：
+1. **`ArchiveEntries()`（第 362-404 行）**：按时间归档旧条目时，将被删除的 (feed_id, hash) 批量插入墓碑表，`ON CONFLICT (feed_id, hash) DO NOTHING` 幂等
+2. **`FlushHistory()`（第 491-501 行）**：用户手动清空历史时同样写入墓碑表
+
+#### 11.8.3 无限增长隐患：无清理策略
+
+对 `entry_tombstones` 相关代码的完整扫描结果（全代码库 8 处引用）：
+
+| 文件:行号 | 操作 | 是否清理 |
+|----------|------|---------|
+| `storage/entry.go:118` | `createEntry` WHERE NOT EXISTS 检查 | 否 |
+| `storage/entry.go:287` | `IsNewEntry` EXISTS 检查 | 否 |
+| `storage/entry.go:386` | `ArchiveEntries` INSERT | 否 |
+| `storage/entry.go:499` | `FlushHistory` INSERT | 否 |
+| `database/migrations.go:1472-1495` | DDL + 初始数据迁移 | 否 |
+| `cli/cleanup_tasks.go` | 全文件 4 项清理任务 | **无 entry_tombstones 清理** |
+
+**`entry_tombstones` 表没有任何清理代码**。虽然表上有 `entry_tombstones_deleted_at_idx` 索引（暗示设计时考虑过按时间清理），但实际没有任何 DELETE 语句使用这个索引。
+
+增长速率估算：
+- RSS 订阅源每篇文章产生一条墓碑记录
+- 一个中等活跃用户 100 个订阅源 × 每源每天 5 篇 × 365 天 = 每年 ~18 万条
+- 多用户实例 N×M 增长
+- 每条记录约 40 字节（bigint + text hash + timestamp），18 万条约 7 MB/年/用户，单表增长不算快但永久不清理
+
+#### 11.8.4 唯一隐式清理路径：ON DELETE CASCADE
+
+表定义 `feed_id bigint not null references feeds(id) on delete cascade` 意味着：
+- **删除订阅源时**，该 feed 的所有墓碑记录级联删除
+- 这是唯一能让 entry_tombstones 缩小的机制
+- 用户保留的订阅源越多，墓碑积累越永久
+
+#### 11.8.5 如果 keymap 真用 JSONB 数组存储墓碑，该怎么设计？
+
+作为架构对比分析，假设存在 `keymap_tombstones jsonb` 存储已删除的快捷键映射（`"Ctrl+Shift+K"`, `"Alt+F"` 等），需要解决的清理问题包括：
+
+| 维度 | entry_tombstones 现状 | keymap_tombstone JSONB 假设 |
+|------|----------------------|--------------------------|
+| 结构 | 独立表 + 主键 | JSONB 数组内嵌在 users 表 |
+| 上限 | 无（行数无限） | 数组长度无检查 → 单行无限膨胀 |
+| 写入 | INSERT + ON CONFLICT | `jsonb_set(keymap_tombstones, ...)` 每次全量写回 |
+| 按时间清理 | 有 deleted_at 索引但无清理逻辑 | 需在 JSON 内存储删除时间戳，查询效率低 |
+| 级联删除 | ON DELETE CASCADE (feed) | 随用户删除自动清理 |
+| 去重 | PRIMARY KEY (feed_id, hash) | JSONB 数组需应用层去重 |
+
+**keymap_tombstone JSONB 数组比 entry_tombstones 独立表更差**：
+- JSONB 数组不能用 PRIMARY KEY 去重，需应用层检查 `?` 操作符
+- 无上限更严重：单个 users 行的 JSONB 数组膨胀会拖慢整行读取（SELECT *）
+- 按时间清理需要解析每一个数组元素的时间戳，GIN 索引也帮不上忙
+- PostgreSQL TOAST 存储在单行 JSONB 超过 ~2KB 时触发，进一步降低读取性能
+
+#### 11.8.6 总结
+
+| 问题 | 代码事实 |
+|------|---------|
+| keymap_tombstone 字段 | **不存在**。代码中无 keymap、无 tombstone JSONB 数组 |
+| 唯一的墓碑机制 | `entry_tombstones` 表，用于 RSS 条目去重，与键盘无关 |
+| entry_tombstones 的清理 | **无清理策略**。无上限增长，仅通过删除订阅源级联回收 |
+| deleted_at 索引 | 存在但未被使用（无 DELETE ... WHERE deleted_at < ...） |
+| 用 JSONB 数组存墓碑 | 比独立表更差：无法主键去重、单行膨胀、时间清理低效 |
+
+**设计洞察**：Miniflux 在 entry_tombstones 上选择独立表而非 JSONB 数组是正确的架构决策（有主键去重、有级联删除、有时间索引）。但**遗漏了定期按时间清理的代码**——这是一个真实的、虽然缓慢的存储泄漏。
