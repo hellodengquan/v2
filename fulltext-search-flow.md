@@ -39,10 +39,87 @@ UPDATE entries SET document_vectors =
     || setweight(to_tsvector(substring(coalesce(content, '') for 1000000)), 'B')
 ```
 
-**权重策略**：
-- 标题（title）→ 权重 **A**（最高，匹配时排名靠前）
-- 正文（content）→ 权重 **B**（次高）
-- PostgreSQL 默认提供 A/B/C/D 四级权重，数值比例为 1.0 / 0.4 / 0.2 / 0.1
+**权重策略（setweight 与 ts_rank 协同）**：
+- 标题（title）→ `setweight(..., 'A')` → **权重 A**（最高，匹配时排名靠前）
+- 正文（content）→ `setweight(..., 'B')` → **权重 B**（次高）
+- PostgreSQL 四级权重在 `ts_rank()` 函数中的默认权重数组为 **`{0.1, 0.2, 0.4, 1.0}`**，索引顺序是 **`{D, C, B, A}`**（注意字母倒序）：
+  - **D** = 0.1（默认权重，未显式 setweight 的词）
+  - **C** = 0.2
+  - **B** = 0.4 ← Miniflux 正文使用此级
+  - **A** = 1.0 ← Miniflux 标题使用此级
+- **实际比例换算**：同一个词出现在标题中的 ts_rank 贡献是出现在正文中的 **1.0 / 0.4 = 2.5 倍**。例如词 "golang" 在标题出现 1 次，等价于在正文出现 2.5 次（不计词频归一化因子）
+- `||` 操作符：`setweight(title_vec, 'A') || setweight(content_vec, 'B')` 会合并两个 tsvector，保留各自的权重标签和位置信息
+
+### 1.3 文本搜索配置（regconfig）与中文条目退化路径
+
+#### 1.3.1 Miniflux 未显式指定 regconfig，走默认配置
+
+**代码证据**：全文所有 `to_tsvector()` / `websearch_to_tsquery()` 调用均只传入一个文本参数，未传入 `regconfig`：
+
+```go
+// entry.go createEntry / updateEntry / UpdateEntryTitleAndContent 三处均为：
+setweight(to_tsvector($11), 'A') || setweight(to_tsvector($12), 'B')
+//                                    ↑ 只传文本，不传 regconfig
+
+// entry_query_builder.go WithSearchQuery:
+e.document_vectors @@ websearch_to_tsquery($%d)
+//                                  ↑ 同样只传文本
+```
+
+根据 PostgreSQL 源码（`src/backend/tsearch/to_tsany.c`），单参数 `to_tsvector(text)` 内部实现为：
+
+```c
+// to_tsvector_byid 内部调用 getTSCurrentConfig(true)
+// 读取 GUC 参数 default_text_search_config 的当前值
+```
+
+即**每次 SQL 执行都会读取当前会话的 `default_text_search_config` 参数**。
+
+#### 1.3.2 default_text_search_config 的实际取值链
+
+| 层级 | 默认值 | 说明 |
+|------|--------|------|
+| PostgreSQL 编译内置 | **`pg_catalog.simple`** | 绝对最低 fallback |
+| initdb 初始化时 | 根据 `lc_ctype` 区域自动匹配：<br>`en_US.UTF-8` → `pg_catalog.english`<br>`zh_CN.UTF-8` → **无对应内置配置，回落至 `pg_catalog.simple`** | PostgreSQL 仅为十几种西欧语言提供预定义 config |
+| `postgresql.conf` | 可手动覆盖，Miniflux 安装文档**未要求设置**此参数 | 大多数生产部署沿用 initdb 的值 |
+| 会话级 `SET` | Miniflux 代码中 **未发现任何 `SET default_text_search_config` 语句** | 全部沿用实例级默认值 |
+
+**关键代码核查**：在 `internal/database/`、`internal/storage/`、`internal/config/` 三个目录全局搜索，没有任何对 `default_text_search_config`、`regconfig`、`english`（作为 config 名）的直接 SET 或连接池初始化语句。
+
+#### 1.3.3 中文条目的命中退化路径（三层退化）
+
+对于中文 RSS 条目，由于 PostgreSQL 社区版**不内置中文分词配置**（zhparser、pg_jieba 均为第三方扩展，Miniflux 未集成），必然发生以下退化：
+
+```
+退化第一层：default_text_search_config 取不到中文配置
+        ↓
+退化第二层：实际使用 pg_catalog.simple 或 pg_catalog.english
+        ↓
+退化第三层：分词器无法识别中文字符边界，退化为 "逐字符" 或 "连续字符串" 建索引
+```
+
+**两种退化场景的具体行为**：
+
+**场景 A — 使用 `pg_catalog.simple`（常见于 zh_CN 部署）**
+- `simple` 配置的解析器：default parser 按 Unicode 类别分词
+- 对连续中文字符串 "这是一个中文测试文本"：
+  - parser 识别出 token 类型为 `word`，但**不会按语义拆分**
+  - 整个连续中文序列被当作**单个巨型 token**（例如 10 个汉字 = 1 个 lexeme）
+  - `to_tsvector()` 直接存储该 token，不做词干还原
+- **查询时的致命问题**：用户搜 "中文" 只有当 "中文" 这两个字**恰好作为完整条目被收录**时才能命中。如果条目是 "学习中文编程"，建索引时被当成一个 token，则搜 "中文"**无法匹配**（`@@` 操作符要求 lexeme 完全相等）
+
+**场景 B — 使用 `pg_catalog.english`（常见于 Docker 镜像、en_US 部署）**
+- `english` 配置使用 Snowball stemmer + 英文停用词表
+- 中文字符逐个进入英文 Snowball stemmer：
+  - stemmer 对非 ASCII 字符**不做任何变换**（无规则匹配）
+  - 但分词边界仍以标点、空格为准
+- **行为与场景 A 等价**：连续无标点中文 → 单个 lexeme → 无法分词搜索
+
+**用户侧表现**：
+- 搜 "docker" 这类英文单词可正常命中（有空格分词边界）
+- 搜 "Kubernetes 入门" 中 "Kubernetes" 可命中，"入门" 大概率无法命中
+- 中文**标题命中概率 > 正文**，因为标题中常常夹杂英文/数字/标点，无意中制造了分词边界
+- 标签搜索（`WithTags`）不受影响，因为标签使用 PostgreSQL 数组 `@>` 运算符，与全文索引完全独立
 
 ---
 
@@ -336,65 +413,135 @@ Miniflux 不使用 PostgreSQL 的触发器自动更新 `document_vectors`，而�
 
 `createEntry()`（`internal/storage/entry.go:80-161`）：
 
-```go
-func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
-    // 1. 截断（PostgreSQL tsvector < 1MB 限制）
-    truncatedTitle, truncatedContent := truncateTitleAndContentForTSVectorField(
-        entry.Title, entry.Content)
-
-    // 2. INSERT 时同步计算 document_vectors
-    query := `
-        INSERT INTO entries (..., document_vectors, ...)
-        SELECT ...,
-            setweight(to_tsvector($11), 'A') || setweight(to_tsvector($12), 'B'),
-            --        ↑ 截断后的标题(权重A)        ↑ 截断后的正文(权重B)
-            $13 ...
-    `
-    // 参数: $11=truncatedTitle, $12=truncatedContent
-}
+```sql
+INSERT INTO entries
+    (title, hash, url, comments_url, published_at, content, author,
+     user_id, feed_id, reading_time, changed_at, document_vectors, tags)
+SELECT
+    $1,       -- entry.Title（原始标题，存入 title 列供显示）
+    $2,       -- entry.Hash（内容哈希，用于去重）
+    $3,       -- entry.URL
+    $4,       -- entry.CommentsURL
+    $5,       -- entry.Date（published_at）
+    $6,       -- entry.Content（原始正文，存入 content 列供显示）
+    $7,       -- entry.Author
+    $8,       -- entry.UserID
+    $9,       -- entry.FeedID
+    $10,      -- entry.ReadingTime
+    now(),    -- changed_at 自动填充
+    -- ★ 关键：document_vectors 列实时计算（不存储原始文本，存分词+权重向量）
+    setweight(to_tsvector($11), 'A') || setweight(to_tsvector($12), 'B'),
+    --          ↑ $11=truncatedTitle  ↑ $12=truncatedContent
+    $13       -- pq.Array(entry.Tags)
+WHERE NOT EXISTS (
+    SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+)
+RETURNING id, status, created_at, changed_at
 ```
+
+**参数映射表（与 tx.QueryRow 调用顺序一一对应）**：
+
+| 占位符 | Go 变量 | 用途 | 是否参与索引 |
+|--------|---------|------|-------------|
+| `$1` | `entry.Title` | 原始标题列存储，供 UI 显示 | 否（截断版本见 `$11`） |
+| `$2` | `entry.Hash` | SHA256 内容哈希，去重+墓碑检查 | 否 |
+| `$3` | `entry.URL` | 条目链接 | 否 |
+| `$4` | `entry.CommentsURL` | 评论链接 | 否 |
+| `$5` | `entry.Date` | 发布时间（published_at） | 否（但影响排序时间衰减） |
+| `$6` | `entry.Content` | 原始正文列存储，供阅读 | 否（截断版本见 `$12`） |
+| `$7` | `entry.Author` | 作者 | 否（作者字段**未被索引**，搜作者名无法命中） |
+| `$8` | `entry.UserID` | 用户隔离 | 否 |
+| `$9` | `entry.FeedID` | 订阅源关联 | 否 |
+| `$10` | `entry.ReadingTime` | 估算阅读时长 | 否 |
+| **`$11`** | **`truncatedTitle`** | **标题截断版本（≤200KB，UTF-8 边界安全）** | **是，权重 A（1.0）** |
+| **`$12`** | **`truncatedContent`** | **正文截断版本（≤500KB，UTF-8 边界安全）** | **是，权重 B（0.4）** |
+| `$13` | `pq.Array(entry.Tags)` | 标签数组 | 否（标签使用 PostgreSQL `@>` 独立过滤） |
+
+**重要区分**：`$1/$6` 存完整文本供显示，`$11/$12` 存截断文本供分词建索引。两者是**不同参数**，避免为了索引截断而丢失用户看到的完整内容。
 
 ### 4.2 订阅源刷新时更新索引
 
 `updateEntry()`（`internal/storage/entry.go:166-210`）：订阅源重新抓取到内容变化时：
 
-```go
-func (s *Storage) updateEntry(tx *sql.Tx, entry *model.Entry) error {
-    truncatedTitle, truncatedContent := truncateTitleAndContentForTSVectorField(
-        entry.Title, entry.Content)
-    query := `
-        UPDATE entries SET
-            title=$1, content=$4, ...,
-            document_vectors = setweight(to_tsvector($7), 'A') || setweight(to_tsvector($8), 'B'),
-            --              ↑ 重新计算
-            tags=$12
-        WHERE user_id=$9 AND feed_id=$10 AND hash=$11
-    `
-}
+```sql
+UPDATE entries
+SET
+    title            = $1,     -- 更新标题显示列
+    url              = $2,
+    comments_url     = $3,
+    content          = $4,     -- 更新正文显示列
+    author           = $5,
+    reading_time     = $6,
+    -- ★ document_vectors 随内容变更而全量重算（增量无意义，分词不可叠加）
+    document_vectors = setweight(to_tsvector($7), 'A') || setweight(to_tsvector($8), 'B'),
+    --                    ↑ $7=truncatedTitle    ↑ $8=truncatedContent
+    tags             = $12
+WHERE
+    user_id = $9   AND
+    feed_id = $10  AND
+    hash    = $11     -- 按 (user_id, feed_id, hash) 三元组定位旧条目
+RETURNING id
 ```
 
-触发入口：`RefreshFeedEntries()` → `updateEntry()`
+**参数映射表**：
+
+| 占位符 | Go 变量 | 参与索引 |
+|--------|---------|---------|
+| `$1` | `entry.Title` | 否 |
+| `$2` | `entry.URL` | 否 |
+| `$3` | `entry.CommentsURL` | 否 |
+| `$4` | `entry.Content` | 否 |
+| `$5` | `entry.Author` | 否 |
+| `$6` | `entry.ReadingTime` | 否 |
+| **`$7`** | **`truncatedTitle`** | **是，权重 A** |
+| **`$8`** | **`truncatedContent`** | **是，权重 B** |
+| `$9` | `entry.UserID` | 否（WHERE 条件） |
+| `$10` | `entry.FeedID` | 否（WHERE 条件） |
+| `$11` | `entry.Hash` | 否（WHERE 条件） |
+| `$12` | `pq.Array(entry.Tags)` | 否 |
+
+**索引刷新原子性**：UPDATE 是单条 SQL 原子操作，`document_vectors` 与 `title/content` 列在同一事务中一起变更。GIN 索引随 `document_vectors` 列的 UPDATE 在同一 WAL 记录中增量维护，不存在"内容更新了但索引未刷新"的窗口期。
+
+触发入口：`RefreshFeedEntries()` → `updateEntry()`（每篇条目独立事务）
 
 ### 4.3 用户手动更新条目内容
 
-`UpdateEntryTitleAndContent()`（`internal/storage/entry.go:50-78`）：用户通过 API 修改条目内容时：
+`UpdateEntryTitleAndContent()`（`internal/storage/entry.go:50-78`）：用户通过 API 修改条目内容或抓取完整网页时：
 
-```go
-func (s *Storage) UpdateEntryTitleAndContent(entry *model.Entry) error {
-    truncatedTitle, truncatedContent := truncateTitleAndContentForTSVectorField(
-        entry.Title, entry.Content)
-    query := `
-        UPDATE entries SET
-            title=$1, content=$2, reading_time=$3,
-            document_vectors = setweight(to_tsvector($4), 'A') || setweight(to_tsvector($5), 'B')
-        WHERE id=$6 AND user_id=$7
-    `
-}
+```sql
+UPDATE entries
+SET
+    title            = $1,
+    content          = $2,
+    reading_time     = $3,
+    -- ★ 用户编辑 / 网页抓取重算索引
+    document_vectors = setweight(to_tsvector($4), 'A') || setweight(to_tsvector($5), 'B')
+    --                    ↑ $4=truncatedTitle  ↑ $5=truncatedContent
+WHERE
+    id      = $6   AND   -- 按 (id, user_id) 精确定位单条
+    user_id = $7
 ```
 
+**参数映射表**：
+
+| 占位符 | Go 变量 | 参与索引 |
+|--------|---------|---------|
+| `$1` | `entry.Title` | 否 |
+| `$2` | `entry.Content` | 否 |
+| `$3` | `entry.ReadingTime` | 否 |
+| **`$4`** | **`truncatedTitle`** | **是，权重 A** |
+| **`$5`** | **`truncatedContent`** | **是，权重 B** |
+| `$6` | `entry.ID` | 否（WHERE 条件） |
+| `$7` | `entry.UserID` | 否（WHERE 条件） |
+
+**与 4.2 的差异**：
+- 此函数不更新 URL、Author、Tags，只更新标题/正文/阅读时长（因此参数更少）
+- WHERE 条件用主键 `id + user_id`，而非 `feed_id + hash`，适用单条 API 修改
+- **不返回 `id`**（无需 RETURNING 子句），使用 `db.Exec` 而非 `QueryRow`
+
 触发入口：
-- API `updateEntryHandler`（用户手动编辑条目）
-- `fetchContentHandler` + `update_content=true`（抓取完整网页后更新）
+- API `updateEntryHandler`（用户通过 JSON API PATCH 条目内容）
+- `fetchContentHandler` + `update_content=true`（readability 抓取完整网页后持久化）
 
 ### 4.4 截断策略（tsvector 1MB 限制）
 
