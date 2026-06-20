@@ -1423,9 +1423,706 @@ Vault → Vault Agent → /etc/miniflux/secrets.conf → Miniflux --config /etc/
 
 **但这两种方式都属于"绕过"应用层加密的外部方案，不是代码层面的实现。**
 
-## 十四、设计决策总结与潜在问题
+---
 
-### 14.1 为什么没有 Token 缓存和刷新？
+## 十四、深度补全：deferred provider.revoke 的兜底重试与人工告警机制
+
+### 14.1 代码事实：Miniflux 不实现任何 OAuth2 Token Revoke 功能
+
+全库搜索 `revoke`、`defer.*revoke`、`deferred.*revoke` 关键词**零命中**。这包括：
+
+- `internal/oauth2/` 包（`manager.go`、`provider.go`、`google.go`、`oidc.go`）：没有任何 `RevokeToken()` / `RevokeAccessToken()` / `CallRevokeEndpoint()` 方法
+- `internal/ui/oauth2_unlink.go`：用户解绑 OAuth2 账号时，只更新数据库中的 `google_id`/`openid_connect_id` 字段，不调用 provider 的 revoke 端点
+- `internal/ui/oauth2_callback.go`：没有 `defer revoke(...)` 来保证 token 在流程失败时被撤销
+
+**OAuth2 登录流程的 token 生命周期：**
+
+```
+oauth2Callback()
+  ├── state 校验
+  ├── oauth2.Config.Exchange(code)  // ← 用 code 换 access_token + (可能有) refresh_token
+  ├── authProvider.Profile(accessToken)  // ← 用 access_token 取用户 profile
+  ├── 绑定到本地用户（更新 DB）
+  └── 认证 Web Session
+  
+  // ↑ 全程没有 revoke 调用
+  // access_token 和 refresh_token 在 Profile() 调用后即被丢弃，不保存在任何地方
+```
+
+**OAuth2 Unlink 流程：**
+
+```go
+// oauth2_unlink.go:17-28 — 解绑只清空数据库字段
+if config.Opts.DisableLocalAuth() {
+    slog.Warn("blocking oauth2 unlink attempt, local auth is disabled", ...)
+    response.HTMLRedirect(w, r, h.routePath("/"))
+    return
+}
+if !user.HasPassword() {
+    slog.Warn("blocking oauth2 unlink attempt, user has no password", ...)
+    response.HTMLRedirect(w, r, h.routePath("/settings"))
+    return
+}
+h.store.UnlinkOAuth2Account(user.ID, provider)  // ← UPDATE users SET google_id=''
+// ↑ 没有调用 provider.revoke(token)
+```
+
+### 14.2 兜底重试机制：完全不存在
+
+不仅没有 revoke 功能，代码库中也不存在任何"兜底重试"框架：
+
+| 重试机制 | 是否存在 | 代码位置 |
+|---|---|---|
+| HTTP 请求重试（指数退避） | ❌ 不存在 | — |
+| Dead Letter Queue（DLQ） | ❌ 不存在 | — |
+| Scheduler 重试任务 | ❌ 不存在 | — |
+| `golang.org/x/time/rate` 限流 | ❌ 不存在 | — |
+| `cenkalti/backoff` / `jpillow/backoff` | ❌ 不存在（go.mod 无依赖） | — |
+| `Retry-After` 解析 | ✅ 存在（仅 Feed 刷新使用） | `response_handler.go:82-96` |
+| 集成推送的自动重试 | ❌ 不存在 | — |
+
+`Retry-After` 的解析仅用于** Feed 刷新调度**，用于调整 `next_check_at`（下次刷新时间），不是"失败重试"，而是"延迟下次尝试"。这不适用于集成推送。
+
+**唯一近似的重试概念：** `parsing_error_count` 计数器（`model/feed.go:36`）在 Feed 刷新失败时递增，但这只是统计用，不触发任何重试调度。集成推送连这个计数器都没有。
+
+### 14.3 人工告警机制：仅依赖结构化日志
+
+代码库中不存在任何主动告警机制：
+
+| 告警机制 | 是否存在 |
+|---|---|
+| 内置 Alertmanager/PagerDuty/Opsgenie 集成 | ❌ 不存在 |
+| Admin Email/SMS 通知 | ❌ 不存在（代码库甚至没有 SMTP 客户端） |
+| Admin Webhook（独立于用户 Webhook） | ❌ 不存在 |
+| 错误阈值告警（连续 N 次失败后自动禁用集成） | ❌ 不存在 |
+| 集成健康状态 API | ❌ 不存在 |
+
+**唯一的"告警"方式**是 `slog.Error` / `slog.Warn` 输出的结构化日志。运维侧需要通过外部日志收集系统（ELK、Promtail + Loki、Datadog 等）配置告警规则，例如：
+
+```
+# 示例 Promtail/Loki 告警规则（伪代码）
+- alert: IntegrationPushFailure
+  expr: count_over_time({app="miniflux"} |= "Unable to send entry to"[1h]) > 10
+  labels:
+    severity: warning
+  annotations:
+    summary: "Integration push failures detected"
+    description: "{{ $value }} push failures in last hour"
+```
+
+但这完全是运维侧的配置，Miniflux 应用层不提供任何内建支持。
+
+### 14.4 如果未来要实现 deferred revoke + 兜底重试 + 告警，需要什么？
+
+假设 Miniflux 未来要实现 OAuth2 token revoke + 兜底重试 + 人工告警，需要添加的组件：
+
+```go
+// 需要新增的接口（概念性设计）
+type TokenRevoker interface {
+    RevokeToken(ctx context.Context, token string) error
+}
+
+type RetryQueue interface {
+    Enqueue(task RetryTask) error
+    ProcessNext(ctx context.Context) error
+    Stats() RetryStats
+}
+
+type AlertNotifier interface {
+    NotifyAdmin(ctx context.Context, alert Alert) error
+}
+```
+
+这些组件在当前代码库中全部缺失。
+
+---
+
+## 十五、深度补全：ActivityPub instance domain 错误分类（DNS 失败 vs TCP RST）的失效桶路径
+
+### 15.1 前置说明：代码库中不存在 ActivityPub 集成
+
+如第九章所述，全库搜索 `mastodon`、`pleroma`、`activitypub` 零命中。但代码库中存在完整的**网络错误分类框架**（`response_handler.go:175-275` 的 `LocalizedError()` 和相关辅助函数），可以基于此分析"如果有 ActivityPub 集成"时 DNS 失败 vs TCP RST 的失效路径。
+
+### 15.2 现有错误分类框架分析
+
+`response_handler.go:175-229` 的 `LocalizedError()` 是全库最完整的错误分类器。它的分类逻辑是：
+
+```
+LocalizedError(clientErr, httpResponse)
+  ├── clientErr != nil （连接层错误）
+  │   ├── isSSLError → error.tls_error 桶
+  │   ├── isNetworkError → error.network_operation 桶
+  │   ├── os.IsTimeout → error.network_timeout 桶
+  │   ├── errors.Is(err, io.EOF) → error.http_empty_response 桶
+  │   └── 其他 → error.http_client_error 桶
+  │
+  ├── clientErr == nil （HTTP 响应层错误）
+  │   ├── Cloudflare Challenge → error.http_cloudflare_challenge 桶
+  │   ├── 401 → error.http_not_authorized 桶
+  │   ├── 403 → error.http_forbidden 桶
+  │   ├── 429 → error.http_too_many_requests 桶
+  │   ├── 404/410 → error.http_resource_not_found 桶
+  │   ├── 500 → error.http_internal_server_error 桶
+  │   ├── 502 → error.http_bad_gateway 桶
+  │   ├── 503 → error.http_service_unavailable 桶
+  │   ├── 504 → error.http_gateway_timeout 桶
+  │   ├── >= 400 → error.http_unexpected_status_code 桶
+  │   └── ContentLength == 0 → error.http_empty_response_body 桶
+  │
+  └── 无错误 → nil
+```
+
+**`isNetworkError` 的判定逻辑**（`response_handler.go:245-259`）：
+
+```go
+func isNetworkError(err error) bool {
+    if _, ok := errors.AsType[*url.Error](err); ok { return true }
+    if errors.Is(err, io.EOF) { return true }
+    if _, ok := errors.AsType[*net.OpError](err); ok { return true }
+    return false
+}
+```
+
+**`os.IsTimeout` 的判定逻辑**（Go 标准库）：检查是否实现了 `Timeout() bool` 方法并返回 true。
+
+### 15.3 DNS 解析失败的失效桶路径
+
+DNS 解析失败时，Go net 包返回的错误链是：
+
+```
+*url.Error {
+    Op: "Get",
+    URL: "https://mastodon.example/api/v1/statuses",
+    Err: *net.OpError {
+        Op: "dial",
+        Net: "tcp",
+        Source: nil,
+        Addr: &net.TCPAddr{IP: nil, Port: 443, Zone: ""},
+        Err: *net.DNSError {
+            Err:        "no such host",
+            Name:       "mastodon.example",
+            Server:     "8.8.8.8:53",
+            IsTimeout:  false,
+            IsTemporary: false,
+            IsNotFound: true,
+        },
+    },
+}
+```
+
+**分类路径：**
+1. `clientErr != nil` → 进入连接层错误分支
+2. `isSSLError()` → false（还没到 TLS 握手）
+3. `isNetworkError()` → true（`*url.Error` 匹配）
+4. **跳过 `os.IsTimeout()`**（因为 `*net.DNSError{IsTimeout: false}`）
+5. **落入 `error.network_operation` 桶**
+6. 封装为 `LocalizedErrorWrapper{originalErr: err, translationKey: "error.network_operation"}`
+
+### 15.4 TCP RST 的失效桶路径
+
+TCP RST（连接被重置）发生在 TCP 三次握手或数据传输阶段，Go net 包返回的错误链是：
+
+```
+*url.Error {
+    Op: "Get",
+    URL: "https://mastodon.example/api/v1/statuses",
+    Err: *net.OpError {
+        Op: "read",
+        Net: "tcp",
+        Source: &net.TCPAddr{IP: 192.168.1.1, Port: 54321, Zone: ""},
+        Addr: &net.TCPAddr{IP: 93.184.216.34, Port: 443, Zone: ""},
+        Err: syscall.ECONNRESET,  // "connection reset by peer"
+    },
+}
+```
+
+**分类路径：**
+1. `clientErr != nil` → 进入连接层错误分支
+2. `isSSLError()` → false（ECONNRESET 不是 x509 错误）
+3. `isNetworkError()` → true（`*net.OpError` 匹配）
+4. `os.IsTimeout()` → false（ECONNRESET 不实现 Timeout() 方法或返回 false）
+5. **落入 `error.network_operation` 桶**
+6. 封装为 `LocalizedErrorWrapper{originalErr: err, translationKey: "error.network_operation"}`
+
+### 15.5 结论：DNS 失败和 TCP RST 走**同一失效桶**
+
+两者的分类路径完全相同：
+- 都匹配 `*url.Error` 或 `*net.OpError` → `isNetworkError()` 返回 true
+- 都不是 SSL 错误
+- 都不是 timeout 错误
+- 都落入 `error.network_operation` 桶
+
+**区分度为零。** 代码库的错误分类框架没有设计"按错误原因细分"的桶——所有网络层错误（DNS 失败、TCP RST、连接被拒绝、主机不可达、TLS 证书过期之外的所有错误）都进入同一个 `error.network_operation` 桶。
+
+### 15.6 与 OAuth Provider 的对比
+
+OAuth2 provider（Google/OIDC）的 token 获取失败路径同样使用这个错误分类框架。例如 Google token endpoint 不可达时：
+- 如果是 DNS 失败 → `error.network_operation` 桶
+- 如果是 TCP RST → `error.network_operation` 桶
+- 如果是 TLS 证书过期 → `error.tls_error` 桶
+- 如果是 401 → `error.http_not_authorized` 桶
+
+**因此，ActivityPub 和 OAuth Provider 的错误分类机制是一致的**——如果 ActivityPub 接入，它会复用同样的 `LocalizedError()` 分类器，DNS 失败和 TCP RST 会走与 OAuth Provider 完全相同的桶路径。
+
+---
+
+## 十六、深度补全：KMS Hook 接入的 Reference 实现示例
+
+### 16.1 总体架构设计
+
+基于 Miniflux 现有的 `config/` 包结构，KMS hook 应该设计为**配置值解析器**，在 `parseEnvVariables()` 之后、`validate()` 之前插入。架构图：
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    config.Options                              │
+│                                                               │
+│  parseFlags() → parseConfigFile() → parseEnvVariables() →     │
+│                                              ↓                │
+│  [NEW] resolveSecretURIs()  ←  SecretProvider 注册表          │
+│              ↓                                                │
+│  validate()                                                   │
+└───────────────────────────────────────────────────────────────┘
+                               ↑
+                               │ 注册 Provider
+                    ┌──────────┴──────────┐
+                    │                     │
+              VaultProvider        AWSKMSProvider
+                    │                     │
+              vault:///...          kms:///...
+```
+
+### 16.2 Reference 实现示例
+
+#### 步骤 1：定义 Secret Provider 接口
+
+```go
+// internal/config/secret_provider.go — 新增文件
+package config
+
+import (
+    "context"
+    "fmt"
+    "strings"
+    "sync"
+)
+
+// SecretProvider 定义了从外部密钥管理系统获取密钥的接口
+type SecretProvider interface {
+    // Scheme 返回支持的 URI scheme（如 "vault", "kms", "gcp-sm"）
+    Scheme() string
+    // Get 从密钥管理系统获取指定路径的密钥值
+    Get(ctx context.Context, uri string) ([]byte, error)
+    // Close 清理资源（关闭连接等）
+    Close(ctx context.Context) error
+}
+
+var (
+    secretProvidersMu sync.RWMutex
+    secretProviders   = make(map[string]SecretProvider)
+)
+
+// RegisterSecretProvider 注册一个密钥提供者
+func RegisterSecretProvider(provider SecretProvider) {
+    secretProvidersMu.Lock()
+    defer secretProvidersMu.Unlock()
+    secretProviders[provider.Scheme()] = provider
+}
+
+// IsSecretURI 判断一个配置值是否是密钥 URI
+func IsSecretURI(value string) bool {
+    return strings.HasPrefix(value, "vault://") ||
+           strings.HasPrefix(value, "kms://") ||
+           strings.HasPrefix(value, "gcp-sm://") ||
+           strings.HasPrefix(value, "azure-kv://")
+}
+
+// resolveSecretURI 解析密钥 URI，返回实际的密钥值
+func resolveSecretURI(ctx context.Context, uri string) (string, error) {
+    parts := strings.SplitN(uri, "://", 2)
+    if len(parts) != 2 {
+        return "", fmt.Errorf("config: invalid secret URI format: %s", uri)
+    }
+    scheme := parts[0]
+
+    secretProvidersMu.RLock()
+    provider, ok := secretProviders[scheme]
+    secretProvidersMu.RUnlock()
+
+    if !ok {
+        return "", fmt.Errorf("config: no secret provider registered for scheme: %s", scheme)
+    }
+
+    secret, err := provider.Get(ctx, uri)
+    if err != nil {
+        return "", fmt.Errorf("config: failed to fetch secret from %s: %w", scheme, err)
+    }
+
+    return string(secret), nil
+}
+
+// resolveAllSecretURIs 遍历所有配置项，解析其中的密钥 URI
+func (c *configParser) resolveAllSecretURIs(ctx context.Context) error {
+    for name, opt := range c.options {
+        if opt.secret && IsSecretURI(opt.value) {
+            resolved, err := resolveSecretURI(ctx, opt.value)
+            if err != nil {
+                return fmt.Errorf("config: failed to resolve %s: %w", name, err)
+            }
+            c.options[name] = configOption{
+                value:       resolved,
+                description: opt.description,
+                secret:      opt.secret,
+            }
+            slog.Debug("Resolved secret URI for config option",
+                slog.String("option", name),
+                slog.String("scheme", strings.SplitN(opt.value, "://", 2)[0]))
+        }
+    }
+    return nil
+}
+```
+
+#### 步骤 2：实现 HashiCorp Vault Provider
+
+```go
+// internal/config/vault_provider.go — 新增文件
+package config
+
+import (
+    "context"
+    "fmt"
+    "os"
+    "path/filepath"
+    "strings"
+
+    vault "github.com/hashicorp/vault/api"
+)
+
+// VaultProvider 实现从 HashiCorp Vault 获取密钥
+type VaultProvider struct {
+    client *vault.Client
+}
+
+// NewVaultProvider 从环境变量创建 Vault 客户端
+func NewVaultProvider() (*VaultProvider, error) {
+    config := vault.DefaultConfig()
+    if addr := os.Getenv("VAULT_ADDR"); addr != "" {
+        config.Address = addr
+    }
+
+    client, err := vault.NewClient(config)
+    if err != nil {
+        return nil, fmt.Errorf("vault: failed to create client: %w", err)
+    }
+
+    // 支持多种认证方式
+    if token := os.Getenv("VAULT_TOKEN"); token != "" {
+        client.SetToken(token)
+    } else if roleID := os.Getenv("VAULT_ROLE_ID"); roleID != "" {
+        // AppRole 认证
+        secretID := os.Getenv("VAULT_SECRET_ID")
+        resp, err := client.Auth().AppRoleLogin(roleID, secretID)
+        if err != nil {
+            return nil, fmt.Errorf("vault: approle login failed: %w", err)
+        }
+        client.SetToken(resp.Auth.ClientToken)
+    } else if k8sSA := os.Getenv("VAULT_K8S_SA_PATH"); k8sSA != "" {
+        // Kubernetes 认证（简化实现）
+        role := os.Getenv("VAULT_K8S_ROLE")
+        jwt, _ := os.ReadFile(filepath.Clean(k8sSA))
+        resp, err := client.Auth().Kubernetes().Login(role, string(jwt))
+        if err != nil {
+            return nil, fmt.Errorf("vault: k8s login failed: %w", err)
+        }
+        client.SetToken(resp.Auth.ClientToken)
+    }
+
+    return &VaultProvider{client: client}, nil
+}
+
+func (p *VaultProvider) Scheme() string { return "vault" }
+
+func (p *VaultProvider) Get(ctx context.Context, uri string) ([]byte, error) {
+    // URI 格式: vault://secret/data/miniflux/encryption_key?field=key
+    path := strings.TrimPrefix(uri, "vault://")
+    
+    // 分离路径和字段查询参数
+    var field string
+    if idx := strings.Index(path, "?field="); idx != -1 {
+        field = path[idx+len("?field="):]
+        path = path[:idx]
+    }
+
+    secret, err := p.client.Logical().ReadWithContext(ctx, path)
+    if err != nil {
+        return nil, fmt.Errorf("vault: read failed: %w", err)
+    }
+    if secret == nil || secret.Data == nil {
+        return nil, fmt.Errorf("vault: secret not found at path: %s", path)
+    }
+
+    // 从 data 中提取字段（KV v2 返回 {data: {key: value}, metadata: {...}}）
+    data, ok := secret.Data["data"].(map[string]interface{})
+    if !ok {
+        // 尝试 KV v1 格式
+        data = secret.Data
+    }
+
+    if field == "" {
+        // 没有指定字段，尝试常见字段名
+        for _, candidate := range []string{"key", "value", "secret", "password", "token"} {
+            if val, ok := data[candidate]; ok {
+                return []byte(fmt.Sprint(val)), nil
+            }
+        }
+        return nil, fmt.Errorf("vault: no field specified and no default field found")
+    }
+
+    val, ok := data[field]
+    if !ok {
+        return nil, fmt.Errorf("vault: field %q not found in secret", field)
+    }
+
+    return []byte(fmt.Sprint(val)), nil
+}
+
+func (p *VaultProvider) Close(ctx context.Context) error {
+    // Vault HTTP 客户端不需要显式关闭
+    return nil
+}
+```
+
+#### 步骤 3：实现 AWS KMS Provider（用于 envelope encryption）
+
+```go
+// internal/config/aws_kms_provider.go — 新增文件
+package config
+
+import (
+    "context"
+    "encoding/base64"
+    "fmt"
+    "strings"
+
+    "github.com/aws/aws-sdk-go-v2/config"
+    "github.com/aws/aws-sdk-go-v2/service/kms"
+    "github.com/aws/aws-sdk-go-v2/service/kms/types"
+)
+
+// AWSKMSProvider 实现用 AWS KMS 解密切钥
+type AWSKMSProvider struct {
+    client *kms.Client
+}
+
+func NewAWSKMSProvider(ctx context.Context, region string) (*AWSKMSProvider, error) {
+    cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+    if err != nil {
+        return nil, fmt.Errorf("aws: failed to load config: %w", err)
+    }
+    return &AWSKMSProvider{client: kms.NewFromConfig(cfg)}, nil
+}
+
+func (p *AWSKMSProvider) Scheme() string { return "kms" }
+
+func (p *AWSKMSProvider) Get(ctx context.Context, uri string) ([]byte, error) {
+    // URI 格式: kms://alias/miniflux-key?ciphertext=AQICAHj...
+    // 或者:    kms://arn:aws:kms:us-east-1:123456789:key/abcd-1234?ciphertext=...
+    path := strings.TrimPrefix(uri, "kms://")
+    
+    var ciphertextBlob string
+    if idx := strings.Index(path, "?ciphertext="); idx != -1 {
+        ciphertextBlob = path[idx+len("?ciphertext="):]
+        path = path[:idx]
+    }
+
+    if ciphertextBlob == "" {
+        return nil, fmt.Errorf("aws-kms: ciphertext parameter required, format: kms://<key-id>?ciphertext=<base64>")
+    }
+
+    encrypted, err := base64.StdEncoding.DecodeString(ciphertextBlob)
+    if err != nil {
+        return nil, fmt.Errorf("aws-kms: invalid base64 ciphertext: %w", err)
+    }
+
+    output, err := p.client.Decrypt(ctx, &kms.DecryptInput{
+        KeyId:          &path,
+        CiphertextBlob: encrypted,
+        EncryptionAlgorithm: types.EncryptionAlgorithmSpecSymmetricDefault,
+    })
+    if err != nil {
+        return nil, fmt.Errorf("aws-kms: decrypt failed: %w", err)
+    }
+
+    return output.Plaintext, nil
+}
+
+func (p *AWSKMSProvider) Close(ctx context.Context) error { return nil }
+```
+
+#### 步骤 4：修改 parser.go 集成到现有流程
+
+```go
+// internal/config/parser.go — 修改 NewConfigParser()
+func NewConfigParser() *configParser {
+    cp := &configParser{options: newDefaultConfigOptions()}
+    
+    cp.parseFlags()
+    cp.parseConfigFile()
+    cp.parseEnvVariables()
+    
+    // [NEW] 解析密钥 URI（放在 validate 之前）
+    if err := cp.resolveAllSecretURIs(context.Background()); err != nil {
+        slog.Error("Failed to resolve secret URIs", slog.Error(err))
+        // 注意：这里可以选择继续启动（用默认值/空值）或者直接 os.Exit(1)
+    }
+    
+    cp.validate()
+    return cp
+}
+```
+
+#### 步骤 5：在 main.go 中注册 Provider
+
+```go
+// main.go — 在 init() 或 main() 开头注册
+func main() {
+    // 注册可用的密钥提供者
+    if vaultProvider, err := config.NewVaultProvider(); err == nil {
+        config.RegisterSecretProvider(vaultProvider)
+        slog.Info("Vault secret provider registered")
+    }
+    if kmsProvider, err := config.NewAWSKMSProvider(
+        context.Background(), 
+        os.Getenv("AWS_REGION"),
+    ); err == nil {
+        config.RegisterSecretProvider(kmsProvider)
+        slog.Info("AWS KMS secret provider registered")
+    }
+    
+    // ... 原有的启动流程 ...
+}
+```
+
+### 16.3 运维侧使用示例
+
+#### 示例 1：用 Vault 存储加密密钥
+
+```bash
+# 1. 在 Vault 中写入密钥
+vault kv put secret/miniflux/encryption key=$(openssl rand -hex 32)
+
+# 2. 配置 Miniflux 使用 Vault 中的密钥
+export ENCRYPTION_KEY="vault://secret/data/miniflux/encryption?field=key"
+export VAULT_ADDR="https://vault.example.com:8200"
+export VAULT_TOKEN="hvs.xxx..."  # 或用 AppRole/K8s auth
+
+# 3. 启动 Miniflux
+miniflux
+```
+
+#### 示例 2：用 AWS KMS 解密切钥（Envelope Encryption 模式）
+
+```bash
+# 1. 生成数据密钥并用 KMS 加密
+aws kms generate-data-key \
+  --key-id alias/miniflux-key \
+  --key-spec AES_256 \
+  --query CiphertextBlob \
+  --output text > encrypted_dek.b64
+
+# 2. 配置 Miniflux
+export ENCRYPTION_KEY="kms://alias/miniflux-key?ciphertext=$(cat encrypted_dek.b64)"
+export AWS_REGION="us-east-1"
+export AWS_ACCESS_KEY_ID="xxx"
+export AWS_SECRET_ACCESS_KEY="xxx"
+# 或使用 IAM Role（EC2/EKS 推荐）
+
+# 3. 启动 Miniflux
+miniflux
+```
+
+### 16.4 配套的加密层示例（用于 token 列加密）
+
+```go
+// internal/crypto/encryption.go — 新增文件（扩展现有 crypto 包）
+package crypto
+
+import (
+    "crypto/aes"
+    "crypto/cipher"
+    "crypto/rand"
+    "encoding/base64"
+    "fmt"
+    "io"
+)
+
+// Encrypt 使用 AES-256-GCM 加密明文
+func Encrypt(plaintext, key []byte) (string, error) {
+    block, err := aes.NewCipher(key)
+    if err != nil {
+        return "", fmt.Errorf("crypto: invalid key: %w", err)
+    }
+
+    gcm, err := cipher.NewGCM(block)
+    if err != nil {
+        return "", fmt.Errorf("crypto: GCM init failed: %w", err)
+    }
+
+    nonce := make([]byte, gcm.NonceSize())
+    if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+        return "", fmt.Errorf("crypto: nonce generation failed: %w", err)
+    }
+
+    ciphertext := gcm.Seal(nonce, nonce, plaintext, nil)
+    return base64.StdEncoding.EncodeToString(ciphertext), nil
+}
+
+// Decrypt 解密 AES-256-GCM 密文
+func Decrypt(ciphertext string, key []byte) ([]byte, error) {
+    data, err := base64.StdEncoding.DecodeString(ciphertext)
+    if err != nil {
+        return nil, fmt.Errorf("crypto: invalid base64: %w", err)
+    }
+
+    block, err := aes.NewCipher(key)
+    if err != nil {
+        return nil, fmt.Errorf("crypto: invalid key: %w", err)
+    }
+
+    gcm, err := cipher.NewGCM(block)
+    if err != nil {
+        return nil, fmt.Errorf("crypto: GCM init failed: %w", err)
+    }
+
+    nonceSize := gcm.NonceSize()
+    if len(data) < nonceSize {
+        return nil, fmt.Errorf("crypto: ciphertext too short")
+    }
+
+    nonce, ciphertextBytes := data[:nonceSize], data[nonceSize:]
+    plaintext, err := gcm.Open(nil, nonce, ciphertextBytes, nil)
+    if err != nil {
+        return nil, fmt.Errorf("crypto: decryption failed: %w", err)
+    }
+
+    return plaintext, nil
+}
+```
+
+### 16.5 依赖项
+
+```bash
+# go.mod 需要添加的新依赖
+go get github.com/hashicorp/vault/api
+go get github.com/aws/aws-sdk-go-v2/config
+go get github.com/aws/aws-sdk-go-v2/service/kms
+```
+
+**注意：** 以上是完整的 reference 实现，但如第九章所述，这些代码**当前不存在于 Miniflux 代码库中**，需要运维/开发团队从零实现。
+
+## 十七、设计决策总结与潜在问题
+
+### 17.1 为什么没有 Token 缓存和刷新？
 
 Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每次请求都重新获取 token（类型 B）或本地生成 token（类型 C）。这带来了：
 
@@ -1439,7 +2136,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 - 对第三方服务造成不必要的认证负载（特别是 Matrix 的设备注册问题）
 - Wallabag 集成忽略了 refresh_token，无法利用 OAuth2 的标准刷新机制
 
-### 14.2 潜在问题
+### 17.2 潜在问题
 
 1. **Wallabag 的 `grant_type=password`**：OAuth2 规范中，Resource Owner Password Grant 已被废弃（RFC 6819），且每次都走密码授权而非 refresh_token，既不安全也不高效
 2. **Matrix 设备累积**：每次推送都通过 `m.login.password` 登录，Matrix 服务端会为每次登录创建一个新的 device session，长期运行可能产生大量设备
@@ -1447,7 +2144,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 4. **无集成健康状态**：Token 失效不会反馈到 UI，用户无法感知集成是否正常工作
 5. **Ntfy 的认证优先级**：当 API Token 和用户名密码同时设置时，两者都会被加到请求头，而非互斥回退
 
-### 14.3 与 Web Session 轮换的对比
+### 17.3 与 Web Session 轮换的对比
 
 Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"防 session fixation 的机制，但它也缺少：
 - 滚动续期（每次活跃使用时延长有效期）
@@ -1456,7 +2153,7 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 
 ---
 
-## 十五、代码文件索引
+## 十八、代码文件索引
 
 | 文件路径 | 作用 |
 |---|---|
@@ -1504,3 +2201,6 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 | `internal/storage/icon.go` | Feed 图标存储（事务使用示例） |
 | `internal/database/database.go` | 数据库迁移（唯一显式使用 tx.Rollback 的业务层） |
 | `internal/config/parser.go` | 配置解析（env/flag/file 三来源解析流程） |
+| `internal/reader/fetcher/response_handler.go` | HTTP 响应错误分类器（LocalizedError、isSSLError、isNetworkError、错误桶划分） |
+| `internal/locale/error.go` | LocalizedErrorWrapper 定义与实现 |
+| `internal/model/feed.go` | Feed 模型（parsing_error_count 计数器、ScheduleNextCheck） |
