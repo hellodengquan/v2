@@ -370,6 +370,67 @@ func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
 
 **结论**：所有通知发送 goroutine 在进程关闭时都是**孤儿状态**——它们既没有 context 可以取消，也没有 WaitGroup 可以等待。RefreshFeed 本身作为同步调用会被 worker pool 等待完成，但它启动的通知子 goroutine 不会被等待。进程的"优雅停止"仅覆盖了 HTTP server 和 worker goroutine，不覆盖通知 goroutine。通知 goroutine 会在 main 返回后、进程被操作系统终止时随进程一起被强制终止。
 
+#### 进程终止对正在发送中 HTTP 请求的精确副作用
+
+当进程被终止时，通知 goroutine 中正在执行的 `httpClient.Do(request)` 会经历什么？这取决于 HTTP 请求的进度阶段：
+
+##### 情况 1：请求尚未发出（DNS 解析 / TCP 连接阶段）
+
+如果 goroutine 正在 `Transport.DialContext` 中执行 DNS 解析或 TCP 三次握手：
+- 操作系统终止进程时，所有打开的文件描述符（包括未完成的 socket）被自动关闭
+- DNS 解析中断：`net.LookupIP` 返回错误（context canceled 或文件描述符无效）
+- TCP 连接中断：`dialer.DialContext` 返回 `connect: can't assign requested address` 或 `use of closed network connection`
+- **后果**：请求从未到达服务端，目标 provider 完全不知道有此请求。下次 Feed 刷新时不会重试此通知。
+
+##### 情况 2：TLS 握手阶段
+
+如果 TCP 连接已建立，正在进行 TLS 握手：
+- 进程终止关闭底层 TCP socket
+- TLS 握手中断，对端收到 TCP RST 或 FIN
+- **后果**：服务端可能看到连接被重置，但 HTTP 请求尚未发出，服务端无法识别这是通知请求
+
+##### 情况 3：请求体正在发送（最危险的情况）
+
+如果 HTTP 请求行和 header 已发送，请求体（JSON payload）正在传输中：
+- 进程终止导致 TCP socket 关闭，发送缓冲区中未发送完的数据丢失
+- 服务端可能收到**不完整的 JSON 请求体**
+- **后果**：
+  - 如果服务端在收到完整请求前检测到连接关闭，会返回 4xx/5xx 错误——但 miniflux 进程已死，无法接收此响应
+  - 如果服务端在请求体不完整的情况下仍然处理（取决于服务端实现），可能产生**部分写入**问题——例如 Pushover API 收到不完整的 JSON 后可能返回错误，也可能按空字段处理
+  - **最关键的不可逆后果**：Webhook 请求体已经到达服务端但 miniflux 已无法接收响应——服务端可能已成功处理，但 miniflux 视为失败；若 miniflux 有重试机制，会导致**重复通知**。当前没有重试机制，所以不存在此问题
+
+##### 情况 4：请求已发完，等待响应
+
+如果完整请求体已发送，goroutine 正在等待服务端响应：
+- 进程终止关闭 socket，服务端发送的响应数据无法被接收
+- 服务端角度：请求已完整到达，服务端正常处理并返回响应，但客户端在响应到达前断开
+- **后果**：这是**唯一可能导致通知实际已成功但 miniflux 认为失败**的场景。由于没有重试机制，不会产生重复通知；但 miniflux 的日志中不会记录此次成功，造成通知状态的**静默不一致**——服务端认为已处理，miniflux 无记录
+
+##### 情况 5：响应已到达，正在读取响应体
+
+如果 `httpClient.Do` 已收到响应头，正在 `io.CopyN` 或 `json.NewDecoder` 读取响应体：
+- 进程终止导致响应体读取中断
+- **后果**：与情况 4 类似——通知实际已成功，但 goroutine 来不及记录日志
+
+##### 情况 6：`httpClient.Do` 已返回，正在执行后续逻辑
+
+如果 HTTP 请求已完成（`httpClient.Do` 返回），goroutine 正在执行后续代码（如 `response.Body.Close()`、错误判断、日志记录）：
+- 进程终止导致后续逻辑被中断
+- **后果**：如果 `defer response.Body.Close()` 未执行，响应体未关闭，但进程终止会回收所有 fd，所以不会泄漏
+
+##### 副作用总结
+
+| 请求阶段 | 服务端是否收到请求 | 通知是否生效 | 是否可能重复 | 日志中是否有记录 |
+|---------|----------------|-----------|-----------|-------------|
+| DNS/TCP 连接 | 否 | 否 | 否 | 否 |
+| TLS 握手 | 否 | 否 | 否 | 否 |
+| 请求体发送中 | 可能部分 | 取决于服务端 | 否 | 否 |
+| 等待响应 | 是 | 是（静默成功） | 否 | 否（无法记录） |
+| 读取响应体 | 是 | 是（静默成功） | 否 | 否（无法记录） |
+| 后续逻辑执行 | 是 | 是 | 否 | 可能部分记录 |
+
+**核心结论**：进程终止对正在发送中通知的最严重副作用不是"通知丢失"（这在当前 Fire-and-Forget 设计下本身就是预期行为），而是**静默成功**——通知实际上已被服务端处理，但 miniflux 侧无任何记录。对于有状态通知（如稍后读服务创建书签），这可能导致用户重复操作；对于纯通知推送（如 Telegram/Discord），后果较轻（用户可能重复收到通知，但当前无重试机制所以不会发生）。
+
 ### 3.3 日志字段约定
 
 失败日志包含以下标准字段（以 `integration.go:57-62` 为例）：
@@ -592,7 +653,108 @@ DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 3. **私有网络检查的覆盖范围**：自定义 `Transport.DialContext` 仅在 **TCP 连接建立时**检查 IP，不在重定向时重新检查。这意味着：
    - 初始请求被检查（例如禁止 `http://127.0.0.1/webhook`）
    - 重定向目标**也会被检查**，因为每次重定向都需要建立新的 TCP 连接，经过同一个 `DialContext`
-4. **签名在重定向中的行为**：`X-Miniflux-Signature` 是基于原始请求体计算的。Go 的 `http.Client` 在跟随 307/308 重定向时会转发原始请求体和大部分请求头，但**可能会修改某些头**（如 `Content-Length`）。签名头不会被自动移除，因此重定向目标接收到的签名仍与原始请求体匹配
+
+4. **签名 header 在重定向中的转发行为**（以下基于 Go 标准库 `net/http/client.go` 源码精确追踪）：
+
+   Go 的 `http.Client.do` 方法在处理重定向时，通过 `makeHeadersCopier` 创建一个 header 复制函数。该函数的行为如下：
+
+   **关键代码路径** (`net/http/client.go:614-693`)：
+
+   ```go
+   // do 方法中初始化
+   copyHeaders = c.makeHeadersCopier(req)
+
+   // 重定向循环中
+   if len(reqs) > 0 {
+       // ...
+       req = &Request{
+           Method:   redirectMethod,
+           Response: resp,
+           URL:      u,
+           Header:   make(Header),    // ← 创建空 Header map，而非复用原始 Header
+           Host:     host,
+           Cancel:   ireq.Cancel,
+           ctx:      ireq.ctx,
+       }
+       // ...
+       if !stripSensitiveHeaders && reqs[0].URL.Host != req.URL.Host {
+           if !shouldCopyHeaderOnRedirect(reqs[0].URL, req.URL) {
+               stripSensitiveHeaders = true
+           }
+       }
+       copyHeaders(req, stripSensitiveHeaders, !includeBody)
+   }
+   ```
+
+   **`makeHeadersCopier` 的核心逻辑** (`net/http/client.go:757-829`)：
+
+   ```go
+   func (c *Client) makeHeadersCopier(ireq *Request) func(...) {
+       var ireqhdr = cloneOrMakeHeader(ireq.Header)  // ← 克隆初始请求的完整 Header
+
+       return func(req *Request, stripSensitiveHeaders, stripBodyHeaders bool) {
+           for k, vv := range ireqhdr {
+               sensitive := false
+               body := false
+               switch CanonicalHeaderKey(k) {
+               case "Authorization", "Www-Authenticate", "Cookie", "Cookie2",
+                    "Proxy-Authorization", "Proxy-Authenticate":
+                   sensitive = true
+               case "Content-Encoding", "Content-Language", "Content-Location",
+                    "Content-Type":
+                   body = true
+               }
+               if !(sensitive && stripSensitiveHeaders) && !(body && stripBodyHeaders) {
+                   req.Header[k] = vv  // ← 复制到新请求
+               }
+           }
+       }
+   }
+   ```
+
+   **`X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` 的转发判断**：
+
+   这两个自定义 header 不在 Go 标准库的 `sensitive` 列表（`Authorization`/`Cookie`/`Proxy-Authorization` 等）中，也不在 `body` 列表（`Content-Type`/`Content-Encoding` 等）中。因此：
+
+   - **`stripSensitiveHeaders = false` 时**（同域重定向）：两个 header **无条件复制**到重定向请求
+   - **`stripSensitiveHeaders = true` 时**（跨域重定向）：因为这两个 header 既不是 `sensitive` 也不是 `body`，所以**仍然复制**到重定向请求
+
+   **`stripSensitiveHeaders` 的触发条件**：
+
+   ```go
+   // net/http/client.go:688-691
+   if !stripSensitiveHeaders && reqs[0].URL.Host != req.URL.Host {
+       if !shouldCopyHeaderOnRedirect(reqs[0].URL, req.URL) {
+           stripSensitiveHeaders = true
+       }
+   }
+   ```
+
+   `shouldCopyHeaderOnRedirect` (`net/http/client.go:1005-1020`) 判断目标 host 是否是源 host 的子域：
+   ```go
+   func shouldCopyHeaderOnRedirect(initial, dest *url.URL) bool {
+       ihost := idnaASCIIFromURL(initial)
+       dhost := idnaASCIIFromURL(dest)
+       return isDomainOrSubdomain(dhost, ihost)  // 目标是源的同域或子域 → true → 不剥离
+   }
+   ```
+
+   综合判断：`stripSensitiveHeaders = true` 当且仅当目标 host **不是**源 host 的同域或子域。但即使 `stripSensitiveHeaders = true`，`X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` 仍会被复制，因为它们**不在敏感 header 列表中**。
+
+   **重定向中请求体的行为**：
+
+   | 重定向状态码 | 请求方法 | 请求体 | Content-Type | 签名 header | 签名是否仍匹配请求体 |
+   |-----------|---------|-------|-------------|------------|-----------------|
+   | 301/302/303 | GET（POST→GET） | **丢弃** | **丢弃**（body=true, stripBodyHeaders=true） | **保留** | ❌ 签名基于原始请求体，但请求体已丢弃 |
+   | 307/308 | POST（保持） | **保留**（如果 `GetBody` 可用） | 保留 | **保留** | ✅ 签名与请求体匹配 |
+
+   **关键细节**：301/302/303 重定向时 POST→GET，`stripBodyHeaders=true` 导致 `Content-Type` 被剥离，但 `X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` **不会被剥离**。重定向目标收到一个无请求体的 GET 请求，但仍然携带 `X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` header——签名与空请求体不匹配，若目标验证签名则会失败。
+
+   **安全影响**：签名 header 在跨域重定向中仍被转发，意味着如果 webhook URL 配置为 `https://example.com/webhook` 而该地址返回 302 重定向到 `https://attacker.com/capture`，攻击者可以捕获 `X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` header。虽然攻击者无法伪造新签名（需要 secret），但他们可以：
+   - 了解到 webhook 的签名格式和事件类型
+   - 对已捕获的请求体+签名进行重放攻击（在签名时效内）
+
+   **Webhook 使用 `http.NewRequest` 而非 `http.NewRequestWithContext`**，因此 `GetBody` 未被设置。307/308 重定向时，由于 `ireq.GetBody == nil && ireq.outgoingLength() != 0`，Go 的 `redirectBehavior` 会设置 `shouldRedirect = false`，直接返回 307/308 响应而不跟随重定向。这意味着 **307/308 重定向实际上不会被跟随**，Webhook 只会跟随 301/302/303（POST→GET，丢弃请求体）。
 
 #### HTTP 客户端行为完整总结
 
@@ -836,7 +998,7 @@ func NewClient(user, token string, priority int, device, urlPrefix string) *Clie
 | `priority` | `> 2` | `2` | Pushover 最高优先级（紧急，需要确认） |
 | `device` | 任意值（含 `""`） | 原样保存 | 空字符串表示发送到用户的所有设备 |
 
-#### `pushover.SendMessages`：空凭证前置检查 (`pushover/pushover.go:76-104`)
+#### `pushover.SendMessages`：空凭证前置检查与字段 fall-through 路径 (`pushover/pushover.go:76-104`)
 
 ```go
 func (c *Client) SendMessages(feed *model.Feed, entries model.Entries) error {
@@ -862,6 +1024,87 @@ func (c *Client) SendMessages(feed *model.Feed, entries model.Entries) error {
 ```
 
 这是三个 provider 中**唯一在发送前做凭证非空校验**的。
+
+#### Pushover `message` 结构体的完整字段 fall-through 分析
+
+`message` 结构体定义 (`pushover/pushover.go:36-47`)：
+
+```go
+type message struct {
+    Token string `json:"token"`
+    User  string `json:"user"`
+
+    Title    string `json:"title"`
+    Message  string `json:"message"`
+    Priority int    `json:"priority"`
+
+    URL      string `json:"url"`
+    URLTitle string `json:"url_title"`
+    Device   string `json:"device,omitempty"`
+}
+```
+
+**Pushover API 支持但 miniflux 未实现的字段**：
+
+Pushover Messages API（`https://pushover.net/api#messages`）支持以下字段，但 miniflux 的 `message` 结构体中**不存在**这些字段：
+
+| Pushover API 字段 | 类型 | miniflux 是否支持 | 缺失时的 Pushover 默认行为 |
+|------------------|------|----------------|------------------------|
+| `sound` | string | **不支持** | Pushover 使用用户设备上配置的默认通知声音 |
+| `timestamp` | int (Unix) | **不支持** | Pushover 使用消息到达服务器的时间 |
+| `callback` | string (URL) | **不支持** | 不设置回调（仅 priority=2 紧急通知可用） |
+| `retry` | int (秒) | **不支持** | 不重试（仅 priority=2 时必须，缺失则 API 返回错误） |
+| `expire` | int (秒) | **不支持** | 不设置过期（仅 priority=2 时必须，缺失则 API 返回错误） |
+| `html` | int (0/1) | **不支持** | 消息按纯文本处理 |
+| `monospace` | int (0/1) | **不支持** | 消息按比例字体显示 |
+| `attachment` | base64 | **不支持** | 不附带图片 |
+
+##### `sound` 字段的完整 fall-through 路径
+
+`sound` 是用户最容易期望但缺失的字段。完整 fall-through 路径如下：
+
+1. **数据库层**：`integrations` 表中没有 `pushover_sound` 列（`migrations.go:1048-1052` 只添加了 `pushover_enabled`/`pushover_user`/`pushover_token`/`pushover_device`/`pushover_prefix`），`feeds` 表也没有
+
+2. **模型层**：`model.Integration` 结构体中没有 `PushoverSound` 字段（`integration.go:124-128`），`model.Feed` 结构体中也没有
+
+3. **表单层**：`ui/form/integration.go:377-381` 中没有 `pushover_sound` 表单字段
+
+4. **调用层**：`integration.go:645-663` 中 `pushover.NewClient(...)` 不传递 sound 参数
+
+5. **客户端层**：`pushover.NewClient(...)` 签名为 `(user, token string, priority int, device, urlPrefix string)`，无 sound 参数
+
+6. **消息构建层**：`pushover.SendMessages` 中 `msg := &message{...}` 不设置 `Sound` 字段
+
+7. **序列化层**：`message` 结构体中无 `Sound` 字段，`json.Marshal` 不会输出 `"sound"` key
+
+8. **Pushover API 层**：收到 JSON 中无 `"sound"` key，**使用用户在 Pushover 客户端/应用设置中配置的默认通知音**
+
+**结论**：`sound` 字段从数据库到 API 的完整路径中**每一层都没有对应字段**，不是"有字段但为空"的情况，而是**完全不存在**。Pushover API 的回退行为是使用用户设备级默认设置，这意味着同一 miniflux 实例的所有通知都使用相同默认声音，无法按 Feed 或用户区分。
+
+##### `URLTitle` 字段的 fall-through 路径
+
+`URLTitle` 在 `message` 结构体中存在，但 `SendMessages` 中未赋值：
+
+```go
+msg := &message{
+    // ...
+    URL:      entry.URL,
+    // URLTitle 未赋值 → 零值 ""
+}
+```
+
+由于 `URLTitle` 的 JSON tag 是 `"url_title"`（**无 `omitempty`**），空字符串 `""` 仍会被序列化为 `"url_title":""` 发送给 Pushover API。Pushover 收到空 `url_title` 时，显示 URL 本身作为链接文本（等同于 `url_title` 未设置的效果）。
+
+##### priority=2 时缺失 `retry`/`expire`/`callback` 的实际后果
+
+当 `feed.PushoverPriority` 被钳制为 `2`（紧急优先级）时，Pushover API **要求**同时提供 `retry` 和 `expire` 字段。但 miniflux 的 `message` 结构体中不存在这两个字段，因此：
+
+- **Pushover API 返回错误**：`{"errors":["Emergency priority messages require the 'retry' and 'expire' parameters."]}` 
+- `makeRequest` 会捕获此错误（`resp.StatusCode >= 400`），解析 `errResp.Errors` 并返回
+- `SendMessages` 中 `return fmt.Errorf("pushover: unable to send message: %w", err)`，后续 entry 不再发送
+- **实际影响**：任何 Feed 级别设置了 `pushover_priority=2` 的通知都会**必然失败**，且该 Feed 的所有 entry 都不会被推送（第一条失败即停止）
+
+这是一个**功能性缺陷**：`NewClient` 允许 priority=2 但不发送必需的 `retry`/`expire` 字段，导致紧急优先级实际上不可用。
 
 #### `pushover.makeRequest`：错误响应解析 (`pushover/pushover.go:106-141`)
 
@@ -896,8 +1139,11 @@ func (c *Client) makeRequest(payload *message) error {
 | `PushoverDevice == ""` | JSON omitempty 不序列化，Pushover 发送到用户全部设备 | 无错误，正常回退 |
 | `PushoverPrefix == ""` | `NewClient` 回退到 `"https://api.pushover.net"` | 无错误，正常回退 |
 | `feed.PushoverPriority < -2` | `NewClient` 钳制为 `-2` | 无错误，正常回退 |
-| `feed.PushoverPriority > 2` | `NewClient` 钳制为 `2` | 无错误，正常回退 |
+| `feed.PushoverPriority == 2` | **Pushover API 必返回错误**（缺少 `retry`/`expire`） | Pushover API 响应：`"Emergency priority messages require the 'retry' and 'expire' parameters."` |
+| `feed.PushoverPriority > 2` | `NewClient` 钳制为 `2`，同上 | 同上 |
 | `feed.PushoverPriority == 0`（默认） | 直接使用 `0`，表示 Pushover 正常优先级 | 无错误 |
+| `sound` 字段 | 从数据库到 API 完全不存在，Pushover 使用用户设备默认声音 | 无错误，但不可自定义 |
+| `URLTitle` 字段 | 结构体有字段但未赋值，序列化为 `"url_title":""`，Pushover 显示 URL 本身作为链接文本 | 无错误 |
 
 **关键特性**：
 - 逐条发送，某条失败后**后续 entry 不再发送**（return error）——与 Discord 一致，与 Telegram 不同
@@ -1017,13 +1263,17 @@ feedScheduler (time.Tick)
 
 3. **无持久化重试**：所有通知采用 Fire-and-Forget 异步模式，失败仅记录日志，无队列、无重试、无死信处理。任何通知发送失败（网络错误、第三方服务不可用等）都会导致该条通知永久丢失。
 
-4. **Graceful Shutdown 时通知 goroutine 既不被 kill 也不被等待**：`go integration.PushEntries(...)` 和 `go integration.SendEntry(...)` 启动的 goroutine 不被 `WaitGroup` 追踪，也不接受 `context.Context`。RefreshFeed 本身作为同步调用会被 worker pool 等待完成，但它启动的通知子 goroutine 不会被等待。关闭时序为：worker pool Shutdown → 等 RefreshFeed 返回 → worker 退出 → main 返回 → 操作系统终止进程。通知 goroutine 在此期间仍在运行，最终随进程被操作系统强制终止，属于"孤儿状态"。
+4. **Graceful Shutdown 时通知 goroutine 既不被 kill 也不被等待**：通知 goroutine 在进程终止时经历"孤儿→被操作系统强制终止"的路径。对正在发送中的 HTTP 请求，副作用取决于请求进度阶段——最严重的不是"通知丢失"（在 Fire-and-Forget 设计下属于预期行为），而是**静默成功**：请求体已完整到达服务端、通知已生效，但 miniflux 侧无任何记录。对于有状态通知（书签创建），可能导致用户重复操作。
 
-5. **Webhook 签名依赖 JSON 结构体字段顺序**：HMAC-SHA256 签名头键名为 `X-Miniflux-Signature`（HTTP/2 下为 `x-miniflux-signature`），使用 Go 标准库小写十六进制编码。签名计算基于 `json.Marshal(payload)` 的完整原始字节输出，Go 的结构体字段声明顺序直接决定签名值，任何字段顺序调整、struct tag 改名、`omitempty` 触发都会导致签名变化。接收方必须对原始请求体字节计算签名。
+5. **Webhook 签名在重定向中始终被转发，即使跨域**：基于 Go 标准库 `net/http/client.go` 的 `makeHeadersCopier` 源码追踪，`X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` 不在 `sensitive` 列表（`Authorization`/`Cookie` 等）中，也不在 `body` 列表（`Content-Type` 等）中，因此在任何重定向场景下都会被复制到新请求。301/302/303 重定向时 POST→GET 丢弃请求体，但签名 header 仍被转发，导致签名与空请求体不匹配；307/308 重定向时因 `GetBody` 未设置（`http.NewRequest` 不自动设置），实际上**不会跟随重定向**，直接返回 307/308 响应。跨域重定向存在签名 header 泄露风险。
 
-6. **三个高频 Provider 回退策略差异显著**：
+6. **Webhook 签名依赖 JSON 结构体字段顺序**：HMAC-SHA256 签名头键名为 `X-Miniflux-Signature`（HTTP/2 下为 `x-miniflux-signature`），使用 Go 标准库小写十六进制编码。签名计算基于 `json.Marshal(payload)` 的完整原始字节输出，Go 的结构体字段声明顺序直接决定签名值，任何字段顺序调整、struct tag 改名、`omitempty` 触发都会导致签名变化。接收方必须对原始请求体字节计算签名。
+
+7. **Pushover 字段 fall-through 从数据库到 API 逐层缺失**：`sound`、`timestamp`、`callback`、`retry`、`expire`、`html`、`monospace`、`attachment` 八个 Pushover API 字段从数据库列→模型字段→表单→调用→客户端→消息构建→序列化每一层都不存在，不是"有字段但为空"，而是**完全不存在**。`sound` 缺失时 Pushover 使用用户设备默认声音；`URLTitle` 存在于结构体但未赋值，空字符串仍被序列化发送；最严重的功能性缺陷是 **priority=2（紧急）时缺失必需的 `retry`/`expire` 字段，导致 Pushover API 必然返回错误**，紧急优先级实际上完全不可用。
+
+8. **三个高频 Provider 回退策略差异显著**：
    - **Discord**：零校验，空/非法 URL 直接在 HTTP 请求阶段失败，失败后停止后续 entry 发送
    - **Telegram**：无前置校验，空 Token/ChatID 由 Telegram API 返回错误，失败后继续发送下一条 entry；客户端未设置 `BlockPrivateNetworks`（风险极低）
-   - **Pushover**：唯一具备前置空凭证校验和参数边界钳制（priority [-2, 2]），空 Prefix 回退官方 API，空 Device 回退全部设备，失败后停止后续 entry 发送
+   - **Pushover**：唯一具备前置空凭证校验和参数边界钳制（priority [-2, 2]），空 Prefix 回退官方 API，空 Device 回退全部设备，失败后停止后续 entry 发送；但 priority=2 是功能性死路
 
-7. **可观测性薄弱**：缺乏通知发送成功率、延迟等指标，也无告警机制。
+9. **可观测性薄弱**：缺乏通知发送成功率、延迟等指标，也无告警机制。
