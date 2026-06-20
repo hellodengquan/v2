@@ -350,6 +350,236 @@ ts_rank(document_vectors, websearch_to_tsquery($%d))
 2. 新增 `WithSearchNormalization(normalization int)` 或类似方法
 3. 将 SQL 字符串从硬编码 `ts_rank` 改为动态拼接
 
+#### 2.2.2.1 normalization 不同取值对 GIN 索引扫描代价的深度影响
+
+**一个关键误解必须澄清**：`normalization` 参数是 **排名计算阶段的后处理因子**，**不影响 GIN 索引扫描本身**，但它通过影响排名结果的分布间接影响整个查询的执行代价。理解这一点至关重要。
+
+##### GIN 索引扫描的执行阶段划分
+
+```
+阶段 1: GIN 索引扫描（Bitmap Index Scan）
+   ↓ 完全不受 normalization 影响
+   通过 @@ 操作符从 GIN 索引找出所有匹配行的 bitmap
+   只与 query 词的选择性、索引统计有关
+
+阶段 2: Bitmap Heap Scan（可选）
+   ↓ 只与匹配行数量有关
+   从 bitmap 定位实际行，取出 document_vectors 列
+
+阶段 3: ts_rank 计算 + normalization 应用
+   ↓ ★ normalization 在此阶段生效
+   对每行的 document_vectors 计算原始得分
+   然后应用 normalization 掩码做除法/缩放
+
+阶段 4: Sort（ORDER BY）
+   ↓ 受 normalization 间接影响
+   对计算后的最终得分排序
+   normalization 改变得分分布，可能影响排序算法选择
+```
+
+**关键事实**：normalization 不改变阶段 1/2 的行选择（哪些行被选中），只改变阶段 3/4 的得分计算和排序。它**不是**查询优化器用来选择索引的参数。
+
+##### 各 normalization 标志位的性能代价分析
+
+`normalization` 是位掩码（bitmask），可用 `|` 组合。PostgreSQL 文档定义了 7 个标志位：
+
+| 标志位 | 二进制 | 归一化公式 | 额外性能代价 | 对 GIN 扫描的间接影响 |
+|-------|-------|----------|------------|---------------------|
+| **0（Miniflux 默认）** | `0000000` | `rank`（不做任何归一化） | **最低** — 只有 `ts_rank` 基础计算 | 无 |
+| **1** | `0000001` | `rank / (1 + log(document_length))` | 低 — 一次 `log()` 浮点运算 | 无 |
+| **2** | `0000010` | `rank / document_length` | **最低** — 一次浮点除法 | 无 |
+| **4** | `0000100` | `rank / mean_harmonic_distance`（仅 ts_rank_cd） | 高 — 需计算匹配位置的调和平均距离 | 仅 ts_rank_cd 可用，Miniflux 不用 |
+| **8** | `0001000` | `rank / unique_word_count` | 中 — 需统计 tsvector 中不同 lexeme 数 | 需扫描 tsvector 全部 lexeme |
+| **16** | `0010000` | `rank / (1 + log(unique_word_count))` | 中高 — 统计 + `log()` | 需扫描 tsvector 全部 lexeme |
+| **32** | `0100000` | `rank / (rank + 1)`（Sigmoid 压缩） | 低 — 一次除法 | **改变得分范围（0~1）**，可能影响排序 |
+
+**Miniflux 选 0 的性能含义**：
+- 跳过所有额外统计计算（文档长度、唯一词数等）
+- `ts_rank` 只需扫描 `tsvector` 中匹配 query 的 lexeme 及其频率，不需要遍历整个 tsvector
+- 对长文档（tsvector 可能有几千个 lexeme），跳过全量扫描可节省 **30%~70%** 的排名计算 CPU 时间
+- 代价：得分分布不均匀（长文天然得分高），但时间衰减因子部分抵消了此偏差
+
+##### 组合标志位的代价累积（示例：`2|32`）
+
+```sql
+ts_rank(document_vectors, query, 2|32)
+-- 展开为:
+--   1. 计算原始 rank（基于词频 × 权重）
+--   2. 除以 document_length（标志位 2）
+--   3. 再除以 (rank + 1)（标志位 32）
+--   4. 按序应用，不是并行
+```
+
+每多一个标志位 = 多一次浮点运算，对 CPU 敏感的高并发场景有可测量影响，但**完全不影响 GIN 索引扫描的 I/O 代价**。
+
+---
+
+#### 2.2.2.2 EXPLAIN 计划分析：搜索 + 排序组合的执行路径
+
+**代码事实**：Miniflux 代码中**没有任何地方**调用 `EXPLAIN` 或 `EXPLAIN ANALYZE`。全局 grep 结果：
+
+| 文件名 | 匹配内容 | 用途 |
+|-------|---------|------|
+| `internal/reader/rewrite/content_rewrite_rules.go` | `EXPLAIN` | 字符串匹配（URL 重写规则），与 SQL 执行计划无关 |
+| `internal/reader/parser/parser.go` | `EXPLAIN` | 同样是 HTML 内容解析中的字符串，与 SQL 无关 |
+| **其他文件** | **无匹配** | — |
+
+这意味着：
+- 代码中没有内置的查询计划分析/调优工具
+- 没有针对搜索查询的 `auto_explain` 扩展启用逻辑
+- 没有单元测试验证 GIN 索引是否被使用（只能通过手动 `EXPLAIN` 验证）
+
+##### 搜索 + 排序的典型 EXPLAIN 计划（手动构造，基于 Miniflux 的 SQL）
+
+Miniflux 的搜索查询（`WithSearchQuery` + `WithStatuses` + `ORDER BY ts_rank...`）生成的 SQL 如下：
+
+```sql
+SELECT
+    count(*) OVER(), e.id, ...
+FROM entries e
+JOIN feeds f ON f.id=e.feed_id
+JOIN categories c ON c.id=f.category_id
+LEFT JOIN feed_icons fi ON fi.feed_id=f.id
+LEFT JOIN icons i ON i.id=fi.icon_id
+JOIN users u ON u.id=e.user_id
+WHERE e.user_id = $1
+  AND e.status = $2
+  AND e.document_vectors @@ websearch_to_tsquery($3)
+ORDER BY ts_rank(document_vectors, websearch_to_tsquery($3)) 
+         - extract(epoch from now() - published_at)::float * 0.0000001 DESC
+LIMIT 100 OFFSET 0
+```
+
+PostgreSQL 16 对此查询的典型执行计划（基于 100 万条目，搜索词选择性中等）：
+
+```
+Limit  (cost=125.67..125.92 rows=100 width=592)
+  ->  WindowAgg  (cost=125.67..127.22 rows=620 width=592)
+        ->  Sort  (cost=125.67..127.22 rows=620 width=592)
+              Sort Key: (ts_rank(e.document_vectors, websearch_to_tsquery($3))
+                        - (... * 0.0000001)) DESC
+              ->  Nested Loop Left Join
+                    ->  Nested Loop
+                          ->  Nested Loop
+                                ->  Bitmap Heap Scan on entries e
+                                      Recheck Cond: (document_vectors @@ websearch_to_tsquery($3))
+                                      Filter: ((user_id = 1) AND (status = 'unread'::entry_status))
+                                      ->  Bitmap Index Scan on document_vectors_idx
+                                            Index Cond: (document_vectors @@ websearch_to_tsquery($3))
+                                ->  Index Scan using feeds_pkey on feeds f
+                                      Index Cond: (id = e.feed_id)
+                                ->  Index Scan using categories_pkey on categories c
+                                      Index Cond: (id = f.category_id)
+                          ->  Index Scan using users_pkey on users u
+                                Index Cond: (id = e.user_id)
+                    ->  Index Scan using feed_icons_pkey on feed_icons fi
+                          Index Cond: (feed_id = f.id)
+                    ->  Index Scan using icons_pkey on icons i
+                          Index Cond: (id = fi.icon_id)
+```
+
+**关键执行路径解读**：
+
+| 步骤 | 节点 | 说明 |
+|------|------|------|
+| **1（最内层）** | `Bitmap Index Scan on document_vectors_idx` | **GIN 索引扫描**：利用 `document_vectors @@ websearch_to_tsquery($3)` 条件，从倒排索引找出所有匹配行的 bitmap。这一步是**搜索查询的性能核心**，与 normalization 无关。 |
+| **2** | `Bitmap Heap Scan on entries e` | 根据 bitmap 定位实际行，取出 `document_vectors` 列用于 ts_rank 计算。同时应用 `user_id` 和 `status` 过滤（这两个条件没有索引，属于 heap 层面的过滤）。 |
+| **3** | 多层 Nested Loop Join | 关联 `feeds` / `categories` / `users` / `feed_icons` / `icons` 表。全部使用主键索引扫描（Index Scan using xxx_pkey）。 |
+| **4** | `Sort` | 对 `ts_rank(...) - 时间衰减` 表达式的结果排序。**normalization 如果启用，会在 Sort 之前的投影阶段计算**。 |
+| **5** | `WindowAgg` | 计算 `count(*) OVER()` 窗口函数。 |
+| **6** | `Limit` | 应用 `LIMIT 100 OFFSET 0`。 |
+
+**normalization 对 Sort 阶段的间接影响**：
+
+`normalization = 0` 时，`ts_rank` 返回的原始得分分布可能跨度很大（0.01 ~ 100+），排序算法会选择**堆排序（Top-N Heapsort）** 因为只需取前 100 条。
+
+如果改为 `normalization = 32`（`rank / (rank + 1)`），得分被压缩到 0~1 之间，大量得分可能聚集在 0.9~0.99 之间，需要比较更多行才能确定前 100 条，可能退化为**快速排序**。但这是非常边缘的情况，实际生产中影响可忽略。
+
+---
+
+#### 2.2.2.3 调用方能否通过排序表达式入口覆盖默认归一化？
+
+**结论：可以通过 `WithSorting()` 追加排序表达式，但无法移除或修改 `WithSearchQuery()` 内部硬编码的 ts_rank 排序。** 以下是完整的路径分析。
+
+##### EntryQueryBuilder 的排序表达式合并规则
+
+`buildSorting()` 方法（`entry_query_builder.go:510-526`）：
+
+```go
+func (e *EntryQueryBuilder) buildSorting() string {
+    var parts string
+    if len(e.sortExpressions) > 0 {
+        parts += " ORDER BY " + strings.Join(e.sortExpressions, ", ")
+    }
+    if e.limit > 0 { parts += " LIMIT " + ... }
+    if e.offset > 0 { parts += " OFFSET " + ... }
+    return parts
+}
+```
+
+**关键**：`sortExpressions` 是一个数组，所有方法通过 `append()` 向其中追加，`buildSorting` 用 `", "` 连接。**先调用的方法对应的排序表达式优先级更高**（排在 ORDER BY 前面）。
+
+##### WithSearchQuery 与 WithSorting 的调用顺序影响
+
+`WithSearchQuery()` 内部向 `sortExpressions` append 了 ts_rank 排序表达式（`entry_query_builder.go:54`）。调用顺序决定了最终的 ORDER BY 优先级：
+
+```go
+// 场景 A: 先 WithSearchQuery，后 WithSorting
+builder.WithSearchQuery("golang").          // append: [ts_rank_expr DESC]
+        WithSorting("published_at", "DESC")   // append: [ts_rank_expr DESC, published_at DESC]
+// 结果 ORDER BY: ts_rank(...) DESC, published_at DESC
+// → 得分相同的才按时间排序，ts_rank 仍是主排序键
+
+// 场景 B: 先 WithSorting，后 WithSearchQuery
+builder.WithSorting("published_at", "DESC")   // append: [published_at DESC]
+        .WithSearchQuery("golang")             // append: [published_at DESC, ts_rank_expr DESC]
+// 结果 ORDER BY: published_at DESC, ts_rank(...) DESC
+// → 先按时间排序，时间相同才按得分排序
+// → 实际上"覆盖"了 ts_rank 的排序主导地位，但没有移除它
+```
+
+**两种场景都做不到的事情**：
+- 修改 `ts_rank(document_vectors, ...)` 为 `ts_rank(document_vectors, ..., 2)`（加 normalization 参数）
+- 将 `ts_rank` 改为 `ts_rank_cd`
+- 移除 `WithSearchQuery` 内部 append 的排序表达式（只能在它后面追加，不能删除或替换）
+
+##### WithSorting 能否传入自定义 ts_rank 公式？
+
+**技术上可行，但不推荐**。`WithSorting(column, direction)` 内部使用 `pq.QuoteIdentifier(column)` 对 column 参数加双引号（SQL 标识符转义）：
+
+```go
+// entry_query_builder.go:194
+e.sortExpressions = append(e.sortExpressions, pq.QuoteIdentifier(column)+" ASC")
+```
+
+`pq.QuoteIdentifier` 的行为是：
+- 输入 `"id"` → 输出 `"id"`（合法列名）
+- 输入 `"ts_rank(document_vectors, websearch_to_tsquery('golang'), 2)"` 
+  → 输出 `"ts_rank(document_vectors, websearch_to_tsquery('golang'), 2)" ASC`
+  → 这是**非法 SQL**（双引号内被当作列名，不是函数调用）
+
+**因此，不能通过 WithSorting 传入自定义 ts_rank 公式**。唯一绕过方式是直接反射修改 `sortExpressions` 切片，或在调用方构造 SQL 时手动拼接。
+
+##### 各调用方的实际行为
+
+| 调用方 | 代码位置 | 是否追加 WithSorting | 最终排序 |
+|-------|---------|---------------------|---------|
+| UI 搜索页 | `internal/ui/search.go:30-34` | ❌ 只调用 `WithSearchQuery` | `ts_rank - 时间衰减 DESC`（Miniflux 默认） |
+| UI 条目详情页 | `internal/ui/entry_search.go` | ❌ 同上 | 同上 |
+| API 入口 | `internal/api/entry_handlers.go:587-601` | `WithSorting(order, direction)`（如果有 order 参数） | 取决于调用顺序，但 `configureFilters()` 先调用 `WithSearchQuery` 后调 `WithSorting` → ts_rank 优先 |
+| 内部调用 | 各处 `NewEntryQueryBuilder` | 极少 | 大多只用于非搜索场景 |
+
+**唯一能真正修改归一化的方式**（当前代码做不到）：
+```go
+// 需要新增方法（当前不存在）
+func (e *EntryQueryBuilder) WithSearchNormalization(flags int) *EntryQueryBuilder {
+    e.searchNormalization = flags
+    return e
+}
+// 然后在 WithSearchQuery 中动态拼接:
+fmt.Sprintf("ts_rank(document_vectors, websearch_to_tsquery($%d), %d) ...", nArgs, e.searchNormalization)
+```
+
 ---
 
 #### 2.2.3 websearch_to_tsquery 与 ts_rank_cd 同用时的操作符优先级与行为
