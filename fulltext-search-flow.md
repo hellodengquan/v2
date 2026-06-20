@@ -21,23 +21,84 @@ Miniflux 的全文搜索基于 PostgreSQL 原生的全文检索能力（tsvector
 | `feed_id` | `bigint` | 关联订阅源 |
 | `user_id` | `int` | 所属用户（隔离数据） |
 
-### 1.2 索引创建（迁移脚本）
+### 1.2 索引创建与权重重建（迁移脚本完整历史）
 
-索引创建位于 `internal/database/migrations.go`：
+`internal/database/migrations.go` 中的 `migrations` 数组是**按序号递增**的迁移列表（注释"Order is important. Add new migrations at the end of the list."），与全文搜索相关的迁移共有 **4 次**，覆盖了从引入到权重重建、再到索引裁剪的完整生命周期：
+
+| 迁移序号（数组下标） | 所在行号 | 操作类型 | 具体内容 |
+|---------------------|---------|---------|---------|
+| **#21** | `migrations.go:278` | **首次引入** | 新增 `document_vectors tsvector` 列；全量 UPDATE 生成初始向量；创建全量 GIN 索引 |
+| **#23** | `migrations.go:292` | **权重重建** | 全量 UPDATE 重建全部 `document_vectors`，从"标题+空格+正文混为一体（默认权重 D）"改为"标题权重 A + 正文权重 B 分离" |
+| **#…** | — | — | 中间多次迁移不涉及全文搜索（users/feeds 等表结构变更） |
+| **#N（接近末尾）** | `migrations.go:1400` | **索引裁剪** | DROP 原全量索引，重建 `WHERE status != 'removed'` 的**部分索引**，为已删除条目节省索引空间 |
+
+#### 1.2.1 迁移 #21 — 初始引入（无权重，标题正文混合）
 
 ```sql
--- 迁移步骤 1: 添加 tsvector 列并生成初始数据
 ALTER TABLE entries ADD COLUMN document_vectors tsvector;
-UPDATE entries SET document_vectors = to_tsvector(substring(title || ' ' || coalesce(content, '') for 1000000));
 
--- 迁移步骤 2: 创建 GIN 索引（倒排索引）
+-- ★ 注意: 标题和内容用空格拼接后统一 to_tsvector，未用 setweight
+-- 所有词默认落在权重 D（0.1），标题与正文无区分度
+UPDATE entries
+   SET document_vectors = to_tsvector(
+           substring(title || ' ' || coalesce(content, '') for 1000000)
+           --        ↑ 硬编码 1,000,000 字符（≈1MB 原文，≈占满 tsvector 上限）
+       );
+
 CREATE INDEX document_vectors_idx ON entries USING gin(document_vectors);
-
--- 迁移步骤 3: 引入权重系统（标题 A / 内容 B）
-UPDATE entries SET document_vectors = 
-    setweight(to_tsvector(substring(coalesce(title, '') for 1000000)), 'A') 
-    || setweight(to_tsvector(substring(coalesce(content, '') for 1000000)), 'B')
 ```
+
+**此版本的缺陷**：
+- `title` 和 `content` 拼接后统一处理，词在标题中出现和在正文中出现权重**完全相同**（都是默认 D = 0.1）
+- `substring(... for 1000000)` 是**字符数**不是字节数，对中文（UTF-8 3字节/字）实际约 3MB 原文，可能触发 PostgreSQL `string is too long for tsvector` 报错（当时 1MB 限制尚未在应用层强制截断）
+
+#### 1.2.2 迁移 #23 — 权重重建（标题 A / 正文 B 分离）
+
+这是**最关键的权重迁移**，一次性重写全表所有 `document_vectors`：
+
+```sql
+UPDATE entries
+   SET document_vectors =
+           setweight(to_tsvector(substring(coalesce(title, '') for 1000000)), 'A')
+           --        ↑ 标题单独分词，赋权重 A（1.0）
+        ||
+           setweight(to_tsvector(substring(coalesce(content, '') for 1000000)), 'B')
+           --        ↑ 正文单独分词，赋权重 B（0.4）
+```
+
+**代码证据**：`migrations.go:294-297` 的 UPDATE 语句直接出现在迁移数组第 23 个元素（紧接 #21 的 `username/password` 列添加之后、`user_agent` 列添加之前）。
+
+**此迁移前后 ts_rank 得分比例变化**（以词 "golang" 为例）：
+
+| 出现位置 | 迁移 #21 前（混合 D） | 迁移 #23 后（分离 A/B） |
+|---------|---------------------|------------------------|
+| 仅标题出现 1 次 | 词频 × 0.1 | 词频 × 1.0（**提升 10 倍**） |
+| 仅正文出现 1 次 | 词频 × 0.1 | 词频 × 0.4（**提升 4 倍**） |
+| 标题 1 次 + 正文 1 次 | 2 × 0.1 = 0.2 | 1.0 + 0.4 = 1.4（**提升 7 倍**） |
+
+**注意事项**：
+- 此次迁移为**全表 UPDATE**，对大数据库是重量级操作（产生大量 WAL、锁表、触发 GIN 索引全量重建）
+- 迁移未使用 `CREATE INDEX CONCURRENTLY`，在 Miniflux 单用户/小团队场景可接受
+- 迁移后后续新写入（`createEntry`/`updateEntry`）也同步使用相同的 setweight 公式，保持一致
+
+#### 1.2.3 末尾迁移 — 索引裁剪（部分 GIN 索引）
+
+在引入软删除（`status='removed'`）和墓碑表（`entry_tombstones`）之后，接近末尾的一次迁移优化了索引体积：
+
+```sql
+DROP INDEX document_vectors_idx;
+
+CREATE INDEX document_vectors_idx
+    ON entries
+    USING gin(document_vectors)
+    WHERE status != 'removed';   -- ★ 部分索引条件
+```
+
+**收益**：
+- 已标记为 `removed` 的条目虽然保留行（供墓碑去重），但其全文搜索向量**不再占索引空间**
+- PostgreSQL 查询优化器自动过滤 `status='removed'` 的条目（因搜索 WHERE 条件均含用户过滤+状态隐含约束），部分索引完全可用
+
+---
 
 **权重策略（setweight 与 ts_rank 协同）**：
 - 标题（title）→ `setweight(..., 'A')` → **权重 A**（最高，匹配时排名靠前）
@@ -191,6 +252,44 @@ func (e *EntryQueryBuilder) WithSearchQuery(query string) *EntryQueryBuilder {
    - `ts_rank()`：根据词频、权重、逆文档频率计算相关度
    - 时间衰减系数：`0.0000001 ≈ 0.1 / 86400`（每天衰减 0.1 分）
    - 新文章排名天然靠前，旧文章需要更高相关度才能排名靠前
+
+#### 2.2.1 ts_rank vs ts_rank_cd：Miniflux 为何选择 ts_rank 以及邻近性排序的影响
+
+PostgreSQL 提供两种全文相关度排名函数，**Miniflux 明确使用 `ts_rank()` 而非 `ts_rank_cd()`**（代码全局 grep `ts_rank_cd` / `cover_density` 无任何匹配）。两者在多关键字搜索下行为差异显著：
+
+| 维度 | `ts_rank()`（Miniflux 使用） | `ts_rank_cd()`（Cover Density，未使用） |
+|------|------------------------------|----------------------------------------|
+| **核心算法** | 词频 × 权重 × 逆文档频率（TF-IDF 变体） | Clarke-Cormack-Tudhope 覆盖密度算法 |
+| **多关键字邻近性** | ❌ **完全忽略**。词 A 在第 1 段、词 B 在末段 vs 词 A 词 B 相邻，得分相同 | ✅ **核心考虑**。相邻匹配得分远高于分散匹配 |
+| **对短语匹配的敏感度** | "postgresql performance" 两词分两处出现 = 两词紧邻出现 | 两词紧邻（距离 1） >> 两词相隔 100 词 >> 两词分处两段 |
+| **位置信息依赖** | 需要位置（计算权重）但不计算距离 | **强依赖位置**，无位置信息的 tsvector 返回 0 |
+| **归一化参数** | 支持 1/2/4/8/16/32 六种归一化（文档长度、日志等） | 同样归一化参数集，但默认值都是 `0`（不归一化） |
+
+**Miniflux 选择 ts_rank 的原因（代码事实推导）**：
+
+1. **RSS 条目长度差异极大**：从几十字的微推到几万字的长文，`ts_rank_cd` 的"覆盖密度"对长文不友好——长文即使包含所有关键字，但因整体长度大，覆盖密度分数反而低；`ts_rank` 通过词频累积对长文更公平
+2. **排序目标是"新且相关"而非"精确匹配"**：Miniflux 的排序公式 `ts_rank - 时间衰减` 本质上是让新文章占优势；如果改用 `ts_rank_cd`，会让"关键词紧密相邻"的旧文章排名反超"关键词分散"的新文章，与 RSS 阅读器的时效性期望冲突
+3. **`websearch_to_tsquery` 本身已提供短语匹配**：用户可输入 `"postgresql performance"`（带引号）强制短语匹配，`websearch_to_tsquery` 会生成带 `<->` 邻近操作符的 tsquery，`@@` 匹配阶段即过滤非短语结果，不需要 ranking 阶段用 `ts_rank_cd` 再次强化
+4. **性能**：`ts_rank_cd` 需要对匹配位置做区间覆盖计算，复杂度高于纯词频统计的 `ts_rank`
+
+**多关键字场景的具体行为差异对比**（示例：查询 `postgresql fulltext search`，三词 AND）：
+
+假设文档 A：`"PostgreSQL fulltext search engine..."`（三词紧邻出现在开头）
+假设文档 B：长文，"PostgreSQL" 在第 1 段，"fulltext" 在第 10 段，"search" 在最末段
+
+| 函数 | 文档 A 得分 | 文档 B 得分 | 排名结果 |
+|------|-----------|-----------|---------|
+| **`ts_rank`**（Miniflux） | ≈1.0+1.0+1.0 = **3.0**（词频相同，权重相同） | ≈1.0+1.0+1.0 = **3.0**（三词各出现 1 次，频率相同） | **A 与 B 并列**，靠时间衰减分胜负 |
+| `ts_rank_cd`（未使用） | **高**（三词紧邻，覆盖区间长度 ≈ 词距=2，密度 = 3/2 = 1.5） | **低**（三词覆盖长度 ≈ 2000 词，密度 = 3/2000 = 0.0015） | **A 远高于 B**（可能差 1000 倍） |
+
+**如果未来 Miniflux 想增强多关键字邻近性**：
+```sql
+-- 可选方案：混合 ts_rank（词频）+ ts_rank_cd（邻近）+ 时间衰减
+ts_rank(document_vectors, query) * 0.6
++ ts_rank_cd(document_vectors, query) * 0.4
+- extract(epoch from now() - published_at)::float * 0.0000001 DESC
+```
+但当前代码（`entry_query_builder.go:169-171`）仅使用 `ts_rank`，不涉及 `ts_rank_cd`。
 
 ### 2.3 各过滤条件与全文搜索的组合
 
@@ -543,28 +642,116 @@ WHERE
 - API `updateEntryHandler`（用户通过 JSON API PATCH 条目内容）
 - `fetchContentHandler` + `update_content=true`（readability 抓取完整网页后持久化）
 
-### 4.4 截断策略（tsvector 1MB 限制）
+### 4.4 截断策略与尾部内容命中丢失分析
 
-PostgreSQL 的 `tsvector` 单个值最大为 1MB。长文章需截断：
+PostgreSQL 的 `tsvector` 单个值最大为 1MB（PostgreSQL 源码 `src/include/tsearch/ts_type.h` 中定义的限制）。Miniflux 通过**三层截断机制**保证不越界，但代价是**超长文章尾部不可搜索**。
+
+#### 4.4.1 三层截断的完整代码路径
+
+```
+原始 RSS 条目正文（可能 MB 级）
+        │
+        ▼ 第 1 层：迁移脚本 SQL 层（历史遗留，当前写入路径已不再使用）
+│    substring(coalesce(content, '') for 1000000)
+│    -- PostgreSQL substring(... for N) 按 "字符数" 截断，非字节数
+│    -- 仅用于迁移 #21、#23 的历史回刷
+        │
+        ▼ 第 2 层：Go 应用层标题/正文独立字符数截断（当前主路径）
+│    truncateTitleAndContentForTSVectorField(entry.Title, entry.Content)
+│    ├── 标题: truncateStringForTSVectorField(title, 200000)   ← 最多 20 万字符
+│    └── 正文: truncateStringForTSVectorField(content, 500000) ← 最多 50 万字符
+│    -- 合计 ≤ 70 万字符；UTF-8 中文约 3 字节/字 → ≈ 2.1MB 原文
+│    -- 留出约 800KB 给分词后的 lexeme 列表 + 位置数组 + 权重标签
+        │
+        ▼ 第 3 层：Go UTF-8 字符边界安全截断（truncateStringForTSVectorField 内部）
+     truncateStringForTSVectorField(s string, maxSize int) string
+     ├── if len(s) < maxSize: return s   ← 快速路径，不足上限直接返回
+     ├── truncated := s[:maxSize-1]      ← 按字节切，可能切到多字节汉字中间
+     └── 从末尾向前回退:
+         ├── 遇到 0xxxxxxx (ASCII): 截断在此
+         ├── 遇到 11xxxxxx (多字节起始): 截断在此之前，保留完整字符
+         └── 遇到 10xxxxxx (continuation byte): 继续回退
+     -- 回退逻辑保证不会出现无效 UTF-8 序列传给 to_tsvector
+     -- 特殊 fallback: 全是 continuation byte（病理输入）→ 返回空串
+```
+
+#### 4.4.2 truncateStringForTSVectorField 关键实现（`storage/entry.go:686-708`）
 
 ```go
-func truncateTitleAndContentForTSVectorField(title, content string) (string, string) {
-    // 标题最多索引前 200,000 字符 ≈ 200KB
-    // 正文最多索引前 500,000 字符 ≈ 500KB
-    // 合计留足 300KB 给分词后的位置和权重信息
-    return truncateStringForTSVectorField(title, 200000),
-           truncateStringForTSVectorField(content, 500000)
-}
-
 func truncateStringForTSVectorField(s string, maxSize int) string {
-    // ... 按 UTF-8 字符边界截断，不破坏多字节字符
+    if len(s) < maxSize {     // ★ 注意: 此处比较的是 len(s) = 字节数，不是 rune 数
+        return s              // 快速路径: 字节长度 < maxSize 直接返回
+    }
+
+    truncated := s[:maxSize-1]
+    // 从末尾字节向前回溯找 UTF-8 边界
+    for i := len(truncated) - 1; i >= 0; i-- {
+        if (truncated[i] & 0x80) == 0 {
+            return truncated[:i+1]       // ASCII 起始: 保留到该字节
+        }
+        if (truncated[i] & 0xC0) == 0xC0 {
+            return truncated[:i]         // 多字节起始: 保留到该字符之前
+        }
+    }
+    return ""  // Fallback: 找不到合法边界 → 空串（保证 to_tsvector 不报错）
 }
 ```
 
-**设计取舍**：
-- 不索引全文而是取头部，牺牲尾部词的可搜索性
-- 大多数文章核心信息位于前 500KB 文本中
-- 避免 PostgreSQL `string is too long for tsvector` 错误
+**重要代码事实**：
+- `maxSize` 参数单位是**字节**（`len(s)` 返回字节数），不是字符数
+- 正文 `maxSize = 500,000` ≈ **488 KB**，标题 `maxSize = 200,000` ≈ **195 KB**
+- 对英文（1 字节/字）：正文可索引约 **50 万词**（足够任何 RSS 条目）
+- 对中文（3 字节/字）：正文可索引约 **16.6 万汉字**（约 500~1000 段正文）
+
+**单元测试覆盖**（`entry_test.go:11-97` 的 7 个测试用例）：
+
+| 测试用例 | 输入 | 验证点 |
+|---------|------|-------|
+| Test case 1 | 短中文 "这是一个简短的中文测试文本" | 不截断，原样返回 |
+| Test case 2 | `strings.Repeat("汉", 350K+)`（> 1MB） | 截断后 < 1MB，是原串前缀，UTF-8 合法 |
+| Test case 3 | 恰好等于上限 - 1 的 ASCII | 不截断 |
+| Test case 4 | 中英文混合 "测试Test汉字" 重复放大 | 截断后 UTF-8 合法，是前缀 |
+| Test case 5 | 接近末尾是中文 + ASCII 后缀 | 截断到 ASCII 边界 |
+| Test case 6 | 纯 ASCII 超大文本 | 截断后仍是前缀 |
+| Test case 7 | 病理输入：全是 `0x80`（continuation byte） | 返回空串 fallback |
+
+#### 4.4.3 尾部内容命中丢失的量化影响
+
+**正文截断的实际影响**（以中文 RSS 条目为例）：
+
+| 文章长度（汉字） | 正文索引量 | 尾部被截断的比例 | 命中丢失风险 |
+|----------------|-----------|----------------|------------|
+| < 16,666 字 | 100% | 0% | 无风险 |
+| 50,000 字（≈标准中篇） | 100% | 0% | 无风险（5 万字 × 3 = 150KB < 488KB） |
+| 166,666 字 | 100% | 0% | 临界（≈ 499KB，接近 50 万字节上限） |
+| 200,000 字 | **83%** | 约 3.3 万字（尾部 17%） | 中风险 |
+| 500,000 字（长篇连载） | **33%** | 约 33 万字（尾部 67%） | **高风险** |
+
+**具体丢失场景示例**：
+
+1. **法律/技术长文**：条款、结论、附录常出现在文末 → "版权所有"、"MIT License"、"总结" 等词若出现在 33 万字之后，完全无法命中
+2. **教程系列**：实战代码块、习题答案位于文末 → 搜索代码中的函数名、配置项不命中
+3. **长书评/影评**：最终评分、推荐语在末尾 → 搜 "五星推荐" 不命中（出现在尾部截断区）
+4. **多页文章抓取**：readability 抓取的全文拼接后可能超过 50 万字节 → 后面几页的内容完全不可搜索
+
+**标题截断的影响极小**：
+- 标题上限 20 万字节（中文 ≈ 6.6 万字），远超任何 RSS 条目标题长度（实际 RSS 标题通常 < 200 字符），几乎不会触发截断
+- 唯一风险：部分畸形 RSS 将正文塞入标题字段，此时标题截断才会生效
+
+#### 4.4.4 迁移脚本 substring(... for 1000000) vs 应用层截断的关系
+
+两处截断**同时存在但作用于不同时间点**：
+
+| 来源 | 位置 | 截断方式 | 单位 | 当前是否仍在使用 |
+|------|------|---------|------|---------------|
+| 迁移脚本 #21/#23 | `migrations.go:281/297` | `substring(... for 1000000)` | **字符数**（PostgreSQL char length） | ❌ 仅历史迁移时执行过一次，当前写入路径不走 |
+| `createEntry` / `updateEntry` / `UpdateEntryTitleAndContent` | `entry.go:679-708` | `truncateStringForTSVectorField` | **字节数**（Go len(s)） | ✅ 当前所有新写入、更新都走此路径 |
+
+**迁移历史遗留的不一致**：
+- 迁移 #21/#23 用 SQL `substring(... for 1000000)` 按**字符数**截断（中文 100 万字符 ≈ 3MB），而当前应用层按**字节数**截断（中文 50 万字节 ≈ 16.6 万字符）
+- 含义：**极旧条目**（迁移 #23 之前创建、之后从未被刷新过）可能索引了比新条目更长的正文（最多 100 万字符 vs 16.6 万汉字）
+- 实际影响极低：RSS 条目通常在被抓取后短期内会被 `RefreshFeedEntries` 重刷几次，触发 `updateEntry` 重新走应用层截断，旧数据会被逐步覆盖
+- Miniflux 没有专门的"重索引所有历史条目"迁移来统一此差异
 
 ### 4.5 索引维护时序图
 
