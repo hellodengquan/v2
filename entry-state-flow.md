@@ -1281,7 +1281,519 @@ func (s *Storage) InsertEntryForFeed(userID, feedID int64, entry *model.Entry) (
 
 ---
 
-## 十五、总结
+## 十五、Entry 状态迁移历史的审计机制
+
+### 15.1 核心结论：无状态历史审计表，只保留当前状态
+
+通过全代码库搜索确认：
+- 不存在 `entry_status_log`、`entry_status_history`、`entry_audit` 等历史表
+- 没有 `CREATE TABLE ... LOG` / `CREATE TABLE ... HISTORY` 的数据库迁移
+- 没有触发器（`CREATE TRIGGER`）用于记录状态变更
+- 没有应用层的历史记录代码（如写入历史表的 hook）
+
+Miniflux 的审计设计是**极简主义**：仅保留条目当前状态，不记录状态迁移的时间线。
+
+### 15.2 已废弃的 `removed` 状态
+
+**Schema 定义**（`database/migrations.go:74`）：
+
+```sql
+CREATE TYPE entry_status as enum('unread', 'read', 'removed');
+```
+
+最初设计了三种状态，但 `removed` 状态在后期迁移中被废弃：
+
+**迁移代码**（`database/migrations.go:1470-1498`）：
+
+```go
+_, err = tx.Exec(`
+    CREATE TABLE entry_tombstones (
+        feed_id bigint not null references feeds(id) on delete cascade,
+        hash text not null check (hash <> ''),
+        deleted_at timestamp with time zone not null default now(),
+        primary key (feed_id, hash)
+    );
+
+    INSERT INTO entry_tombstones (feed_id, hash, deleted_at)
+        SELECT feed_id, hash, changed_at
+        FROM entries
+        WHERE status = 'removed' AND hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING;
+
+    DELETE FROM entries WHERE status = 'removed';
+`)
+```
+
+**原因**：`removed` 状态本质上是"软删除"，但会污染 entries 表的查询（所有查询都需要 `WHERE status != 'removed'`），且没有实际的恢复流程。改为 `entry_tombstones` 表后：
+- 已删除条目的 hash 被记录，防止爬虫重新导入时"复活"
+- entries 表只包含 `unread` 和 `read` 两种状态，查询更简单
+- 但 `entry_status` enum 类型仍然保留 `removed` 值（PostgreSQL 不能安全移除 enum 值）
+
+### 15.3 仅有的"审计"信息：`changed_at` 时间戳
+
+所有状态变更都会更新 `changed_at = now()`，但这只是**最后一次变更的时间戳**，不包含历史：
+
+| 字段 | 含义 | 粒度 |
+|------|------|------|
+| `created_at` | 条目首次导入时间 | 一次性，创建后不变 |
+| `published_at` | RSS 源中条目的发布时间 | 来自 RSS，不随状态变更 |
+| `changed_at` | **最后一次**状态/收藏变更时间 | 每次 `SetEntriesStatus` / `ToggleStarred` 等都会更新 |
+
+### 15.4 审计信息的使用场景
+
+`changed_at` 唯一的"类审计"用途是**增量同步过滤**：
+
+**代码**（`api/entry_handlers.go:564-612`）：
+
+```go
+func configureFilters(builder *storage.EntryQueryBuilder, r *http.Request) *storage.EntryQueryBuilder {
+    // ...
+    if beforeChangedTimestamp := request.QueryInt64Param(r, "changed_before", 0); beforeChangedTimestamp > 0 {
+        builder = builder.BeforeChangedDate(time.Unix(beforeChangedTimestamp, 0))
+    }
+    if afterChangedTimestamp := request.QueryInt64Param(r, "changed_after", 0); afterChangedTimestamp > 0 {
+        builder = builder.AfterChangedDate(time.Unix(afterChangedTimestamp, 0))
+    }
+    // ...
+}
+```
+
+这允许 API 客户端"只拉取某个时间点之后有状态变更的条目"，但无法知道具体变更是从什么状态变成什么状态。
+
+### 15.5 设计权衡分析
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **当前方案：无历史** | 实现简单、存储开销为 0、查询性能最优 | 无法审计"谁在什么时候把条目从 unread 变成 read 再变成 starred" |
+| 历史表方案 | 完整审计、可回溯 | 写入放大（每次状态变更多一次 INSERT）、存储随时间增长、查询复杂 |
+| 触发器方案 | 透明无侵入 | 数据库端逻辑、难以调试、迁移复杂 |
+
+Miniflux 作为个人 RSS 阅读器，选择了**极简方案**——因为单用户场景下，状态变更的审计需求极低，用户几乎不会关心"三个月前我哪天把这篇文章标为已读"。
+
+---
+
+## 十六、跨设备同步：Last-Writer-Wins 策略与客户端拉取模型
+
+### 16.1 核心设计：无服务器端合并逻辑，全靠数据库原生 LWW
+
+Miniflux **没有实现显式的最后写赢逻辑**（如 `WHERE changed_at < $new_changed_at` 的 CAS 更新）。其跨设备同步一致性依赖以下几层机制的组合：
+
+#### 16.1.1 数据库层：PostgreSQL 原生 Last-Writer-Wins
+
+所有状态更新都是单条 SQL：
+
+```sql
+UPDATE entries SET status=$1, changed_at=now() WHERE user_id=$2 AND id=ANY($3)
+```
+
+当两个设备同时更新同一条目时：
+- 两个 UPDATE 都会执行成功
+- 后提交的 UPDATE 会覆盖先提交的 `status` 和 `changed_at`
+- 没有冲突检测、没有合并、没有版本向量
+
+**这是最朴素的 LWW**——完全依赖 PostgreSQL 的事务调度，"后到达者胜"。
+
+#### 16.1.2 `changed_at` 不是乐观锁条件
+
+关键细节：SQL 中 **没有** `WHERE changed_at = $old_changed_at` 或 `WHERE status = $old_status` 这样的比较条件。
+
+如果设备 A 在 T1 将条目 123 设为 read，设备 B 在 T2（T2 > T1）将同一条目设为 unread：
+- 最终状态是 `unread`（后写入者胜）
+- `changed_at` 是 T2
+- 设备 A 下次拉取时会看到 `changed_at = T2, status = 'unread'`，知道自己的变更被覆盖
+
+但 Miniflux 不会告诉设备 A"你的变更被 B 覆盖了"——这需要设备端自行对比本地记录与服务器状态。
+
+### 16.2 同步模型：客户端拉取（Pull）而非服务器推送（Push）
+
+Miniflux 没有 WebSocket 或长连接推送。所有同步都是**客户端主动轮询**，分为两种模式：
+
+#### 16.2.1 Fever API 同步模式：全量 ID 列表对比
+
+**代码**（`fever/handler.go:331-370`）：
+
+```go
+// unread_item_ids — 返回所有未读条目的 ID，逗号分隔字符串
+func (h *feverHandler) handleUnreadItems(w http.ResponseWriter, r *http.Request) {
+    rawEntryIDs, _ := h.store.NewEntryQueryBuilder(userID).
+        WithStatuses(model.EntryStatusUnread).
+        GetEntryIDs()
+    // 序列化为 "123,456,789" 字符串
+}
+
+// saved_item_ids — 返回所有收藏条目的 ID
+func (h *feverHandler) handleSavedItems(w http.ResponseWriter, r *http.Request) {
+    rawEntryIDs, _ := h.store.NewEntryQueryBuilder(userID).
+        WithStarred(true).
+        GetEntryIDs()
+}
+```
+
+**客户端同步流程**：
+1. 客户端缓存本地的 `unread_item_ids` 和 `saved_item_ids` 列表
+2. 定期调用 `?unread_item_ids` 和 `?saved_item_ids` 获取服务器端全量列表
+3. 客户端对比两个列表的差异：
+   - 服务器有但本地没有 → 拉取条目详情 + 应用状态
+   - 本地有但服务器没有 → 向服务器发送 `mark=item&as=read` / `mark=item&as=unsaved`
+4. 条目详情通过 `?items&since_id=XXX` 分页拉取（每次 50 条）
+
+**特点**：
+- 协议简单，ID 列表传输量小
+- 客户端负责冲突解决（发现差异时客户端决定如何处理）
+- 服务器完全无状态
+
+#### 16.2.2 Google Reader API 同步模式：带时间窗口的增量拉取
+
+**代码**（`googlereader/handler.go:1005-1047` + `980-1002`）：
+
+```go
+func (h *greaderHandler) handleReadingListStreamHandler(w http.ResponseWriter, r *http.Request, rm requestModifiers) {
+    builder := h.store.NewEntryQueryBuilder(rm.UserID).
+        WithLimit(rm.Count).
+        WithOffset(rm.Offset).
+        WithSorting(model.DefaultSortingOrder, rm.SortDirection)
+
+    // 排除已读条目（xt = exclude tag）
+    for _, s := range rm.ExcludeTargets {
+        switch s.Type {
+        case ReadStream:
+            builder = builder.WithStatuses(model.EntryStatusUnread)
+        }
+    }
+
+    // 时间窗口过滤（ot = start time, st = stop time）
+    if rm.StartTime > 0 {
+        builder = builder.AfterPublishedDate(time.Unix(rm.StartTime, 0))
+    }
+    if rm.StopTime > 0 {
+        builder = builder.BeforePublishedDate(time.Unix(rm.StopTime, 0))
+    }
+}
+```
+
+**状态回传中的时间戳**（`googlereader/handler.go:696-730`）：
+
+```go
+result.Items[i] = contentItem{
+    // ...
+    TimestampUsec: strconv.FormatInt(entry.Date.UnixMicro(), 10),    // 发布时间（微秒）
+    CrawlTimeMsec: strconv.FormatInt(entry.CreatedAt.UnixMilli(), 10), // 导入时间（毫秒）
+    Published:     entry.Date.Unix(),                              // 发布时间（秒）
+    Updated:       entry.ChangedAt.Unix(),                         // ★ 状态最后变更时间
+}
+```
+
+**客户端同步流程**：
+1. 首次全量拉取：`/reader/api/0/stream/items/ids?s=user/-/state/com.google/reading-list&n=1000`
+2. 记录最大的 `Updated` 时间戳
+3. 增量拉取：带上 `ot=<last_updated_timestamp>` 只拉取发布时间在该时间之后的条目
+4. 对于状态变更，客户端通过 `/reader/api/0/stream/items/contents` 拉取条目详情，检查 `Updated` 字段是否大于本地记录
+5. 发现冲突时（本地 `Updated` < 服务器 `Updated`），以服务器状态为准
+
+**关键缺失**：Google Reader 协议原生支持 `changed_after` 过滤（按状态变更时间拉取），但 Miniflux 实现中**只支持按 `published_at` 过滤**，不支持按 `changed_at` 过滤增量同步。客户端必须拉取条目详情才能发现状态变更。
+
+#### 16.2.3 REST API v1 同步模式：明确的 `changed_after` 支持
+
+**代码**（`api/entry_handlers.go:589-594`）：
+
+```go
+if afterChangedTimestamp := request.QueryInt64Param(r, "changed_after", 0); afterChangedTimestamp > 0 {
+    builder = builder.AfterChangedDate(time.Unix(afterChangedTimestamp, 0))
+}
+```
+
+这是最先进的同步方式——客户端可以直接"只拉取上次同步之后有状态变更的条目"，无需拉取全量 ID 列表。
+
+### 16.3 冲突解决策略总览
+
+| 同步入口 | 冲突检测方式 | 解决策略 | 位置 |
+|---------|-------------|---------|------|
+| Fever API | 客户端对比全量 ID 列表 | 客户端决定（通常服务器胜） | `fever/handler.go:331-370` |
+| Google Reader API | 客户端对比条目的 `Updated` 字段 | `Updated` 大者胜 | `googlereader/handler.go:703` |
+| REST API v1 | 客户端使用 `changed_after` 过滤 | 无冲突（只拉增量，客户端应用） | `api/entry_handlers.go:589-594` |
+| Web UI | 无（每次重新加载页面） | 无冲突（实时查询数据库） | 所有 UI handler |
+
+### 16.4 缺陷与边界情况
+
+1. **`changed_at` 精度问题**：`now()` 的精度是微秒级，但两个请求在同一微秒内到达时，`changed_at` 相同，客户端无法判断哪个更新。
+2. **状态 vs 收藏的独立更新**：设备 A 更新 `status`，设备 B 同时更新 `starred`，两者都能成功，最终状态是两者的组合（PostgreSQL 列级更新）。这实际上是"无冲突"，因为两个字段独立。
+3. **Fever 的 `saved` 翻转问题**：`ToggleStarred` 在并发时可能导致收藏状态意外翻转（见第八章分析）。
+4. **无删除同步**：条目被归档删除后，客户端不会收到"已删除"通知，只会在下次拉取时发现 ID 不在列表中。
+
+---
+
+## 十七、第三方阅读器协议差异下的状态映射边界
+
+### 17.1 三种协议的状态模型对比
+
+| 维度 | Miniflux 内部 | Fever API | Google Reader API |
+|------|-------------|-----------|------------------|
+| **已读状态** | `status` 字段（enum: unread/read） | `is_read`（0/1 整数） | `user/-/state/com.google/read` 标签（存在=已读，不存在=未读） |
+| **收藏状态** | `starred` 字段（boolean） | `is_saved`（0/1 整数） | `user/-/state/com.google/starred` 标签（存在=收藏） |
+| **保持未读** | 无对应字段 | 无对应字段 | `user/-/state/com.google/kept-unread` 标签（特殊语义） |
+| **状态变更时间** | `changed_at`（timestamp） | 无对应字段，条目返回 `created_on_time` | `Updated` 字段（Unix 时间戳） |
+| **批量标记已读** | 按 user_id / feed_id / category_id | `mark=feed` / `mark=group` + `before` 时间戳 | `mark-all-as-read` + `ts` 时间戳 |
+| **同步粒度** | 无（全量查询） | 全量 ID 列表（`unread_item_ids`） | 条目详情带状态标签 |
+
+### 17.2 Fever API 状态映射的边界与缺陷
+
+#### 17.2.1 读状态映射
+
+**Miniflux → Fever**（`fever/handler.go:303-325`）：
+
+```go
+for _, entry := range entries {
+    isRead := 0
+    if entry.Status == model.EntryStatusRead {
+        isRead = 1
+    }
+    isSaved := 0
+    if entry.Starred {
+        isSaved = 1
+    }
+    result.Items = append(result.Items, item{
+        ID:        entry.ID,
+        IsSaved:   isSaved,
+        IsRead:    isRead,
+        CreatedAt: entry.Date.Unix(),  // ★ 注意：用的是 published_at，不是 changed_at
+    })
+}
+```
+
+**边界 1：`created_on_time` 的语义偏差**
+
+Fever 协议规定 `created_on_time` 是条目创建时间，但 Miniflux 返回的是 `entry.Date.Unix()`（即 RSS 的 `published_at`）。对于客户端同步来说，这意味着：
+- 无法通过 `created_on_time` 判断状态是否变更
+- 只能通过 `is_read` / `is_saved` 字段的当前值判断
+
+**Fever → Miniflux**（`fever/handler.go:429-470`）：
+
+```go
+switch r.FormValue("as") {
+case "read":
+    h.store.SetEntriesStatus(userID, []int64{entryID}, model.EntryStatusRead)
+case "unread":
+    h.store.SetEntriesStatus(userID, []int64{entryID}, model.EntryStatusUnread)
+case "saved":
+    h.store.ToggleStarred(userID, entryID)  // ★ 缺陷 1：用 Toggle 而非显式设置 true
+case "unsaved":
+    h.store.ToggleStarred(userID, entryID)  // ★ 缺陷 2：同样用 Toggle 而非显式设置 false
+}
+```
+
+#### 17.2.2 收藏状态的 Toggle 缺陷
+
+这是最严重的映射边界问题：
+
+**问题场景**：
+1. 条目初始状态：未收藏（`starred = false`）
+2. 客户端 A 调用 `mark=item&as=saved` → `ToggleStarred` → `starred = true` ✓
+3. 同步延迟下，客户端 B 本地状态仍是未收藏
+4. 客户端 B 也调用 `mark=item&as=saved` → `ToggleStarred` → `starred = false` ✗（预期应该保持 true）
+
+**正确实现应该是**：
+
+```go
+// 伪代码——当前代码没有这样做
+case "saved":
+    if !entry.Starred {
+        h.store.SetEntriesStarredState(userID, []int64{entryID}, true)
+    }
+case "unsaved":
+    if entry.Starred {
+        h.store.SetEntriesStarredState(userID, []int64{entryID}, false)
+    }
+```
+
+当前代码（`fever/handler.go:447,466`）在写操作前**已经 SELECT 了 entry**，但没有利用该信息做条件判断，直接 `ToggleStarred`。
+
+#### 17.2.3 范围标记已读的时间戳映射
+
+**Fever → Miniflux**（`fever/handler.go:481-541`）：
+
+```go
+// mark=feed
+func (h *feverHandler) handleWriteFeeds(w http.ResponseWriter, r *http.Request) {
+    before := time.Unix(request.FormInt64Value(r, "before"), 0)
+    h.store.MarkFeedAsRead(userID, feedID, before)  // ★ 传递 before 时间戳
+}
+
+// mark=group&id=0
+case groupID == 0:
+    h.store.MarkAllAsRead(userID)  // ★ 注意：没有 before 参数，标记全部
+```
+
+**边界 2：`mark=group&id=0` 忽略 `before` 参数**
+
+Fever 协议允许 `mark=group` 时带上 `before` 参数，但 Miniflux 实现中 `groupID == 0`（表示全部）时调用 `MarkAllAsRead`，该函数**不接受时间戳参数**，会标记**所有**未读条目。如果客户端本意是"标记全部中在某个时间点之前的条目"，会导致超出预期的标记范围。
+
+### 17.3 Google Reader API 状态映射的边界与缺陷
+
+#### 17.3.1 标签系统到内部状态的映射
+
+**标签解析**（`googlereader/stream.go:73-107`）：
+
+```
+标签 → 内部 StreamType
+user/123/state/com.google/read           → ReadStream
+user/123/state/com.google/starred        → StarredStream
+user/123/state/com.google/reading-list   → ReadingListStream
+user/123/state/com.google/kept-unread    → KeptUnreadStream
+user/123/label/MyFolder                 → LabelStream (Category)
+feed/456                                → FeedStream
+```
+
+**标签简化与冲突检测**（`googlereader/handler.go:1234-1281`）：
+
+```go
+func checkAndSimplifyTags(addTags []Stream, removeTags []Stream) (map[StreamType]bool, error) {
+    tags := make(map[StreamType]bool)
+
+    // add 处理
+    for _, s := range addTags {
+        switch s.Type {
+        case ReadStream:
+            if _, ok := tags[KeptUnreadStream]; ok {
+                return nil, errSimultaneously  // ★ 互斥检测
+            }
+            tags[ReadStream] = true
+        case KeptUnreadStream:
+            if _, ok := tags[ReadStream]; ok {
+                return nil, errSimultaneously  // ★ 互斥检测
+            }
+            tags[ReadStream] = false  // kept-unread 映射为"不读"
+        case StarredStream:
+            tags[StarredStream] = true
+        }
+    }
+
+    // remove 处理
+    for _, s := range removeTags {
+        switch s.Type {
+        case ReadStream:
+            if _, ok := tags[ReadStream]; ok {
+                return nil, errSimultaneously  // ★ 同时 add 和 remove 报错
+            }
+            tags[ReadStream] = false  // remove read = 标记未读
+        case KeptUnreadStream:
+            if _, ok := tags[ReadStream]; ok {
+                return nil, errSimultaneously
+            }
+            tags[ReadStream] = true   // remove kept-unread = 标记已读
+        case StarredStream:
+            if _, ok := tags[StarredStream]; ok {
+                return nil, fmt.Errorf("...")
+            }
+            tags[StarredStream] = false
+        }
+    }
+    return tags, nil
+}
+```
+
+**边界 1：`kept-unread` 语义的二义性**
+
+Google Reader 中 `kept-unread` 标签的语义是"即使条目已读，也保持在未读列表中"。但 Miniflux 没有对应字段，简化映射为：
+- `add kept-unread` = `SetEntriesStatus(status=unread)`
+- `remove kept-unread` = `SetEntriesStatus(status=read)`
+
+这丢失了"保持未读"的语义（Miniflux 没有"读了但仍显示为未读"的中间状态）。
+
+#### 17.3.2 状态应用前的条件检查
+
+**代码**（`googlereader/handler.go:248-271`）：
+
+```go
+var readEntryIDs, unreadEntryIDs, starredEntryIDs, unstarredEntryIDs []int64
+for _, entry := range entries {
+    if read, exists := tags[ReadStream]; exists {
+        if read && entry.Status == model.EntryStatusUnread {
+            readEntryIDs = append(readEntryIDs, entry.ID)  // ★ 只有未读的才加入已读列表
+        } else if !read && entry.Status == model.EntryStatusRead {
+            unreadEntryIDs = append(unreadEntryIDs, entry.ID)  // ★ 只有已读的才加入未读列表
+        }
+    }
+    if starred, exists := tags[StarredStream]; exists {
+        if starred && !entry.Starred {
+            starredEntryIDs = append(starredEntryIDs, entry.ID)  // ★ 只有未收藏的才加入收藏列表
+            entries[n] = entry
+            n++
+        } else if !starred && entry.Starred {
+            unstarredEntryIDs = append(unstarredEntryIDs, entry.ID)
+        }
+    }
+}
+```
+
+这是 Google Reader 实现比 Fever 更健壮的地方——**应用状态变更前先检查当前状态**，只对真正需要变更的条目调用 UPDATE。这避免了：
+1. 不必要的数据库写入
+2. `changed_at` 被无意义地更新
+3. `RowsAffected == 0` 错误（`SetEntriesStarredState` 会检查并报错）
+
+#### 17.3.3 状态回传的标签映射
+
+**代码**（`googlereader/handler.go:680-691`）：
+
+```go
+categories := make([]string, 0, 4)
+categories = append(categories, userReadingList)  // 始终包含
+if entry.Feed.Category.Title != "" {
+    categories = append(categories, labelPrefix+entry.Feed.Category.Title)
+}
+if entry.Status == model.EntryStatusRead {
+    categories = append(categories, userRead)  // 已读 → 添加 read 标签
+}
+if entry.Starred {
+    categories = append(categories, userStarred)  // 收藏 → 添加 starred 标签
+}
+```
+
+**边界 2：`kept-unread` 标签永不返回**
+
+因为 Miniflux 没有对应字段，即使客户端之前添加了 `kept-unread` 标签，下次拉取时该标签也不会出现在 `categories` 中。客户端会认为该标签已被移除。
+
+#### 17.3.4 时间戳映射
+
+**代码**（`googlereader/handler.go:700-703`）：
+
+```go
+TimestampUsec: strconv.FormatInt(entry.Date.UnixMicro(), 10),    // published_at（微秒）
+CrawlTimeMsec: strconv.FormatInt(entry.CreatedAt.UnixMilli(), 10), // created_at（毫秒）
+Published:     entry.Date.Unix(),                              // published_at（秒）
+Updated:       entry.ChangedAt.Unix(),                         // ★ changed_at（秒）
+```
+
+Google Reader 协议返回 4 个时间戳，Miniflux 都正确映射了。其中 `Updated` 字段是客户端判断状态是否变更的关键。
+
+### 17.4 三方协议的状态幂等性对比
+
+| 操作 | Fever API | Google Reader API | REST API v1 |
+|------|----------|------------------|------------|
+| 标记已读 | 非幂等（重复调用无副作用，但也不报错） | 幂等（先检查当前状态） | 非幂等（直接 UPDATE） |
+| 标记未读 | 非幂等 | 幂等 | 非幂等 |
+| 添加收藏 | **非幂等且危险**（ToggleStarred 可能翻转） | 幂等（先检查 `!entry.Starred`） | 非幂等 |
+| 取消收藏 | **非幂等且危险**（ToggleStarred 可能翻转） | 幂等（先检查 `entry.Starred`） | 非幂等 |
+| 批量标记已读 | 非幂等 | 幂等（按 before 时间戳） | 非幂等 |
+
+### 17.5 不支持的标签与静默忽略
+
+两个兼容接口都有一些协议标签被静默忽略：
+
+**Google Reader**（`googlereader/handler.go:1250-1251,1273-1274`）：
+```go
+case BroadcastStream, LikeStream:
+    slog.Debug("Broadcast & Like tags are not implemented!")
+```
+
+**Fever**：
+- `is_spark` 字段恒为 0（不支持 Sparks 功能）
+- `favicon_id` 只有在 Feed 有图标时才设置
+
+这些标签的 add/remove 不会报错，但也不会产生任何效果。
+
+---
+
+## 十八、总结
 
 ### 状态同步的核心设计原则
 
@@ -1297,7 +1809,27 @@ func (s *Storage) InsertEntryForFeed(userID, feedID int64, entry *model.Entry) (
 
 5. **计数获取时序控制**：Web UI 中 `GetNavMetadata` 在状态写入**之后**执行，保证计数准确性；`entry_unread.go` 中的注释 "Fetching the counters here avoids being off by one" 明确说明了这一时序设计。
 
+6. **极简审计设计**：不维护状态迁移历史表，仅通过 `changed_at` 记录最后一次变更时间戳。`removed` 状态已废弃，改为 `entry_tombstones` 表防止删除条目被爬虫复活。
+
+7. **跨设备同步靠客户端**：无服务器端冲突合并逻辑，完全依赖 PostgreSQL 原生 Last-Writer-Wins。同步模型为客户端拉取（Pull），三种协议各有差异：
+   - Fever：全量 ID 列表对比 + 分页拉取
+   - Google Reader：按 `published_at` 时间窗口增量拉取 + `Updated` 时间戳判断
+   - REST API v1：支持 `changed_after` 按状态变更时间过滤
+
+8. **协议适配层的健壮性差异**：
+   - Google Reader 实现更健壮：状态应用前先检查当前状态，确保幂等；`kept-unread` 与 `read` 标签互斥检测
+   - Fever 实现存在缺陷：`saved`/`unsaved` 使用 `ToggleStarred` 而非显式设置，并发时可能翻转状态；`mark=group&id=0` 忽略 `before` 参数
+
 ### 注意事项与潜在问题
 
-- Fever 的 `saved`/`unsaved` 操作使用 `ToggleStarred` 而非显式 `SetEntriesStarredState`，存在客户端重复调用时状态意外翻转的风险（`fever/handler.go:447,466`）。
-- Web UI 的 `markAllAsRead` 仅标记全局可见的 Feed，与 API / Fever / Google Reader 的全局标记语义不同，使用时需注意范围差异。
+- **Fever 收藏翻转风险**：`saved`/`unsaved` 操作使用 `ToggleStarred` 而非显式 `SetEntriesStarredState`，存在客户端重复调用时状态意外翻转的风险（`fever/handler.go:447,466`）。代码已经 SELECT 了 entry 但未做条件判断，是可修复的缺陷。
+
+- **Web UI 与 API 范围差异**：Web UI 的 `markAllAsRead` 仅标记全局可见的 Feed（`MarkGloballyVisibleFeedsAsRead`），与 API / Fever / Google Reader 的全局标记语义不同（使用 `MarkAllAsRead`），使用时需注意范围差异。
+
+- **无状态迁移历史**：无法审计"条目 X 在 T1 被设备 A 标为已读，T2 被设备 B 标为未读"的完整时间线，只能知道最后一次变更时间。
+
+- **Google Reader `kept-unread` 语义丢失**：Miniflux 没有"保持未读"中间状态，`add kept-unread` 直接映射为 `SetEntriesStatus(unread)`，与原生协议语义有差异。
+
+- **Google Reader 增量同步限制**：协议实现只支持按 `published_at` 过滤，不支持按 `changed_at` 过滤增量同步，客户端必须拉取条目详情才能发现状态变更。
+
+- **`changed_at` 精度限制**：微秒级精度下，同一微秒内的并发更新无法通过时间戳区分先后。
