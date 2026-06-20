@@ -353,3 +353,288 @@ Miniflux **没有实时双向同步协议**（如 WebSocket / Server-Sent Events
 | `internal/ui/web_session_middleware.go` | 会话加载、用户认证、会话持久化 |
 | `internal/ui/ui.go` | 所有 UI 路由注册 |
 | `internal/database/migrations.go` | 数据库 schema 演进 |
+
+---
+
+## 九、快捷键冲突检测：`on()` 方法无防御，`Map.set` 静默覆盖
+
+### 9.1 代码事实
+
+`KeyboardHandler.on(combination, callback)` 的完整实现（`keyboard_handler.js:8-12`）：
+
+```javascript
+on(combination, callback) {
+    const keys = combination.split(" ");
+    this.shortcuts.set(combination, { keys, callback });
+    this.triggers.add(keys[0]);
+}
+```
+
+整个方法**没有任何冲突检测分支**。具体分析：
+
+1. **`this.shortcuts.set(combination, ...)`**：`Map.set()` 在 key 已存在时会静默替换旧值，不抛异常、不返回冲突标记、不发出警告。如果 `initializeKeyboardShortcuts()` 中先后注册了两个相同 combination（如 `"j"`），后者回调直接覆盖前者，前者永久丢失。
+
+2. **`this.triggers.add(keys[0])`**：`Set.add()` 对已存在的值也是幂等操作，无副作用。
+
+3. **序列键前缀冲突**：假设注册 `"g u"` 和 `"g g"` 后，又注册 `"g u"` 的另一个回调，同样静默覆盖。更微妙的是，`"g"` 作为 trigger 存在于 Set 中，按键 `"g"` 会进入队列，但 `"g"` 本身不是任何单键快捷键，所以队列中只留下 `"g"` 等待下一个键——这不算冲突，但说明 `triggers` 是粗粒度过滤器，只决定"是否值得把按键放入队列"。
+
+### 9.2 运行时匹配中的隐式"冲突"行为
+
+`listen()` 中的匹配循环（`keyboard_handler.js:27-39`）：
+
+```javascript
+for (const [combination, { keys, callback }] of this.shortcuts.entries()) {
+    if (keys.every((value, index) => value === this.queue[index])) {
+        this.queue = [];
+        callback(event);
+        return;
+    }
+    if (keys.length === 1 && key === keys[0]) {
+        this.queue = [];
+        callback(event);
+        return;
+    }
+}
+```
+
+关键行为：**先注册的序列键优先级高于后注册的单键**。
+
+假设注册了 `"g"` → actionA（单键）和 `"g u"` → actionB（序列键）：
+- 按下 `"g"` 时，循环遍历 `shortcuts` Map，先遇到 `"g u"`，`keys.every(...)` 检查 `[queue[0]]` 与 `["g", "u"]`，因为 `queue` 长度不足所以 `every` 返回 `true`（空位满足）——但实际 JS 的 `every` 对越界索引返回 `true`，这意味着 `["g"]` 和 `["g", "u"]` 的前缀匹配成功，`actionB` 被错误触发。
+
+   等等，让我们重新审视：`queue` 此时是 `["g"]`，`keys` 是 `["g", "u"]`。`keys.every((value, index) => value === this.queue[index])` 检查：
+   - index=0: `"g" === "g"` → true
+   - index=1: `"u" === undefined` → false
+   - 结果 false，不匹配。
+
+   继续循环到单键 `"g"`：`keys.length === 1 && key === "g"` → true，触发 `actionA`。
+
+   所以**单键先被触发，序列键的第二个键来时队列已被清空**。这是实际存在的冲突：如果用户先按 `"g"` 想触发 `"g u"`，但 `"g"` 作为单键已被注册，`"g"` 立即被消费，`"g u"` 永远无法触发。
+
+3. **Miniflux 的实际注册中不存在这种冲突**：查看 `app.js:1170-1223`，`"g"` 从未单独注册为单键快捷键，所有以 `"g"` 开头的都是双键序列（`"g u"`, `"g b"`, `"g h"`, `"g f"`, `"g c"`, `"g s"`, `"g g"`），因此不存在前缀冲突。但这是**靠开发者人工保证**的，没有代码层面的强制检测。
+
+### 9.3 结论
+
+| 维度 | 现状 |
+|------|------|
+| 冲突检测 | **不存在**。`on()` 是无条件覆盖写入 |
+| 序列键 vs 单键冲突 | 如果 `"g"` 同时注册为单键和 `"g u"` 的前缀，单键胜出，序列键永远无法触发 |
+| 运行时保护 | 无。Map 迭代顺序决定匹配优先级（先注册先匹配），但序列键的前缀匹配在 queue 长度不足时返回 false，所以不会误触发 |
+| 开发者保障 | 靠人工审查确保 `g`/`z` 等序列前缀键不作为单键注册 |
+
+---
+
+## 十、keymap JSONB 字段：不存在，偏好全部存为扁平列
+
+### 10.1 代码事实
+
+对整个代码库的搜索结果：
+
+- **`keymap`/`KeyMap`/`key_map`/`keyMap`**：全局零匹配。代码中不存在任何 keymap 相关字段或概念。
+- **JSONB 字段**：`migrations.go` 中仅有两处 JSONB：
+  1. 第 198 行：旧版 `sessions` 表的 `data jsonb`（已被后续迁移删除）
+  2. 第 1456 行：`web_sessions` 表的 `state jsonb not null default '{}'::jsonb`
+- **GIN 索引**：`migrations.go` 中所有 GIN 索引只作用于 `entries.document_vectors`（全文搜索向量），与用户偏好无关。
+
+### 10.2 `keyboard_shortcuts` 的存储方式
+
+迁移第 303 行：
+
+```sql
+ALTER TABLE users ADD COLUMN keyboard_shortcuts boolean default 't'
+```
+
+这是一个**简单的 `boolean` 列**，默认值 `true`（启用）。没有 JSONB、没有 keymap、没有每用户自定义快捷键映射表。
+
+### 10.3 JSONB vs 扁平列的查询效率对比（假设分析）
+
+虽然 Miniflux 不使用 JSONB 存储偏好，但若假设一种替代方案——将所有偏好存入一个 JSONB 字段如 `preferences jsonb`——对比如下：
+
+| 维度 | 扁平列（现有方案） | JSONB 字段（假设方案） |
+|------|-------------------|----------------------|
+| 读取单个偏好 | `SELECT keyboard_shortcuts FROM users WHERE id=$1`，走主键索引，O(1) | `SELECT preferences->>'keyboard_shortcuts' FROM users WHERE id=$1`，需 JSONB 解析 |
+| 写入单个偏好 | `UPDATE users SET keyboard_shortcuts=$2 WHERE id=$1`，直接赋值 | `UPDATE users SET preferences = jsonb_set(preferences, '{keyboard_shortcuts}', 'false') WHERE id=$1`，需读-改-写整条 JSONB |
+| 全量读取偏好 | `SELECT * FROM users WHERE id=$1`，列映射直接 Scan | 同上，但需逐字段 `->>` 提取，或整个 JSONB 反序列化 |
+| GIN 索引 | 不需要，主键索引足够 | 如需 `WHERE preferences @> '{"keyboard_shortcuts": false}'` 这种条件查询才需要 GIN 索引，但 Miniflux 从不做偏好的条件查询 |
+| Schema 演进 | 每新增偏好需 `ALTER TABLE ADD COLUMN` + Go 结构体字段 | JSONB 天然灵活，无需迁移 |
+| 类型安全 | Go 结构体强类型，编译期检查 | 需要手动类型断言，运行时可能出错 |
+| 存储空间 | bool 占 1 字节，int 占 4 字节 | JSONB 键名重复存储，每个用户一份键名开销 |
+
+**Miniflux 选择扁平列的理由**：
+
+1. 偏好字段数量有限（约 25 个），且新增频率极低（年级别），JSONB 的灵活性优势不明显
+2. Miniflux 宣称 "Doesn't use any ORM"（README），扁平列 + 手写 SQL 与此哲学一致
+3. 所有偏好查询都是 `WHERE id=$1`（按主键），不存在跨用户的偏好条件查询，GIN 索引无用武之地
+4. Go 强类型结构体与扁平列天然匹配，代码更清晰
+
+### 10.4 `web_sessions.state` 中 JSONB 的使用场景
+
+`web_sessions` 表的 `state jsonb` 存储**会话级临时状态**（CSRF token、flash 消息、OAuth2 流程数据、语言/主题缓存），与用户偏好无关。其 JSONB 选择合理：
+- 会话状态结构多变（OAuth2 流程中需要临时存储 state/code_verifier）
+- 生命周期短，不需要跨会话查询
+- 不需要条件索引
+
+### 10.5 `OptionalString` / `OptionalNumber` 的隐式零值问题
+
+`model/model.go` 中的辅助函数：
+
+```go
+func OptionalNumber[T Number](value T) *T {
+    if value > 0 {
+        return &value
+    }
+    return nil
+}
+
+func OptionalString(value string) *string {
+    if value != "" {
+        return &value
+    }
+    return nil
+}
+```
+
+注意 `OptionalNumber` 的判断是 `value > 0`，这意味着 `0` 和负数都会返回 `nil`。在 `settings_update.go:69-80` 中：
+
+```go
+userModificationRequest := &model.UserModificationRequest{
+    EntriesPerPage:      model.OptionalNumber(settingsForm.EntriesPerPage),
+    DefaultReadingSpeed: model.OptionalNumber(settingsForm.DefaultReadingSpeed),
+    CJKReadingSpeed:     model.OptionalNumber(settingsForm.CJKReadingSpeed),
+    MediaPlaybackRate:   model.OptionalNumber(settingsForm.MediaPlaybackRate),
+}
+```
+
+如果用户在表单中填写 `0`，`OptionalNumber(0)` 返回 `nil`，`Patch()` 不会覆盖该字段——**这意味着通过 REST API 无法将数值型偏好设为 0**（虽然验证逻辑会拒绝 ≤0 的值，所以实际不会出问题，但这是一个潜在的语义缺陷）。
+
+**更关键的是**：`KeyboardShortcuts` 等布尔字段**没有** `OptionalBool` 辅助函数（`model.go` 中不存在），因此在 `settings_update.go` 中这些字段**不通过** `UserModificationRequest` 传递，而是通过 `SettingsForm.Merge(user)` 直接覆盖到 User 对象。这导致 Web UI 表单提交是全量覆盖语义，无法实现部分更新。
+
+---
+
+## 十一、前端启动时 default 与 user 偏好合并的优先级覆盖策略
+
+### 11.1 三层默认值体系
+
+Miniflux 的偏好默认值分布在三个层级，优先级从低到高：
+
+```
+1. PostgreSQL 列默认值     (DDL: DEFAULT 't' / DEFAULT 'en_US' / DEFAULT 'UTC')
+2. Go 代码常量             (WebSession: defaultSessionLanguage / defaultSessionTheme)
+3. 用户显式设置值          (users 表中的实际数据)
+```
+
+### 11.2 PostgreSQL 层默认值（最低优先级）
+
+`migrations.go:303`：
+```sql
+ALTER TABLE users ADD COLUMN keyboard_shortcuts boolean default 't'
+```
+
+新用户创建时，`keyboard_shortcuts` 列默认为 `true`。其他偏好的 DB 默认值包括：
+- `language` → `'en_US'`
+- `timezone` → `'UTC'`
+- `theme` → `'light_serif'`（后续迁移从 `'default'` 更新而来）
+- `entries_per_page` → `100`
+- `display_mode` → `'standalone'`
+
+`CreateUser` 的 SQL 使用 `RETURNING` 子句读回所有列值（含默认值），所以 Go 层拿到的 `User` 对象已经携带了 DB 默认值，不存在 Go 零值问题。
+
+### 11.3 Go 层默认值（Session 未绑定用户时的回退）
+
+`web_session.go:20-21`：
+```go
+const (
+    defaultSessionLanguage = "en_US"
+    defaultSessionTheme    = "system_serif"
+)
+```
+
+`Language()` 和 `Theme()` 方法在 session 未绑定用户时提供回退值：
+
+```go
+func (s *WebSession) Language() string {
+    if s.state.Language != "" {
+        return s.state.Language
+    }
+    return defaultSessionLanguage
+}
+```
+
+**注意两层默认值的不一致**：
+- DB 的 theme 默认是 `"light_serif"`
+- Session 的 theme 默认是 `"system_serif"`
+- 登录前（匿名 session）用户看到 `"system_serif"` 主题
+- 登录后 `SetUser()` 将 user.Theme 复制到 session，覆盖为 `"light_serif"`（如果用户未修改过）
+
+### 11.4 `SetUser()` 的优先级覆盖策略
+
+`web_session.go:244-254`：
+
+```go
+func (s *WebSession) SetUser(user *User) {
+    if user == nil {
+        return
+    }
+    s.dirty = true
+    userID := user.ID
+    s.userID = &userID
+    s.state.Language = user.Language
+    s.state.Theme = user.Theme
+}
+```
+
+**无条件覆盖**：不管 session 中原有的 `Language`/`Theme` 是什么，直接用 user 表的值覆盖。这意味着：
+
+1. **登录瞬间**：匿名 session 的语言/主题偏好被丢弃，完全以 user 表为准
+2. **设置保存后**：`settings_update.go:94-96` 中再次调用 `sess.SetUser(user)`，将更新后的 user 偏好同步到 session，保证重定向后的页面使用新偏好
+3. **只有 Language 和 Theme 被同步到 session**：其他偏好（如 `KeyboardShortcuts`、`MarkReadOnView`）不经过 session，每次都通过模板渲染从 user 对象直接注入 HTML
+
+### 11.5 前端 JS 层的"不存在即默认"策略
+
+前端 **没有任何 JavaScript 变量存储默认偏好值**。偏好的"默认行为"完全依赖 HTML 属性的**有/无**来区分：
+
+**`keyboard_shortcuts`**（`layout.html:55`）：
+```html
+{{ if not .user.KeyboardShortcuts }}data-disable-keyboard-shortcuts="true"{{ end }}
+```
+- `KeyboardShortcuts = true` → 属性**不存在** → JS 初始化快捷键（默认行为=启用）
+- `KeyboardShortcuts = false` → 属性**存在** → JS 跳过初始化
+
+**`mark_read_on_view`**（`layout.html:56`）：
+```html
+data-mark-as-read-on-view="{{ if .user.MarkReadOnView }}true{{ else }}false{{ end }}"
+```
+- 这里**总是输出属性**，用 `"true"` / `"false"` 字符串区分
+- JS 端（`app.js:1288`）：`document.body.dataset.markAsReadOnView === "true"`
+
+**两种策略的取舍**：
+
+| 策略 | 用于 | 优点 | 缺点 |
+|------|------|------|------|
+| 有/无属性 | `keyboard_shortcuts` | 属性缺失 = 默认启用，减少 HTML 体积 | 前端只能感知"禁用"，无法区分"未登录"和"启用" |
+| true/false 字符串 | `mark_read_on_view` | 语义明确，前端可直接判断 | 每次都输出属性 |
+
+Miniflux 选择对 `keyboard_shortcuts` 使用"有/无"策略，因为键盘快捷键默认启用的设计意图与"属性不存在=不限制"天然对齐。
+
+### 11.6 完整偏好传递优先级图
+
+```
+用户打开页面
+    │
+    ▼
+session 已认证？
+    ├─ 否 → 使用 session 默认值 (language=en_US, theme=system_serif)
+    │        其他偏好不可用（未登录页面不注入 data-*）
+    │
+    └─ 是 → 从 users 表读取完整偏好
+              │
+              ├─ 语言/主题 → 同步写入 session.state (SetUser)
+              │                → view.New() 从 session 读取 language/theme
+              │                → 模板渲染使用 session 值
+              │
+              └─ 其他偏好 → 模板渲染直接从 .user 读取
+                             → 输出为 <body data-*> 属性
+                             → JS 读取 data-* 或检测属性是否存在
+```
+
+**关键洞察**：语言和主题是唯一通过 session 中转的偏好，因为它们影响**所有页面的 CSS 和布局渲染**（在 view 初始化阶段就需要），而其他偏好只在具体交互时才被 JS 读取。这就是为什么 `SetUser()` 只同步 `Language` 和 `Theme` 两个字段到 session。
