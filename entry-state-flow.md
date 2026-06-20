@@ -1793,7 +1793,593 @@ case BroadcastStream, LikeStream:
 
 ---
 
-## 十八、总结
+## 十八、Entry 内容在 Web 端的离线缓存与状态同步机制
+
+### 18.1 总体设计：极简离线支持
+
+Miniflux 的 Web 端离线功能非常克制——**不缓存条目数据，只缓存一个离线提示页**。状态同步也采用**即时同步 + 前端乐观更新**的简单模式，没有本地队列或延迟同步。
+
+### 18.2 Service Worker 与离线缓存
+
+**代码**（`ui/static/js/service_worker.js:1-44`）：
+
+```javascript
+const OFFLINE_VERSION = 1;
+const CACHE_NAME = "offline";
+
+self.addEventListener("install", (event) => {
+    event.waitUntil((async () => {
+        const cache = await caches.open(CACHE_NAME);
+        await cache.add(new Request(OFFLINE_URL, { cache: "reload" }));
+    })());
+    self.skipWaiting();
+});
+
+self.addEventListener("fetch", (event) => {
+    // 只在离线且是导航请求时才介入
+    if (navigator.onLine === false && event.request.mode === "navigate") {
+        event.respondWith((async () => {
+            try {
+                const networkResponse = await fetch(event.request);
+                return networkResponse;
+            } catch (error) {
+                const cache = await caches.open(CACHE_NAME);
+                const cachedResponse = await cache.match(OFFLINE_URL);
+                return cachedResponse;
+            }
+        })());
+    }
+});
+```
+
+**离线缓存内容**：
+
+| 缓存项 | 内容 | 缓存策略 |
+|--------|------|---------|
+| `OFFLINE_URL` ( /offline ) | 纯静态 HTML 离线提示页 | 安装时预缓存，每次 SW 版本更新时重新获取 |
+
+**不缓存的内容**（重要）：
+- ❌ 条目列表（HTML 或 JSON）
+- ❌ 条目内容/正文
+- ❌ Feed 列表
+- ❌ 未读计数
+- ❌ 收藏状态
+
+**设计意图**：Service Worker 只提供"降级体验"——离线时显示一个友好的"你已离线"页面，而不是完整的离线阅读。这与 Feedly、Inoreader 等商业 RSS 阅读器的完整离线缓存有本质区别。
+
+### 18.3 前端状态更新：乐观 UI + 服务器即时同步
+
+Web 端的条目状态操作（标记已读/未读、切换收藏）采用**乐观更新**模式：
+
+#### 18.3.1 状态变更的前端流程
+
+**代码**（`ui/static/js/app.js:682-692`）：
+
+```javascript
+function updateEntriesStatus(entryIDs, status, callback) {
+    const url = document.body.dataset.entriesStatusUrl;
+    sendPOSTRequest(url, { entry_ids: entryIDs, status: status }).then((resp) => {
+        resp.json().then(count => {
+            if (callback) {
+                callback(resp);
+            }
+            // 服务器返回可见条目数，用于更新未读计数
+            updateUnreadCounterValue(status === "read" ? -count : count);
+        });
+    });
+}
+```
+
+**列表页标记当前页为已读**（`app.js:577-596`）：
+
+```javascript
+function markPageAsReadAction() {
+    const items = getVisibleEntries();
+    const entryIDs = items.map(element => parseInt(element.dataset.id, 10));
+
+    // 步骤1：乐观更新 DOM（立即添加已读样式）
+    items.forEach(element => element.classList.add("item-status-read"));
+
+    // 步骤2：发送请求到服务器
+    updateEntriesStatus(entryIDs, "read", () => {
+        // 步骤3：回调中处理页面跳转
+        if (showOnlyUnread) {
+            window.location.reload();
+        } else {
+            goToPage("next", true);
+        }
+    });
+}
+```
+
+**收藏切换**（`app.js:721-741`）：
+
+```javascript
+function handleStarAction(element) {
+    // 步骤1：设为 loading 状态
+    setButtonToLoadingState(buttonElement);
+
+    // 步骤2：发送请求
+    sendPOSTRequest(buttonElement.dataset.starUrl).then(() => {
+        // 步骤3：收到响应后更新按钮状态
+        const isStarred = currentState === "star";
+        const newStarStatus = isStarred ? "unstar" : "star";
+        setStarredButtonState(buttonElement, newStarStatus);
+    });
+}
+```
+
+**时序对比**：
+
+| 操作 | DOM 更新时机 | 计数更新时机 |
+|------|------------|------------|
+| 标记已读/未读 | 请求发送后立即乐观更新 | 响应返回后（使用服务器返回的可见计数） |
+| 切换收藏 | 请求完成后更新（非乐观） | 不更新全局未读计数（收藏不影响未读计数） |
+| 播放完成标记已读 | 达到阈值时立即更新 DOM + 后台发送请求 | 不更新（媒体页场景） |
+
+#### 18.3.2 未读计数的前端更新
+
+**代码**（`app.js:890-901`）：
+
+```javascript
+function updateUnreadCounterValue(delta) {
+    // 更新所有页面上的未读计数器元素
+    document.querySelectorAll("span.unread-counter").forEach((element) => {
+        const oldValue = parseInt(element.textContent, 10);
+        element.textContent = oldValue + delta;
+    });
+
+    // 如果在未读列表页，同时更新页面标题
+    if (window.location.href.endsWith('/unread')) {
+        document.title = document.title.replace(/\(\d+\)/, `(${newValue})`);
+    }
+}
+```
+
+**关键设计**：
+- 未读计数的 delta 不是客户端计算的，而是**使用服务器返回的可见条目数**（`SetEntriesStatusAndCountVisible` 的返回值）
+- 这保证了：即使某些条目属于被隐藏的 Feed（`hide_globally = true`），前端计数也不会"多减"
+- 因为 Web UI 的全局未读计数本来就不包含隐藏的 Feed
+
+### 18.4 状态同步的三种触发方式
+
+| 触发方式 | 场景 | 同步行为 |
+|---------|------|---------|
+| 用户点击 | 列表页/详情页手动切换状态 | 即时 AJAX POST，乐观更新 UI |
+| 键盘快捷键 | `m` 切换已读、`s` 切换收藏 | 同点击，调用相同的 JS 函数 |
+| 媒体播放完成 | 音频/视频播放到指定百分比 | 后台静默发送标记已读请求 |
+| 前进/后退缓存（bfcache） | 从历史记录返回页面 | `pageshow` 事件中重新标记已读（`app.js:1288`） |
+
+### 18.5 离线状态下的行为
+
+由于没有本地状态队列，离线时的状态操作：
+1. 用户点击标记已读 → `fetch()` 失败 → `catch` 中没有降级处理
+2. 按钮保持 loading 状态或报错
+3. 状态变更**不会被暂存**，刷新后恢复为原状态
+4. 用户需要手动重试
+
+这是极简设计的代价——Miniflux Web UI 本质上是**在线应用**，Service Worker 只提供降级体验而非完整离线功能。
+
+---
+
+## 十九、过期 Entry 的清理触发与级联状态删除
+
+### 19.1 清理任务的触发机制
+
+#### 19.1.1 定时调度：后台 Scheduler
+
+**代码**（`cli/scheduler.go:27-30, 53-57`）：
+
+```go
+func runScheduler(store *storage.Storage, pool *worker.Pool) {
+    // ...
+    go cleanupScheduler(
+        store,
+        config.Opts.CleanupFrequency(),
+    )
+}
+
+func cleanupScheduler(store *storage.Storage, frequency time.Duration) {
+    for range time.Tick(frequency) {
+        runCleanupTasks(store)
+    }
+}
+```
+
+- 调度器随服务启动自动启动（`-d` / `--daemon` 模式）
+- 使用 `time.Tick` 定时触发，**无并发保护**（如果 `runCleanupTasks` 执行时间超过 frequency，会并发执行）
+- 实际受 `FOR UPDATE SKIP LOCKED` 保护，不会产生数据冲突
+
+#### 19.1.2 手动触发：CLI 命令
+
+```bash
+miniflux --run-cleanup-tasks
+```
+
+可通过 cron 或 systemd timer 外部调度。
+
+#### 19.1.3 配置参数
+
+| 参数 | 默认值 | 含义 |
+|------|-------|------|
+| `CLEANUP_FREQUENCY` | 24 小时 | 清理任务执行频率 |
+| `CLEANUP_ARCHIVE_READ_DAYS` | 60 天 | 已读条目的保留天数 |
+| `CLEANUP_ARCHIVE_UNREAD_DAYS` | 180 天 | 未读条目的保留天数 |
+| `CLEANUP_ARCHIVE_BATCH_SIZE` | 10000 | 每批删除的条目数 |
+
+**代码**（`cli/cleanup_tasks.go:16-58`）：
+
+```go
+func runCleanupTasks(store *storage.Storage) {
+    // 1. 清理过期 Web Session
+    store.CleanOldWebSessions(config.Opts.CleanupRemoveSessionsInterval())
+
+    // 2. 归档已读条目
+    store.ArchiveEntries(
+        model.EntryStatusRead,
+        config.Opts.CleanupArchiveReadInterval(),   // 默认 60 天
+        config.Opts.CleanupArchiveBatchSize(),       // 默认 10000
+    )
+
+    // 3. 归档未读条目
+    store.ArchiveEntries(
+        model.EntryStatusUnread,
+        config.Opts.CleanupArchiveUnreadInterval(), // 默认 180 天
+        config.Opts.CleanupArchiveBatchSize(),       // 默认 10000
+    )
+
+    // 4. 清理孤立图标
+    store.CleanupOrphanIcons()
+}
+```
+
+### 19.2 核心清理逻辑：`ArchiveEntries`
+
+**代码**（`storage/entry.go:362-404`）：
+
+```sql
+WITH to_delete AS (
+    SELECT id, feed_id, hash
+    FROM entries
+    WHERE
+        status=$1 AND                  -- 按状态分别清理
+        starred is false AND           -- ★ 保护 1：已收藏的不删
+        share_code='' AND              -- ★ 保护 2：已分享的不删
+        created_at < now() - $2::interval  -- 超过保留时间
+    ORDER BY created_at ASC
+    FOR UPDATE SKIP LOCKED              -- 悲观锁 + 跳过被锁的行
+    LIMIT $3                            -- 批量限制
+),
+deleted AS (
+    DELETE FROM entries
+    USING to_delete
+    WHERE entries.id = to_delete.id
+    RETURNING entries.feed_id, entries.hash
+)
+INSERT INTO entry_tombstones (feed_id, hash)
+SELECT feed_id, hash FROM deleted WHERE hash <> ''
+ON CONFLICT (feed_id, hash) DO NOTHING   -- 幂等插入墓碑
+```
+
+**执行流程**（单条 SQL 内）：
+1. `to_delete` CTE：选中待删除行，加 `FOR UPDATE SKIP LOCKED` 行锁
+2. `deleted` CTE：删除选中行
+3. 插入 `entry_tombstones` 墓碑记录
+
+### 19.3 受保护的条目（不被清理）
+
+| 保护条件 | 原因 |
+|---------|------|
+| `starred = true` | 用户收藏的条目是"重要内容"，不应被自动清理 |
+| `share_code <> ''` | 已分享的条目有公开 URL，删除会导致链接失效 |
+
+**注意**：保护条件仅对 `ArchiveEntries` 有效。`FlushHistory`（手动清空历史）只保护收藏的条目，不保护分享的。
+
+### 19.4 `FlushHistory`：用户主动清空历史
+
+**代码**（`storage/entry.go:491-510`）：
+
+```go
+func (s *Storage) FlushHistory(userID int64) error {
+    query := `
+        WITH deleted AS (
+            DELETE FROM entries
+            WHERE user_id=$1 AND status='read' AND starred is false
+            RETURNING feed_id, hash
+        )
+        INSERT INTO entry_tombstones (feed_id, hash)
+        SELECT feed_id, hash FROM deleted WHERE hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING
+    `
+    _, err := s.db.Exec(query, userID)
+    return err
+}
+```
+
+**与 `ArchiveEntries` 的区别**：
+- 范围：仅指定用户的已读条目（非全用户）
+- 时间：不按时间过滤，删除**所有**已读且未收藏的条目
+- 触发：用户主动操作（Web UI "清空历史"按钮、API `POST /v1/me/flush-history`）
+- 保护：只保护 `starred = false`，不检查 `share_code`
+
+### 19.5 级联删除与关联数据清理
+
+#### 19.5.1 Feed 删除时的级联
+
+**Schema 定义**（`database/migrations.go:78-91`）：
+
+```sql
+CREATE TABLE entries (
+    ...
+    feed_id bigint not null references feeds(id) on delete cascade,
+    ...
+);
+```
+
+删除 Feed 时，PostgreSQL 自动级联删除该 Feed 的所有条目。但**附属表需要额外处理**：
+
+- `enclosures`：有外键指向 entries，`ON DELETE CASCADE`，自动级联
+- `entry_tombstones`：有外键指向 feeds，`ON DELETE CASCADE`，自动级联
+
+#### 19.5.2 手动清理：孤立图标
+
+**代码**（`storage/icon.go:150-162`）：
+
+```go
+// feed. Such rows accumulate when feeds are deleted (the cascade only removes
+// icons that are still referenced; orphaned rows stay behind).
+func (s *Storage) CleanupOrphanIcons() (int64, error) {
+    result, err := s.db.Exec(`
+        DELETE FROM icons WHERE id NOT IN (SELECT icon_id FROM feeds WHERE icon_id IS NOT NULL)
+    `)
+    // ...
+}
+```
+
+图标表没有 `ON DELETE SET NULL` 或级联，Feed 删除后图标变成孤儿，需要定期手动清理。
+
+### 19.6 清理对未读计数的影响
+
+由于未读计数是实时查询的：
+- 清理已读条目 → 不影响未读计数
+- 清理未读条目 → 未读计数**自动减少**（因为条目被删除了）
+- 客户端感知：下次拉取时发现条目不在列表中，或未读计数变少
+
+**注意**：Fever API 的 `unread_item_ids` 和 Google Reader 的 `stream/items/ids` 都是基于当前 entries 表实时查询的，清理后这些列表会自动反映最新状态。
+
+### 19.7 清理的幂等性与并发安全
+
+| 安全机制 | 作用 |
+|---------|------|
+| `FOR UPDATE SKIP LOCKED` | 并发清理任务不会重复删除同一行，跳过已被锁定的行 |
+| `ON CONFLICT DO NOTHING` | 墓碑插入幂等，重复插入不会报错 |
+| `created_at < now() - interval` | 时间窗口判断，已删除的不会再被选中 |
+
+即使多个 `cleanupScheduler` 并发运行（如 frequency 过短 + 上轮未执行完），数据也不会出问题。
+
+---
+
+## 二十、Entry 状态对统计聚合（Per-Feed / Per-Category）的反馈链路
+
+### 20.1 总体设计：无缓存实时聚合
+
+Miniflux 的统计聚合**完全不使用缓存或计数器表**，每次请求时从 `entries` 表实时 `GROUP BY` 计算。这是"状态变更 → 聚合反映"链路的根本特征——没有中间层，状态变更直接体现在下次聚合查询中。
+
+### 20.2 Per-Feed 计数：`feedQueryBuilder.fetchFeedCounter()`
+
+#### 20.2.1 核心 SQL
+
+**代码**（`storage/feed_query_builder.go:302-350`）：
+
+```sql
+SELECT
+    e.feed_id,
+    e.status,
+    count(*)
+FROM entries e
+    [INNER JOIN feeds f ON f.id=e.feed_id]  -- 仅当按 category 过滤时
+WHERE
+    e.user_id = $1
+    AND e.status IN ($2, $3)               -- 只统计 unread 和 read
+    [AND f.category_id = $N]               -- 可选：按 category 过滤
+GROUP BY e.feed_id, e.status
+```
+
+**返回结构**：两个 map
+- `readCounters[feedID] = count`
+- `unreadCounters[feedID] = count`
+
+#### 20.2.2 调用入口
+
+| 调用方 | 函数 | 场景 |
+|-------|------|------|
+| Web UI 列表页 | `FeedsWithCounters()` | 侧边栏 Feed 列表，显示每个 Feed 的未读数 |
+| Web UI 分类页 | `FeedsByCategoryWithCounters()` | 分类内的 Feed 列表 |
+| REST API v1 | `FetchCounters()` | `/v1/feeds/counters` 端点，客户端同步使用 |
+
+**Web UI Feed 列表页**（`ui/feed_list.go:14-37`）：
+
+```go
+func (h *handler) showFeedsPage(w http.ResponseWriter, r *http.Request) {
+    feeds, err := h.store.FeedsWithCounters(user.ID)
+    navMetadata, _ := h.store.GetNavMetadata(user.ID)
+    view.Set("countUnread", navMetadata.CountUnread)
+    // ...
+}
+```
+
+**API Counters 端点**（`api/feed_handlers.go:209-217`）：
+
+```go
+func (h *handler) fetchCountersHandler(w http.ResponseWriter, r *http.Request) {
+    counters, err := h.store.FetchCounters(request.UserID(r))
+    response.JSON(w, r, counters)
+}
+```
+
+#### 20.2.3 模型层表示
+
+**代码**（`model/feed.go:74-76, 79-82`）：
+
+```go
+type Feed struct {
+    // ...
+    UnreadCount            int  `json:"-"`  // 内部属性，不序列化到 API
+    ReadCount              int  `json:"-"`  // 内部属性，不序列化到 API
+    NumberOfVisibleEntries int  `json:"-"`  // ReadCount + UnreadCount
+}
+
+type FeedCounters struct {
+    ReadCounters   map[int64]int `json:"reads"`
+    UnreadCounters map[int64]int `json:"unreads"`
+}
+```
+
+注意：`Feed` 结构体的 `UnreadCount` / `ReadCount` 标记为 `json:"-"`，**不在 Feed API 中直接返回**。独立的 `/v1/feeds/counters` 端点专门返回计数数据，供客户端同步使用。
+
+### 20.3 Per-Category 计数：`CategoriesWithFeedCount()`
+
+#### 20.3.1 核心 SQL
+
+**代码**（`storage/category.go:112-170`）：
+
+```sql
+SELECT
+    c.id, c.user_id, c.title, c.hide_globally,
+    coalesce(fc.feed_count, 0),       -- 该分类下的 Feed 数量
+    coalesce(uc.unread_count, 0)      -- 该分类下的未读条目总数
+FROM categories c
+LEFT JOIN (
+    SELECT category_id, count(*) AS feed_count
+    FROM feeds
+    WHERE user_id = $2
+    GROUP BY category_id
+) fc ON fc.category_id = c.id
+LEFT JOIN (
+    SELECT f.category_id, count(*) AS unread_count
+    FROM entries e
+    INNER JOIN feeds f ON f.id = e.feed_id
+    WHERE e.user_id = $2 AND e.status = $1  -- $1 = 'unread'
+    GROUP BY f.category_id
+) uc ON uc.category_id = c.id
+WHERE c.user_id = $2
+ORDER BY
+    [c.title ASC] 或 [uc.unread_count DESC, c.title ASC]
+```
+
+**特点**：
+- 分类计数只统计**未读**（`status = 'unread'`），不统计已读
+- 使用 `LEFT JOIN + coalesce` 保证"空分类"显示为 0 而非 NULL
+- 可按 `unread_count` 排序（用户偏好：`CategoriesSortingOrder`）
+
+#### 20.3.2 调用入口
+
+| 调用方 | 场景 |
+|-------|------|
+| Web UI 分类列表 | `/categories` 页面，显示每个分类的 Feed 数和未读数 |
+| REST API v1 | `/v1/categories?counts=true` |
+
+**模型层**（`model/category.go:15-16`）：
+
+```go
+type Category struct {
+    FeedCount   *int `json:"feed_count,omitempty"`   // 用指针 + omitempty 表示可选
+    TotalUnread *int `json:"total_unread,omitempty"`
+}
+```
+
+### 20.4 状态变更到聚合反映的完整链路
+
+以"标记条目 123 为已读"为例，整个反馈链路：
+
+```
+时间点 T0:
+  feed A: unread=10, read=50
+  category X: unread=100
+
+时间点 T1: 用户点击"标记已读"
+  → UI 层: updateEntriesStatus([123], "read")
+     → HTTP POST /entry/status
+        → UI Handler: entry_update_status.go
+           → Storage: SetEntriesStatusAndCountVisible(userID, [123], "read")
+              → SQL: WITH updated AS (UPDATE ...) SELECT count(*) ...
+                 ← 返回可见条目数 count
+           ← 返回 count 给前端
+        ← 响应: JSON number
+     → 前端: updateUnreadCounterValue(-count)  ← 更新导航栏计数
+  → 此时 feed A: unread=9, read=51 （数据库中已变更）
+
+时间点 T2: 用户刷新页面或点击下一页
+  → 重新查询 FeedsWithCounters()
+     → 重新执行 GROUP BY 查询
+     → 反映最新状态
+```
+
+**关键点**：
+1. 状态变更与聚合同步**不是同一请求内完成**的（导航栏计数除外）
+2. Feed 列表的计数只有在下次重新获取 Feed 列表时才更新
+3. 没有"实时推送"或"WebSocket"机制
+4. 前端的未读计数 delta 更新只影响导航栏，不影响侧边栏 Feed 列表的计数
+
+### 20.5 计数查询的性能优化
+
+#### 20.5.1 覆盖索引
+
+`entries_user_status_feed_idx (user_id, status, feed_id)` 是 feed 粒度计数的完美覆盖索引——PostgreSQL 可以直接对索引做 Index Only Scan，无需回表。
+
+#### 20.5.2 一次性获取，避免 N+1
+
+`FeedsWithCounters()` 的执行流程：
+1. 一次查询获取所有 Feed 基础信息
+2. 一次 `fetchFeedCounter()` 查询获取所有 Feed 的计数（`GROUP BY feed_id`）
+3. 在 Go 代码中按 feed_id 关联赋值
+
+总共 **2 次 SQL 查询**，而不是每个 Feed 查一次计数（避免 N+1）。
+
+#### 20.5.3 分类计数的单次查询
+
+`CategoriesWithFeedCount()` 在**单条 SQL** 中用两个 LEFT JOIN 子查询同时获取 feed_count 和 unread_count。
+
+### 20.6 一致性保证：数据库为唯一真相源
+
+由于所有聚合查询都直接从 entries 表实时计算：
+
+| 一致性属性 | 保证方式 |
+|-----------|---------|
+| 状态变更 → 立即可聚合 | 单 SQL 事务，UPDATE 提交后聚合查询立即可见 |
+| Feed 计数 = 所有条目 status 统计之和 | 同一张表，天然一致 |
+| 分类计数 = 分类下所有 Feed 计数之和 | 同一张表，天然一致 |
+| 全局未读计数 = 所有 Feed 未读数之和 | 同一张表，天然一致 |
+
+不存在"Feed 计数加起来不等于全局计数"的不一致问题——因为所有数字都来自同一张表的实时统计。
+
+### 20.7 特殊聚合：每周条目数预测
+
+**代码**（`storage/feed.go:167-197`）：
+
+```go
+func (s *Storage) WeeklyFeedEntryCount(userID, feedID int64) (int, error) {
+    query := `
+        SELECT COALESCE(CAST(CEIL(
+            (EXTRACT(epoch from interval '1 week')) /
+            NULLIF(
+                (EXTRACT(epoch from (max(published_at)-min(published_at))
+                 / NULLIF((count(*)-1), 0)
+                )
+            ), 0)
+        ) AS BIGINT), 0)
+        FROM entries
+        WHERE entries.user_id=$1 AND entries.feed_id=$2
+          AND entries.published_at >= now() - interval '1 week'
+    `
+}
+```
+
+这是一个**虚拟指标**：基于最近一周条目的平均发布间隔，推算每周预计条目数。用于 Feed 列表页展示"更新频率"参考。
+
+---
+
+## 二十一、总结
 
 ### 状态同步的核心设计原则
 
@@ -1820,6 +2406,15 @@ case BroadcastStream, LikeStream:
    - Google Reader 实现更健壮：状态应用前先检查当前状态，确保幂等；`kept-unread` 与 `read` 标签互斥检测
    - Fever 实现存在缺陷：`saved`/`unsaved` 使用 `ToggleStarred` 而非显式设置，并发时可能翻转状态；`mark=group&id=0` 忽略 `before` 参数
 
+9. **极简离线策略**：Service Worker 只缓存一个离线提示页，不缓存条目数据。前端状态更新采用"乐观 UI + 即时同步"模式，无本地队列、无延迟同步、无离线暂存。未读计数 delta 使用服务器返回的可见条目数计算，而非客户端本地推算。
+
+10. **两层清理机制**：
+    - 自动清理：后台定时调度（默认每天一次），按状态分别归档（已读 60 天、未读 180 天），保护收藏和已分享条目
+    - 手动清理：`FlushHistory` 用户主动清空历史，只保护收藏条目
+    - 级联删除：Feed 删除时通过 `ON DELETE CASCADE` 自动删除 entries，附属表如 enclosures 同理级联
+
+11. **聚合查询的实时一致性**：Per-Feed 和 Per-Category 计数均为实时 `GROUP BY` 查询，无计数器表、无缓存、无触发器。状态变更提交后，下次聚合查询立即可见。使用覆盖索引（`entries_user_status_feed_idx`）实现 Index Only Scan，保证查询性能。
+
 ### 注意事项与潜在问题
 
 - **Fever 收藏翻转风险**：`saved`/`unsaved` 操作使用 `ToggleStarred` 而非显式 `SetEntriesStarredState`，存在客户端重复调用时状态意外翻转的风险（`fever/handler.go:447,466`）。代码已经 SELECT 了 entry 但未做条件判断，是可修复的缺陷。
@@ -1833,3 +2428,9 @@ case BroadcastStream, LikeStream:
 - **Google Reader 增量同步限制**：协议实现只支持按 `published_at` 过滤，不支持按 `changed_at` 过滤增量同步，客户端必须拉取条目详情才能发现状态变更。
 
 - **`changed_at` 精度限制**：微秒级精度下，同一微秒内的并发更新无法通过时间戳区分先后。
+
+- **离线状态操作无降级**：Web 端离线时标记已读/收藏会失败且不暂存，刷新后恢复原状态。Service Worker 仅提供离线提示页，不提供完整离线阅读功能。
+
+- **清理调度无并发保护**：`cleanupScheduler` 使用 `time.Tick` 驱动，如果上一轮清理未完成，下一轮会并发执行。虽然数据层面受 `FOR UPDATE SKIP LOCKED` 保护无冲突，但可能产生不必要的资源消耗。
+
+- **聚合查询的非即时性**：标记已读后，导航栏未读计数即时更新（通过返回值），但侧边栏 Feed 列表和分类列表的计数**不会即时更新**，需要刷新页面或重新进入列表页才能看到变化。
