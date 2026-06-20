@@ -422,6 +422,67 @@ for (const [combination, { keys, callback }] of this.shortcuts.entries()) {
 | 运行时保护 | 无。Map 迭代顺序决定匹配优先级（先注册先匹配），但序列键的前缀匹配在 queue 长度不足时返回 false，所以不会误触发 |
 | 开发者保障 | 靠人工审查确保 `g`/`z` 等序列前缀键不作为单键注册 |
 
+### 9.4 chord 组合键（Ctrl+Shift+K）的冲突识别分析
+
+#### 9.4.1 Miniflux 不支持 Ctrl/Alt/Meta 修饰的 chord
+
+`keyboard_handler.js:17` 的 `listen()` 方法有一道硬门槛：
+
+```javascript
+if (this.isEventIgnored(event, key) || KeyboardHandler.isModifierKeyDown(event)) {
+    return;
+}
+```
+
+`isModifierKeyDown()` 定义（第 53-55 行）：
+```javascript
+static isModifierKeyDown(event) {
+    return event.getModifierState("Control") || event.getModifierState("Alt") || event.getModifierState("Meta");
+}
+```
+
+**只要按住 Ctrl、Alt、Meta（Cmd）中任意一个，按键事件直接被丢弃**，连队列都不会进入。因此：
+- `"Ctrl+K"`、`"Ctrl+Shift+K"`、`"Alt+K"`、`"Cmd+Shift+P"` 这类 chord 组合键**永远不会被触发**
+- 不存在"Ctrl+Shift+K 与其他键冲突"的问题——因为它们根本不被系统识别
+- 冲突检测（哪怕是最简单的存在性检查）也轮不到 chord 键上场
+
+#### 9.4.2 Shift 键是个例外：通过 `event.key` 大小写间接体现
+
+Shift 不在 `isModifierKeyDown()` 的检查列表中。Shift 的作用是**改变 `event.key` 的返回值**：
+- 按 `k` → `event.key === "k"`（小写）
+- 按 `Shift+k` → `event.key === "K"`（大写）
+
+在 Miniflux 实际注册中，大小写键确实是独立注册的两个快捷键：
+- `"v"` → 在后台打开原文
+- `"V"` → 在新标签页打开原文
+- `"m"` → 下一条目状态切换
+- `"M"` → 上一条目状态切换
+- `"c"` → 打开评论链接（后台）
+- `"C"` → 打开评论链接（新标签页）
+- `"f"` → 切换星标
+- `"F"` → 跳转到订阅源页
+
+**"v" 和 "V" 算不算冲突？** 不算。在 `KeyboardHandler.shortcuts` Map 中，`"v"` 和 `"V"` 是两个不同的 key，各自绑定不同的回调函数。`Map.set()` 不会互相覆盖，匹配时也不会混淆——`"k" === "K"` 为 `false`。
+
+#### 9.4.3 序列化形式的结论
+
+如果有人想用 `"Ctrl+Shift+K"` 这种以 `+` 连接的字符串作为 combination 注册：
+
+1. `on("Ctrl+Shift+K", callback)` 会被 `split(" ")` 切成 `["Ctrl+Shift+K"]`（单键），存入 Map 的 key 是 `"Ctrl+Shift+K"` 字符串本身
+2. 实际按键时，`event.key` 按下 K 返回 `"K"`，按下 Ctrl 返回 `"Control"`（单独按修饰键时），同时按 Ctrl+K 时 `event.key` 仍为 `"k"` 但 `isModifierKeyDown()` 返回 true 直接跳过
+3. **永远匹配不上**——既因为修饰键过滤，也因为 key 字符串不匹配
+
+**序列化格式差异总结**：
+
+| 系统 | 组合键表示方式 | 分隔符 | 修饰键处理 |
+|------|--------------|--------|-----------|
+| Miniflux | `g u`（序列键）、`V`（Shift 间接体现） | 空格（序列） | Ctrl/Alt/Meta 直接忽略 |
+| Vim/Emacs | `<C-S-k>` 或 `C-M-k` | 特殊符号 | 支持完整修饰键 |
+| VS Code | `ctrl+shift+k` | `+` | 支持完整修饰键 |
+| Mousetrap.js | `ctrl shift k` 或 `g g` | 空格 | 支持修饰键 + 序列键 |
+
+Miniflux 的 `KeyboardHandler` 是一个**极简实现**，只支持"单键"和"空格分隔的按键序列"两种模式，不支持任何修饰键 chord。
+
 ---
 
 ## 十、keymap JSONB 字段：不存在，偏好全部存为扁平列
@@ -508,6 +569,106 @@ userModificationRequest := &model.UserModificationRequest{
 如果用户在表单中填写 `0`，`OptionalNumber(0)` 返回 `nil`，`Patch()` 不会覆盖该字段——**这意味着通过 REST API 无法将数值型偏好设为 0**（虽然验证逻辑会拒绝 ≤0 的值，所以实际不会出问题，但这是一个潜在的语义缺陷）。
 
 **更关键的是**：`KeyboardShortcuts` 等布尔字段**没有** `OptionalBool` 辅助函数（`model.go` 中不存在），因此在 `settings_update.go` 中这些字段**不通过** `UserModificationRequest` 传递，而是通过 `SettingsForm.Merge(user)` 直接覆盖到 User 对象。这导致 Web UI 表单提交是全量覆盖语义，无法实现部分更新。
+
+### 10.6 JSONB + GIN 索引频繁更新的膨胀代价分析
+
+虽然 Miniflux 的偏好字段不使用 JSONB + GIN，但我们可以结合代码库中 `web_sessions.state`（JSONB 但无索引）和 `entries.document_vectors`（有 GIN 索引的 tsvector）的实现模式，深入分析"如果 keymap 用 JSONB 存储并加 GIN 索引，频繁更新的代价"。
+
+#### 10.6.1 现有代码中 JSONB 的更新模式：整体替换
+
+`storage/web_session.go:183-196` 中 `UpdateWebSession` 的实现：
+
+```go
+query := `
+    UPDATE
+        web_sessions
+    SET
+        user_id=$2,
+        state=$3    -- 整体替换整个 JSONB 字段
+    WHERE
+        id=$1
+`
+
+stateJSON, err := session.MarshalState()  // Go 层序列化为完整 JSON 字符串
+_, err := s.db.Exec(query, session.ID, session.NullUserID(), stateJSON)
+```
+
+特点：
+- **全量写入**：每次更新都是把整个 state 对象序列化为 JSON，整体替换 `state` 列
+- **读-改-写在应用层**：先从 DB 读出 → 反序列化为 Go struct → 修改字段 → 序列化 → 写回
+- **不使用 `jsonb_set` / `jsonb_insert`**：没有利用 PostgreSQL 原生的 JSONB 部分更新操作符
+- 即使只改一个字段（如 flash message），也是整段 JSON 写回
+
+这种模式下，如果有 GIN 索引，**每次更新都是删除旧索引条目 + 插入全部新索引条目**，代价是 O(n) 的索引重建（n 为 JSONB 内键值对数量）。
+
+#### 10.6.2 GIN 索引的工作原理与写入代价
+
+GIN（Generalized Inverted Index）是倒排索引，为每个被索引的元素（对于 JSONB 来说是每个 key 和每个 value）建立 posting list（行号列表）。
+
+对于一个假想的 `keymap jsonb` 字段加 `CREATE INDEX idx_keymap ON users USING gin(keymap)`：
+
+```json
+{
+  "navigate_down": "j",
+  "navigate_up": "k",
+  "open_original": "v",
+  "toggle_star": "f"
+}
+```
+
+GIN 索引内部大致是：
+
+```
+"navigate_down" → [row1, row5, row12, ...]
+"j"             → [row1, row3, ...]
+"navigate_up"   → [row1, ...]
+"k"             → [row1, row2, ...]
+...
+```
+
+**每次更新整个 JSONB 的索引代价**：
+1. 旧 JSONB 的所有 key 和 value 对应的 posting list 都要删除该行
+2. 新 JSONB 的所有 key 和 value 对应的 posting list 都要插入该行
+3. 如果 key 数量是 n，每次更新涉及 2n 次索引操作
+
+对比扁平列的 B-Tree 索引：
+- 只更新变更的列，每次更新涉及 1 次索引操作（如果该列有索引）
+- 偏好列基本都没有单独的索引（主键索引除外），几乎零额外代价
+
+#### 10.6.3 GIN 索引膨胀问题
+
+PostgreSQL 的 GIN 索引有两个与更新相关的膨胀机制：
+
+1. **FASTUPDATE 待处理列表**
+   - `gin_pending_list_limit` 控制一个内存中的 pending list（默认 4MB）
+   - 快速更新先写入 pending list，不立即合并到主索引结构
+   - 当 pending list 满了或 VACUUM 时才批量合并到主索引
+   - Miniflux 代码中未设置任何 GIN 相关参数，使用默认值
+   - 好处：写入快；坏处：查询时要扫 pending list，且积累到阈值才合并，会有突发延迟
+
+2. **碎片与膨胀**
+   - GIN 索引的 posting list 是按页存储的
+   - 频繁删除+插入会导致 posting list 页碎片化，空间利用率降低
+   - 需要定期 `VACUUM` 或 `REINDEX` 回收空间
+   - `web_sessions` 表因为会话有过期清理（`CleanOldWebSessions`），如果 state 有 GIN 索引，删除会话也会产生索引碎片
+
+#### 10.6.4 Miniflux 的实际选择：为什么偏好不用 JSONB
+
+从代码架构可以看出设计考量：
+
+| 考量维度 | 扁平列（现状） | JSONB + GIN（假设） |
+|---------|--------------|-------------------|
+| **写入模式** | 全列 UPDATE，但列数少（20+列），只修改实际变更的列（REST API 用 Patch 指针） | 必须整体替换或用 `jsonb_set`，整体替换 = 所有键都重写索引 |
+| **查询模式** | 按主键查单行，`SELECT *` 扫一行，无额外索引代价 | 按主键查也是扫一行，但 JSONB 解析需要 CPU 时间；如果有键值条件查询才用 GIN |
+| **条件查询需求** | 无。偏好从不作为 WHERE 条件过滤用户列表 | GIN 索引的价值在于 `WHERE preferences @> '{"keyboard_shortcuts": false}'` 这类查询，但 Miniflux 不需要 |
+| **Schema 演进频率** | 低。偏好字段相对稳定，年级别才新增一个 | JSONB 无需迁移，但 Miniflux 偏好稳定，灵活性不是刚需 |
+| **类型安全** | Go 结构体强类型 + PostgreSQL 列类型约束 | 运行时解析，类型靠应用层保证 |
+
+**核心结论**：Miniflux 没有 keymap JSONB 字段，也没有 GIN 索引，因为偏好是**按主键读写的单行列数据**，不需要条件查询，GIN 索引用不上，反而会带来：
+- 写入放大（每次更新触发 2n 次索引操作）
+- 索引膨胀（频繁更新 + FASTUPDATE 合并）
+- 类型不安全
+- 查询性能无提升（仍然走主键索引）
 
 ---
 
@@ -638,3 +799,116 @@ session 已认证？
 ```
 
 **关键洞察**：语言和主题是唯一通过 session 中转的偏好，因为它们影响**所有页面的 CSS 和布局渲染**（在 view 初始化阶段就需要），而其他偏好只在具体交互时才被 JS 读取。这就是为什么 `SetUser()` 只同步 `Language` 和 `Theme` 两个字段到 session。
+
+### 11.7 浅合并策略：删除 default 键时回退还是真删？
+
+这个问题需要在三个不同层面分别分析，因为 Miniflux 存在三种"合并/默认"机制，语义完全不同。
+
+#### 11.7.1 层面一：`UserModificationRequest.Patch()` —— nil = 不修改，不是"删除回退"
+
+`model/user.go:90-202` 的 `Patch()` 方法是典型的"指针 = 是否修改"模式：
+
+```go
+if u.KeyboardShortcuts != nil {
+    user.KeyboardShortcuts = *u.KeyboardShortcuts
+}
+```
+
+**语义**：
+- `*bool = nil` → 跳过这个字段，**保持原值不变**
+- `*bool = &false` → 设为 false
+- `*bool = &true` → 设为 true
+
+**这里没有"删除回退到默认值"的概念**。nil 指针的含义是"调用者不想改这个字段"，而不是"调用者想把这个字段恢复成默认值"。
+
+举例：
+- 用户当前 `KeyboardShortcuts = false`
+- API 调用 `PUT /v1/users/{id}` 传 `{}`（空 JSON）
+- 反序列化后 `u.KeyboardShortcuts == nil`
+- `Patch()` 跳过该字段
+- 结果：`KeyboardShortcuts` 仍然是 `false`，**没有回退到默认的 true**
+
+如果想"恢复默认值"，调用方必须**显式知道默认值是什么**，然后传默认值进去。后端不提供"重置为默认"的语义。
+
+#### 11.7.2 层面二：`webSessionState` JSONB —— `omitempty` 省略 ≠ 删除回退
+
+`model/web_session.go:37-46` 的 `webSessionState` 结构体：
+
+```go
+type webSessionState struct {
+    CSRF               string                `json:"csrf,omitempty"`
+    SuccessMessage     string                `json:"success_message,omitempty"`
+    ErrorMessage       string                `json:"error_message,omitempty"`
+    OAuth2             *WebSessionOAuth2     `json:"oauth2,omitempty"`
+    Language           string                `json:"language,omitempty"`
+    Theme              string                `json:"theme,omitempty"`
+}
+```
+
+`omitempty` 的行为：
+- 序列化时：零值字段（空字符串、nil 指针、0）不出现在 JSON 中
+- 反序列化时：JSON 中不存在的字段，Go struct 对应字段就是**零值**（空字符串、nil 等）
+
+**关键区分**：序列化时被省略 ≠ 数据被删除。
+
+举个完整生命周期：
+1. `NewWebSession()` 创建 session，`state.CSRF = rand.Text()`（非空）
+2. 序列化为 JSON：`{"csrf":"abc123",...}`
+3. 存入 `web_sessions.state` 列
+4. 下次请求读出 → 反序列化 → `state.CSRF == "abc123"`（正常保留）
+5. 如果某处代码把 `state.CSRF = ""`（清空）
+6. 序列化后 JSON 中不再有 `csrf` 键
+7. 写回 DB，DB 中的 JSONB 也没了 `csrf` 键
+8. 下次读出 → 反序列化 → `state.CSRF == ""`（零值）
+
+**这是"清零"，不是"回退默认"**。`csrf` 没了就是没了，不会自动恢复成新的随机值。
+
+那"默认值"从哪来？答案是**`Language()` 和 `Theme()` getter 方法**：
+
+```go
+func (s *WebSession) Theme() string {
+    if s.state.Theme != "" {
+        return s.state.Theme
+    }
+    return defaultSessionTheme  // "system_serif"
+}
+```
+
+所以回退逻辑是 **Get 时的 fallback**，不是 Set/Delete 时的自动恢复：
+- `state.Theme = ""` → JSON 中 theme 键消失 → 下次读 `Theme()` 返回 `defaultSessionTheme`
+- 看起来像是"删除后回退到默认"，但实际上是 getter 在零值时返回了默认常量
+- **DB 层面的数据确实被删了（变成空串/omitted）**，但行为层面前端感知到的是"回退到默认"
+
+| 字段 | 有 getter 方法 | 零值时行为 |
+|------|--------------|-----------|
+| `Language` | 有 → `Language()` | 空串 → 返回 `en_US`（看起来像回退） |
+| `Theme` | 有 → `Theme()` | 空串 → 返回 `system_serif`（看起来像回退） |
+| `CSRF` | 无（直接读字段） | 空串 → 就是空串，不回退 |
+| `SuccessMessage` | 无 | 空串 → 就是空串 |
+| `OAuth2` | 无 | nil → 就是 nil |
+
+#### 11.7.3 层面三：前端 data-* 属性 —— "属性不存在"即默认
+
+前端层面的"删除/回退"是最宽松的：
+
+1. **`keyboard_shortcuts`（有/无策略）**
+   - 属性不存在 → 启用快捷键（默认行为）
+   - 属性存在且为 `"true"` → 禁用
+   - 从"有"变"无" = 从禁用恢复为启用 = "回退默认"
+
+2. **`mark_read_on_view`（true/false 字符串）**
+   - 属性一定存在，值为 `"true"` 或 `"false"`
+   - 没有"不存在即默认"的语义
+   - 想回退默认必须显式传默认值（`false`）
+
+但注意：**前端属性的"有/无"完全由后端模板控制**，前端自身不能"删除偏好"。用户不能在浏览器里改个什么东西就让 data 属性消失——偏好的增删改都是服务端渲染时决定的。
+
+#### 11.7.4 三层模型对比总结
+
+| 层面 | 存储模型 | "删除"操作 | 删除后行为 | 是真删还是回退？ |
+|------|---------|-----------|-----------|----------------|
+| `users` 扁平列 | 每偏好一列，DB 有 DEFAULT | 不存在"删除列值"的概念，只能 UPDATE 为某个值 | 列值保持不变或被覆盖为新值 | 没有删除语义，只有覆盖语义 |
+| `web_sessions.state` JSONB | key-value JSONB 对象 | 设为零值 → `omitempty` 序列化时省略键 | DB 中键确实消失了，但 getter 可能返回默认值 | **DB 层面真删**，但 getter 层有回退 fallback |
+| 前端 `data-*` 属性 | HTML 属性 | 模板不输出该属性 | 前端按默认行为运行 | 是"不注入"，前端用默认逻辑，本质是回退 |
+
+**最容易产生误解的是 webSessionState 层**：`omitempty` + getter fallback 的组合，让"设零值"这个操作在 DB 层面表现为"删除键"，在行为层面表现为"回退默认"，容易让人以为有一套自动的"删除键→回退默认"机制。实际上是两个独立机制碰巧叠在了一起：序列化时的省略规则 + 读取时的零值回退。
