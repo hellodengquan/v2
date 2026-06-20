@@ -274,7 +274,7 @@ client := pushover.NewClient(
 2. **HTTP 服务器关闭** (`daemon.go:83-95`)：5 秒超时 context
 3. **Worker 池关闭** (`daemon.go:98`)：`pool.Shutdown()`
 
-`pool.Shutdown()` 的实现 (`worker/pool.go:27-30`)：
+#### `pool.Shutdown()` 的实现 (`worker/pool.go:27-30`)：
 ```go
 func (p *Pool) Shutdown() {
     close(p.queue)     // 关闭 Job 队列通道
@@ -282,7 +282,49 @@ func (p *Pool) Shutdown() {
 }
 ```
 
-`worker.Run` 的退出条件 (`worker/worker.go:24-49`)：
+#### Worker 池对外暴露的接口完整清单（以及为什么无法等待 in-flight 通知）
+
+`Pool` 结构体定义 (`worker/pool.go:14-17`)：
+```go
+type Pool struct {
+    queue chan model.Job   // 私有，小写开头
+    wg    sync.WaitGroup   // 私有，小写开头
+}
+```
+
+`Pool` 对外暴露的方法只有以下 3 个：
+
+| 方法 | 签名 | 用途 | 能等待通知 goroutine? |
+|-----|------|-----|---------------------|
+| `Push` | `(p *Pool) Push(jobs model.JobList)` | 将 Feed 刷新 job 推入队列 | 否 |
+| `Shutdown` | `(p *Pool) Shutdown()` | close(queue) + wg.Wait() | 否（只等 worker，不等通知） |
+| `NewPool`（构造函数） | `NewPool(store, nbWorkers) *Pool` | 创建 pool 并启动 N 个 worker | 否 |
+
+**关键发现**：
+
+1. **没有 `Drain()` 方法**：与某些 Worker 池实现不同，miniflux 的 Pool 不提供 `Drain()` 方法来等待所有已入队 job 完成后再关闭。`Shutdown()` 直接 `close(p.queue)`，这意味着**关闭瞬间 queue 中尚未被 worker 取走的 job 会被丢弃**——但实际上 queue 是无缓冲 channel（`make(chan model.Job)`），`Push()` 是阻塞发送，所以 queue 中不会有积压 job，每一个 job 在 Push 时就已经被某个 worker 取走了。
+
+2. **`wg` WaitGroup 私有不可导出**：`Pool.wg` 是私有字段（`sync.WaitGroup` 本身也是结构体，不是接口），外部调用方无法获取这个 WaitGroup，也无法通过类型断言访问它。
+
+3. **没有第二个 WaitGroup 追踪通知 goroutine**：Pool 中只维护了一个追踪 worker goroutine 的 `wg`，没有第二个 `notifyWg sync.WaitGroup`。理论上要等待通知完成，需要：
+   - `PushEntries`/`SendEntry` 启动 goroutine 前调用 `notifyWg.Add(1)`
+   - goroutine 结束时 `defer notifyWg.Done()`
+   - `Shutdown()` 中 `wg.Wait()` 之后再 `notifyWg.Wait()`
+   - 但实际代码中完全没有这套机制。
+
+4. **没有通过 context 传递取消信号的路径**：`RefreshFeed` 函数签名不接受 `context.Context`，`PushEntries` 函数签名也不接受 context。即使外部创建了通知专用 WaitGroup，也没有办法通过 context 告诉通知 goroutine"进程正在关闭，超时后请放弃"。
+
+5. **调用方（`daemon.go`）没有额外的等待机制**：`daemon.go:98` 直接调用 `pool.Shutdown()`，之后：
+   ```go
+   slog.Info("All background jobs completed, shutting down...")
+   pool.Shutdown()
+   slog.Info("Process gracefully stopped")
+   ```
+   调用方认为 `pool.Shutdown()` 返回即代表"所有后台工作已完成"，但实际上通知 goroutine 仍在运行。daemon 没有 `time.Sleep(10s)`、`time.AfterFunc`、额外的 WaitGroup 或任何其他机制来给通知 goroutine 缓冲时间。
+
+**结论**：从 API 设计层面，worker pool 对外**完全没有暴露**任何 Drain、WaitGroup、Context、回调钩子或其他机制供调用方等待 in-flight 通知发送完成。调用方（`startDaemon`）也没有自行实现额外的等待策略。in-flight 通知 goroutine 在进程关闭时完全处于"无人看管"状态。
+
+#### `worker.Run` 的退出条件 (`worker/worker.go:24-49`)：
 ```go
 func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
     defer wg.Done()
@@ -843,6 +885,55 @@ func (c *Client) SendDiscordMsg(feed *model.Feed, entries model.Entries) error {
 | `DiscordWebhookLink` 指向私有 IP | 若 `INTEGRATION_ALLOW_PRIVATE_NETWORKS=false`（默认），被 `DialContext` 阻断 | TCP 连接前：`connection to private network is blocked` |
 | `DiscordWebhookLink` 合法但无效（如被删除） | Discord API 返回 401/404 | HTTP 响应阶段：`status=401` / `status=404` |
 
+#### Discord `embed_color` 的完整 fall-through 路径
+
+Discord 通知使用 Rich Embed 格式，`color` 字段控制 embed 左侧竖条的颜色。完整路径逐层分析：
+
+**第 1 层：数据库层**——`integrations` 表中**没有** `discord_color`/`discord_embed_color` 列，`feeds` 表中也没有 Discord 相关颜色列。`model.Integration` 结构体中无 `DiscordColor`/`DiscordEmbedColor` 字段，`model.Feed` 结构体中也无。
+
+**第 2 层：表单/配置层**——`ui/form/integration.go` 中没有 Discord 颜色表单字段。用户在 Web UI 的集成设置页面没有任何地方可以配置 embed 颜色。
+
+**第 3 层：常量硬编码**——`discord/discord.go:24`：
+```go
+const discordMsgColor = 5793266
+```
+十进制 `5793266` = 十六进制 `0x5865F2` = RGB (88, 101, 242)，即 **Discord 品牌蓝色**（与 Slack 的 `#5865F2` 完全相同，见 `slack/slack.go:24`）。
+
+**第 4 层：消息构建**——`discord/discord.go:36-63`：
+```go
+json.Marshal(&discordMessage{
+    Embeds: []discordEmbed{
+        {
+            Title: "RSS feed update from Miniflux",
+            Color: discordMsgColor,    // ← 直接赋值常量，无判断、无覆盖
+            Fields: []discordFields{...},
+        },
+    },
+})
+```
+直接硬编码赋值，没有任何 `if config != nil` 或 `if userColor != 0` 的判断逻辑。
+
+**第 5 层：结构体 JSON 序列化**——`discord/discord.go:103-107`：
+```go
+type discordEmbed struct {
+    Title  string          `json:"title"`
+    Color  int             `json:"color"`   // ← 注意：无 omitempty
+    Fields []discordFields `json:"fields"`
+}
+```
+
+**关键点：`Color` 字段的 JSON tag `"color"` **无 `omitempty`**，因此：
+
+| `Color` 赋值情况 | JSON 输出 | Discord 实际显示颜色 |
+|----------------|---------|------------------|
+| `Color: 5793266`（当前代码） | `"color":5793266` | Discord 品牌蓝 `#5865F2` ✅ |
+| `Color: 0`（假设未来漏赋值） | `"color":0` | **黑色 `#000000`** ❌ |
+| **如加了 `omitempty`** 且 `Color: 0` | `"color"` 字段完全省略 | Discord 默认颜色（通常是深灰 `#202225` 或浅色模式中的中性灰） |
+
+**结论**：Discord embed_color 在完整路径中**每一层都没有用户可配置入口**，完全由代码常量 `discordMsgColor = 5793266` (`#5865F2`) 决定。不同于 Pushover 的 sound 字段（结构体中都不存在），Discord 的 color 字段在结构体中存在且有值，但同样**不可自定义**。
+
+如果将来有人重构时误将 `Color: discordMsgColor` 删除（Go int 零值 0），由于无 `omitempty`，会导致 `"color":0` 发送给 Discord，embed 变为纯黑色而非默认色，这是一个容易忽略的退化点。
+
 **关键特性**：
 - 逐条发送（for-range 每条 entry 一次请求），某条失败后**后续 entry 不再发送**（return error）
 - `response.Body.Close()` 没有使用 `defer`（`discord/discord.go:87`）——正常返回不影响，但如果 return error 前未 close，不会泄漏（因为 httpClient.Do 返回 err 时 response 为 nil）
@@ -939,6 +1030,69 @@ func (c *Client) SendMessage(message *MessageRequest) (*Message, error) {
 | `TelegramBotChatID == ""` | `chat_id` JSON 字段为空字符串，Telegram API 返回 400 Bad Request | Telegram API 响应：`error code is 400, "Bad Request: chat not found"` |
 | `TelegramBotTopicID == nil` | 正常回退：不发送话题 ID，发送到群组/频道的默认话题 | 无错误 |
 | `TelegramBotTopicID` 设为非法值（如不存在的话题） | Telegram API 返回 400 | Telegram API 响应 |
+
+#### Telegram `parse_mode`：为什么不存在 "MarkdownV2 转义失败回退到 plain text" 的逻辑
+
+用户可能会担心：如果使用 `MarkdownV2` 作为 `parse_mode` 但文本内容含有未转义的特殊字符（`_ * [ ] ( ) ~ `` > # + - = | { } . !`），Telegram API 会返回错误。但这个问题**在 miniflux 的实现中根本不会发生**，原因如下：
+
+**第 1 层：parse_mode 是硬编码常量**——`telegrambot/telegrambot.go:27`：
+```go
+message := &MessageRequest{
+    ParseMode: HTMLFormatting,   // ← 不是 MarkdownV2，是 HTML
+    ...
+}
+```
+
+常量定义 (`telegrambot/client.go:18-25`)：
+```go
+const (
+    MarkdownFormatting   = "Markdown"     // 老版本 Markdown，已被 Telegram 标记为过时
+    MarkdownV2Formatting = "MarkdownV2"   // 新版 Markdown，需要转义 18 个特殊字符
+    HTMLFormatting       = "HTML"          // ← 当前实际使用
+)
+```
+
+代码中虽然定义了 `MarkdownFormatting` 和 `MarkdownV2Formatting` 两个常量，但这两个常量**在整个代码库中从未被赋值使用**，仅 `HTMLFormatting` 被实际赋值给 `ParseMode` 字段。
+
+**第 2 层：文本构造使用 HTML 标签**——`telegrambot/telegrambot.go:17-22`：
+```go
+formattedText := fmt.Sprintf(
+    `<b>%s</b> - <a href=%q>%s</a>`,
+    feed.Title,    // ← 直接插入，未做 HTML 转义
+    entry.URL,     // ← 用 %q 加了双引号，也未做 HTML 属性转义
+    entry.Title,   // ← 直接插入，未做 HTML 转义
+)
+```
+
+文本内容（`feed.Title`、`entry.Title`）直接插入 HTML 标签之间，**没有任何 HTML 实体转义**（`&` → `&amp;`、`<` → `&lt;`、`>` → `&gt;`）。这意味着：
+
+- 如果 `entry.Title` 包含 `<script>` 之类的字符串，JSON 中会发送 `<b>Feed Title</b> - <a href="...">Article with <script> tag</a>`，Telegram 的 HTML 解析器会按**安全白名单**解析——只允许 Telegram 支持的标签（`<b>`, `<i>`, `<a>`, `<code>`, `<pre>` 等），其他标签被移除
+- 不存在 MarkdownV2 的 18 个特殊字符转义问题，因为压根没用 Markdown
+- 但存在**HTML 注入风险**：恶意 RSS feed 可以通过文章标题包含 Telegram 允许的 HTML 标签，实现"标题加粗"、"插入链接"等效果——不过这在 Telegram 的安全白名单范围内，且仅影响显示效果，不影响账号安全
+
+**第 3 层：`ParseMode` 的 JSON omitempty 行为**——`telegrambot/client.go:162-170`：
+```go
+type MessageRequest struct {
+    ...
+    ParseMode string `json:"parse_mode,omitempty"`
+    ...
+}
+```
+
+如果未来有人重构时**误将 `ParseMode: HTMLFormatting` 一行删除**，Go string 零值 `""` 会触发 `omitempty`，JSON 中 `"parse_mode"` 字段被完全省略。此时 Telegram API 的回退行为是：
+
+| `ParseMode` 赋值 | JSON 输出 | Telegram 解析方式 |
+|----------------|---------|----------------|
+| `HTMLFormatting`（当前） | `"parse_mode":"HTML"` | **HTML 模式**：`<b>` `<a>` 等标签生效 ✅ |
+| `MarkdownFormatting`（定义但未使用） | `"parse_mode":"Markdown"` | 旧版 Markdown 模式（Telegram 已弃用） |
+| `MarkdownV2Formatting`（定义但未使用） | `"parse_mode":"MarkdownV2"` | 新版 Markdown，需转义 18 个特殊字符 |
+| 删除赋值，保留字段（零值 `""`） | `"parse_mode"` 字段被省略（omitempty） | **纯文本模式**：所有标签原样显示 ❌ （`<b>` 不生效，字面显示） |
+
+**结论**：
+
+1. miniflux **根本不使用 MarkdownV2**，所以不存在 "MarkdownV2 转义失败回退到 plain text" 的逻辑分支——整个代码库没有任何地方执行 Markdown 特殊字符转义。
+2. 实际使用 HTML 模式，但文本内容**未做 HTML 实体转义**，理论上存在注入 Telegram 白名单标签的风险（显示层，非安全漏洞）。
+3. 如果未来重构时误删除 `ParseMode: HTMLFormatting`，`omitempty` 会导致字段被省略，Telegram 回退到纯文本模式，所有格式标签会被原样显示（`"<b>Feed Title</b>"` 而非加粗文字），这是一个容易忽略的退化点。
 
 **关键特性**：
 - 逐条发送，某条失败后 `slog.Error` 但**继续发送下一条**（不 return）——与 Discord 不同
@@ -1263,17 +1417,23 @@ feedScheduler (time.Tick)
 
 3. **无持久化重试**：所有通知采用 Fire-and-Forget 异步模式，失败仅记录日志，无队列、无重试、无死信处理。任何通知发送失败（网络错误、第三方服务不可用等）都会导致该条通知永久丢失。
 
-4. **Graceful Shutdown 时通知 goroutine 既不被 kill 也不被等待**：通知 goroutine 在进程终止时经历"孤儿→被操作系统强制终止"的路径。对正在发送中的 HTTP 请求，副作用取决于请求进度阶段——最严重的不是"通知丢失"（在 Fire-and-Forget 设计下属于预期行为），而是**静默成功**：请求体已完整到达服务端、通知已生效，但 miniflux 侧无任何记录。对于有状态通知（书签创建），可能导致用户重复操作。
+4. **Worker 池从 API 设计上就没有提供等待 in-flight 通知的能力**：`Pool` 结构体的 `queue` 和 `wg` 均为私有字段，对外只暴露 `Push`、`Shutdown`、`NewPool` 三个方法。没有 `Drain()` 方法、没有第二个 WaitGroup 追踪通知 goroutine、没有 context 传递路径。调用方 `startDaemon` 在 `pool.Shutdown()` 返回后立即输出 "Process gracefully stopped" 并退出，完全没有给 in-flight 通知 goroutine 预留缓冲时间。Graceful Shutdown 的"优雅"只覆盖了 worker 本身，不覆盖通知。
 
-5. **Webhook 签名在重定向中始终被转发，即使跨域**：基于 Go 标准库 `net/http/client.go` 的 `makeHeadersCopier` 源码追踪，`X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` 不在 `sensitive` 列表（`Authorization`/`Cookie` 等）中，也不在 `body` 列表（`Content-Type` 等）中，因此在任何重定向场景下都会被复制到新请求。301/302/303 重定向时 POST→GET 丢弃请求体，但签名 header 仍被转发，导致签名与空请求体不匹配；307/308 重定向时因 `GetBody` 未设置（`http.NewRequest` 不自动设置），实际上**不会跟随重定向**，直接返回 307/308 响应。跨域重定向存在签名 header 泄露风险。
+5. **Graceful Shutdown 时通知 goroutine 既不被 kill 也不被等待**：通知 goroutine 在进程终止时经历"孤儿→被操作系统强制终止"的路径。对正在发送中的 HTTP 请求，副作用取决于请求进度阶段——最严重的不是"通知丢失"（在 Fire-and-Forget 设计下属于预期行为），而是**静默成功**：请求体已完整到达服务端、通知已生效，但 miniflux 侧无任何记录。对于有状态通知（书签创建），可能导致用户重复操作。
 
-6. **Webhook 签名依赖 JSON 结构体字段顺序**：HMAC-SHA256 签名头键名为 `X-Miniflux-Signature`（HTTP/2 下为 `x-miniflux-signature`），使用 Go 标准库小写十六进制编码。签名计算基于 `json.Marshal(payload)` 的完整原始字节输出，Go 的结构体字段声明顺序直接决定签名值，任何字段顺序调整、struct tag 改名、`omitempty` 触发都会导致签名变化。接收方必须对原始请求体字节计算签名。
+6. **Webhook 签名在重定向中始终被转发，即使跨域**：基于 Go 标准库 `net/http/client.go` 的 `makeHeadersCopier` 源码追踪，`X-Miniflux-Signature` 和 `X-Miniflux-Event-Type` 不在 `sensitive` 列表（`Authorization`/`Cookie` 等）中，也不在 `body` 列表（`Content-Type` 等）中，因此在任何重定向场景下都会被复制到新请求。301/302/303 重定向时 POST→GET 丢弃请求体，但签名 header 仍被转发，导致签名与空请求体不匹配；307/308 重定向时因 `GetBody` 未设置（`http.NewRequest` 不自动设置），实际上**不会跟随重定向**，直接返回 307/308 响应。跨域重定向存在签名 header 泄露风险。
 
-7. **Pushover 字段 fall-through 从数据库到 API 逐层缺失**：`sound`、`timestamp`、`callback`、`retry`、`expire`、`html`、`monospace`、`attachment` 八个 Pushover API 字段从数据库列→模型字段→表单→调用→客户端→消息构建→序列化每一层都不存在，不是"有字段但为空"，而是**完全不存在**。`sound` 缺失时 Pushover 使用用户设备默认声音；`URLTitle` 存在于结构体但未赋值，空字符串仍被序列化发送；最严重的功能性缺陷是 **priority=2（紧急）时缺失必需的 `retry`/`expire` 字段，导致 Pushover API 必然返回错误**，紧急优先级实际上完全不可用。
+7. **Webhook 签名依赖 JSON 结构体字段顺序**：HMAC-SHA256 签名头键名为 `X-Miniflux-Signature`（HTTP/2 下为 `x-miniflux-signature`），使用 Go 标准库小写十六进制编码。签名计算基于 `json.Marshal(payload)` 的完整原始字节输出，Go 的结构体字段声明顺序直接决定签名值，任何字段顺序调整、struct tag 改名、`omitempty` 触发都会导致签名变化。接收方必须对原始请求体字节计算签名。
 
-8. **三个高频 Provider 回退策略差异显著**：
-   - **Discord**：零校验，空/非法 URL 直接在 HTTP 请求阶段失败，失败后停止后续 entry 发送
-   - **Telegram**：无前置校验，空 Token/ChatID 由 Telegram API 返回错误，失败后继续发送下一条 entry；客户端未设置 `BlockPrivateNetworks`（风险极低）
-   - **Pushover**：唯一具备前置空凭证校验和参数边界钳制（priority [-2, 2]），空 Prefix 回退官方 API，空 Device 回退全部设备，失败后停止后续 entry 发送；但 priority=2 是功能性死路
+8. **Discord embed_color 完全不可自定义，且零值会退化为黑色**：从数据库→模型→表单→客户端→消息构建全链路均无用户可配置入口，硬编码为十进制 `5793266` = `#5865F2`（Discord 品牌蓝）。`discordEmbed.Color` 字段无 `omitempty`，如果重构时漏赋值（Go int 零值 0），JSON 会输出 `"color":0`，Discord 显示纯黑色而非服务端默认色，这是一个容易忽略的退化点。
 
-9. **可观测性薄弱**：缺乏通知发送成功率、延迟等指标，也无告警机制。
+9. **Telegram 根本不使用 MarkdownV2，所以不存在转义失败回退的问题**：代码中定义了 `MarkdownFormatting`/`MarkdownV2Formatting`/`HTMLFormatting` 三个常量，但仅 `HTMLFormatting` 被实际赋值使用，整个代码库没有任何 Markdown 特殊字符转义逻辑。文本内容（feed.Title、entry.Title）直接插入 HTML 标签之间且**未做 HTML 实体转义**，存在 Telegram 白名单标签注入风险（仅显示层）。若未来重构时误删 `ParseMode: HTMLFormatting`，`omitempty` 会触发字段省略，Telegram 回退到纯文本模式，格式标签原样显示。
+
+10. **Pushover 字段 fall-through 从数据库到 API 逐层缺失**：`sound`、`timestamp`、`callback`、`retry`、`expire`、`html`、`monospace`、`attachment` 八个 Pushover API 字段从数据库列→模型字段→表单→调用→客户端→消息构建→序列化每一层都不存在，不是"有字段但为空"，而是**完全不存在**。`sound` 缺失时 Pushover 使用用户设备默认声音；`URLTitle` 存在于结构体但未赋值，空字符串仍被序列化发送；最严重的功能性缺陷是 **priority=2（紧急）时缺失必需的 `retry`/`expire` 字段，导致 Pushover API 必然返回错误**，紧急优先级实际上完全不可用。
+
+11. **三个高频 Provider 回退策略差异显著**：
+    - **Discord**：零校验，空/非法 URL 直接在 HTTP 请求阶段失败，失败后停止后续 entry 发送
+    - **Telegram**：无前置校验，空 Token/ChatID 由 Telegram API 返回错误，失败后继续发送下一条 entry；客户端未设置 `BlockPrivateNetworks`（风险极低）
+    - **Pushover**：唯一具备前置空凭证校验和参数边界钳制（priority [-2, 2]），空 Prefix 回退官方 API，空 Device 回退全部设备，失败后停止后续 entry 发送；但 priority=2 是功能性死路
+
+12. **可观测性薄弱**：缺乏通知发送成功率、延迟等指标，也无告警机制。
