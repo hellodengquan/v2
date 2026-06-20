@@ -515,6 +515,88 @@ Miniflux 的 `KeyboardHandler` 是一个**极简实现**，只支持"单键"和"
 
 **结论**：在当前架构下，修饰键顺序归一化是一个"不存在的问题"。如果未来要扩展支持 Ctrl/Alt chord，首要任务不是写冲突检测，而是先实现修饰键的提取 + 字典序归一化序列化函数。
 
+### 9.6 sort.Strings 归一化：macOS Cmd 与 Linux Meta 不会被归到同一桶
+
+#### 9.6.1 代码事实：sort.Strings 与修饰键完全无关
+
+全代码库中 `sort.Strings` 只出现一次，在 `internal/reader/opml/serializer.go:46`：
+
+```go
+groupedSubs := groupSubscriptionsByFeed(subscriptions)
+categories := make([]string, 0, len(groupedSubs))
+for k := range groupedSubs {
+    categories = append(categories, k)
+}
+sort.Strings(categories)  // 对 RSS 分类名称按字典序排序
+```
+
+这是**OPML 导出时对分类名称排序**，与键盘快捷键、修饰键归一化毫无关系。代码中不存在任何 `sort.Strings(modifiers)` 或类似的修饰键排序逻辑。
+
+#### 9.6.2 Cmd / Meta 的检测方式
+
+`keyboard_handler.js:54` 中的修饰键检测：
+```javascript
+static isModifierKeyDown(event) {
+    return event.getModifierState("Control") || event.getModifierState("Alt") || event.getModifierState("Meta");
+}
+```
+
+W3C DOM `getModifierState("Meta")` 的浏览器实现：
+- **macOS Safari / Chrome**：`"Meta"` 对应 ⌘ Command 键（物理键 Cmd）
+- **Linux GNOME / KDE**：`"Meta"` 对应 Win 键 / Super 键（物理键通常是 Windows Logo）
+- **Windows**：`"Meta"` 通常不被使用，Windows 键映射到 OS 层面
+
+浏览器已经在 DOM 层将"系统主键"统一命名为 `"Meta"`，这是**浏览器内核的归一化**，与 Miniflux 代码无关。
+
+#### 9.6.3 假设分析：如果真的要 sort.Strings 归一化，会有什么问题？
+
+假设未来实现修饰键支持，提取逻辑为：
+```javascript
+// 伪代码
+const modifiers = [];
+if (event.getModifierState("Control")) modifiers.push("Control");
+if (event.getModifierState("Meta"))    modifiers.push("Meta");   // macOS Cmd = Linux Meta
+if (event.getModifierState("Alt"))     modifiers.push("Alt");
+modifiers.sort();  // 即 JS 中的 Array.sort()，对应 Go 的 sort.Strings
+```
+
+**"归到同一桶"的真实含义**：
+- macOS 上按 Cmd → modifiers 为 `["Meta"]`
+- Linux 上按 Super/Win → modifiers 为 `["Meta"]`
+- 两者 `sort()` 后结果相同 → **归到同一桶**
+
+但这是浏览器 `getModifierState("Meta")` 统一命名的结果，不是 `sort.Strings` 的功劳。`sort.Strings` 只解决顺序问题（`["Meta","Control"]` vs `["Control","Meta"]`），不解决命名问题。
+
+**真正的系统差异问题不在排序，而在按键语义**：
+
+| 系统 | 物理键 | `getModifierState()` 返回 | 传统应用语义 |
+|------|--------|--------------------------|------------|
+| macOS | ⌘ Cmd | `"Meta"` | 主命令键（等效于 Windows Ctrl） |
+| macOS | ⌃ Ctrl | `"Control"` | 次要修饰键（终端 Emacs 风格） |
+| Linux | Ctrl | `"Control"` | 主命令键 |
+| Linux | Super/Win | `"Meta"` | 窗口管理 / 次要修饰键 |
+| Windows | Ctrl | `"Control"` | 主命令键 |
+| Windows | Win | `"Meta"` / 不触发 | 系统级快捷键 |
+
+如果用户在 macOS 上设置快捷键 `Ctrl+K`，期望的是 ⌃+K；但同样的配置在 Linux 上 Ctrl+K 是"主命令键+K"，语义完全不同。**`sort.Strings` 归一化解决不了这个语义跨平台差异问题**——需要的是额外的"主命令键"抽象层（如 VS Code 的 `Ctrl/Cmd` 统一写法）。
+
+#### 9.6.4 另一个实际场景：app.js 中的 metaKey 独立使用
+
+`app.js:541` 中导航链接点击处理：
+```javascript
+if (linkElement && !event.ctrlKey && !event.shiftKey && !event.metaKey) {
+    event.preventDefault();  // 无修饰键时使用 SPA 内部跳转
+    window.location.href = linkElement.getAttribute("href");
+}
+```
+
+这里 `ctrlKey` 和 `metaKey` **分开检查**，不做归一化。效果是：
+- 按 Ctrl+点击 → 不拦截，浏览器在新标签页打开（默认行为）
+- 按 Cmd+点击（macOS）→ 同样不拦截，浏览器新标签页打开
+- 按 Super+点击（Linux）→ 同样不拦截
+
+这个场景下 Cmd 和 Meta 被**故意当成等价的"在新标签页打开"修饰符**，但实现方式是分别列出 `ctrlKey` 和 `metaKey` 两个属性，不是通过排序归一化到同一桶。
+
 ---
 
 ## 十、keymap JSONB 字段：不存在，偏好全部存为扁平列
@@ -779,6 +861,96 @@ autovacuum_vacuum_cost_limit = -1  # 使用系统全局限制
 ```
 
 **结论**：VACUUM ANALYZE 触发频率**完全没有暴露给 Miniflux 运维侧配置**，运维必须通过 PostgreSQL 原生参数进行管理。这符合"数据库职责归数据库"的设计哲学——应用层只管业务数据清理，DBMS 的内部维护由 DBA 负责。
+
+### 10.8 autovacuum_naptime：SIGHUP 热重载，无需重启 PostgreSQL
+
+#### 10.8.1 代码事实：Miniflux 完全不涉及此参数
+
+全代码库搜索 `autovacuum_naptime`、`naptime`、`SIGHUP`、`pg_reload_conf`、`pg_reload_config` 的结果：
+- **零个匹配**。Miniflux 代码中没有任何 PostgreSQL 参数管理逻辑，不调用 `SELECT pg_reload_conf()`，也不向 postmaster 发信号。
+
+这是 PostgreSQL 内核层面的运维问题，以下分析基于 PostgreSQL 官方文档和通用运维经验，不涉及 Miniflux 代码。
+
+#### 10.8.2 PostgreSQL 参数的三类上下文
+
+PostgreSQL 的所有配置参数按修改方式分为三类（可通过 `SELECT name, context FROM pg_settings` 查看）：
+
+| context | 修改方式 | 是否需要重启 | 示例参数 |
+|---------|---------|------------|---------|
+| `internal` | 编译时确定，不可改 | — | `server_version` |
+| `postmaster` | 修改配置文件后需重启 postmaster | **是** | `shared_buffers`、`port`、`max_connections` |
+| `sighup` | 修改配置文件后发 SIGHUP 即可 | **否** | `autovacuum_naptime`、`log_*`、`work_mem` |
+| `backend` / `user` / `superuser` | 会话级，`SET` 命令即时生效 | 否 | `search_path`、`statement_timeout` |
+
+`autovacuum_naptime` 的 context 是 **`sighup`**，因此**修改后不需要重启 PostgreSQL 进程**。
+
+#### 10.8.3 三种热重载方式
+
+运维侧修改 `postgresql.conf` 中的 `autovacuum_naptime = 2min`（默认 1min）后，可通过以下任一方式生效：
+
+1. **shell 发信号**：
+   ```bash
+   kill -HUP <postgres_pid>
+   # 或
+   pg_ctl reload -D /path/to/data
+   ```
+
+2. **SQL 函数调用**：
+   ```sql
+   SELECT pg_reload_conf();  -- 需要 superuser 权限
+   ```
+
+3. **systemd 服务管理**：
+   ```bash
+   systemctl reload postgresql
+   # 或
+   service postgresql reload
+   ```
+
+验证是否生效：
+```sql
+SELECT name, setting, pending_restart
+FROM pg_settings
+WHERE name = 'autovacuum_naptime';
+-- pending_restart 为 false 表示已生效
+```
+
+#### 10.8.4 可能误以为需要重启的原因
+
+容易混淆的是 PostgreSQL 的**共享内存参数**（如 `shared_buffers`、`max_connections`）确实需要重启，因为它们影响 postmaster 启动时分配的共享内存段大小。但 `autovacuum_naptime` 只是 autovacuum launcher 进程的**轮询间隔**，不涉及共享内存布局，所以可以热重载。
+
+#### 10.8.5 autovacuum_naptime 的实际影响范围
+
+`autovacuum_naptime` 控制 autovacuum launcher 多久醒来检查一次哪些表需要清理（默认 1 分钟）。与 Miniflux 相关的实际影响：
+
+| 参数 | 默认值 | Miniflux 相关场景 |
+|------|--------|-----------------|
+| `autovacuum_naptime` | 1min | 控制 `entries`、`entry_tombstones`、`web_sessions` 表死元组被清理的检查频率 |
+| `autovacuum_vacuum_threshold` | 50 | 单表死元组达到 50 条才触发 VACUUM（与 scale_factor 叠加） |
+| `autovacuum_vacuum_scale_factor` | 0.2 | 表大小的 20% 附加阈值 |
+| `autovacuum_vacuum_cost_delay` | 2ms | 每次 I/O 后的休眠时间，控制对查询性能的影响 |
+
+Miniflux 的 `CLEANUP_FREQUENCY_HOURS`（默认 24h）产生批量删除后，autovacuum 会在下一次 naptime 周期内感知到死元组并开始清理。如果 naptime 设为 10min，最坏情况下需要等 10min 才开始回收空间。
+
+#### 10.8.6 与 Miniflux 的边界关系
+
+```
+Miniflux 应用层                          PostgreSQL 内核
+───────────────                         ──────────────
+CLEANUP_ARCHIVE_READ_DAYS = 60    ──┐
+CLEANUP_ARCHIVE_UNREAD_DAYS = 180  ──┼─►  DELETE 产生死元组
+CLEANUP_FREQUENCY_HOURS = 24       ──┘
+                                       │
+                                       ▼
+                                  autovacuum 检测死元组
+                                  (由 autovacuum_naptime 控制检查频率)
+                                       │
+                                       ▼
+                                  VACUUM 回收空间 + 更新统计信息
+                                  (无需重启 PostgreSQL，SIGHUP 可热调)
+```
+
+**结论**：`autovacuum_naptime` 调整**不需要重启 PostgreSQL**，通过 SIGHUP 或 `pg_reload_conf()` 即可热重载。此参数完全在 PostgreSQL 运维层面管理，Miniflux 应用层不感知也不参与。
 
 ---
 
@@ -1110,3 +1282,98 @@ CREATE INDEX entry_tombstones_deleted_at_idx
 | 用 JSONB 数组存墓碑 | 比独立表更差：无法主键去重、单行膨胀、时间清理低效 |
 
 **设计洞察**：Miniflux 在 entry_tombstones 上选择独立表而非 JSONB 数组是正确的架构决策（有主键去重、有级联删除、有时间索引）。但**遗漏了定期按时间清理的代码**——这是一个真实的、虽然缓慢的存储泄漏。
+
+### 11.9 max_tombstones=50：不存在此配置，无 LRU / FIFO 淘汰算法
+
+#### 11.9.1 代码事实：全代码库无 max_tombstones、无 LRU、无 FIFO
+
+对全代码库的搜索结果：
+
+| 关键词 | 匹配数 | 匹配位置 |
+|--------|--------|---------|
+| `max_tombstone` / `MAX_TOMBSTONE` | 0 | 无 |
+| `tombstone.*limit` / `limit.*tombstone` | 0 | 无 |
+| `LRU` / `lru` | 0 | 无 |
+| `FIFO` / `fifo` | 0 | 无 |
+| `evict` / `eviction` | 0 | 无 |
+| `least.*recent` / `first.*in` | 0 | 无 |
+| 数字 `50` + tombstone 同文件 | 0 | 无 |
+
+**`max_tombstones=50` 在 Miniflux 代码中完全不存在。** 没有这个常量、没有这个配置项、也没有任何基于这个阈值的清理逻辑。
+
+#### 11.9.2 实际情况：entry_tombstones 无上限、无淘汰、无清理
+
+如 §11.8 已分析，`entry_tombstones` 表的写入发生在两处：
+1. `ArchiveEntries()`（`storage/entry.go:362-404`）：定时归档旧条目时批量 INSERT
+2. `FlushHistory()`（`storage/entry.go:491-501`）：用户手动清空历史时批量 INSERT
+
+两处写入都使用 `ON CONFLICT (feed_id, hash) DO NOTHING` 幂等插入。**没有任何代码在写入前检查表大小，也没有任何代码在写入后触发清理。**
+
+实际增长行为：
+```
+时间线：
+T0: 表空
+T1: 第一次归档 → 插入 N1 行 (N1 ≤ CLEANUP_ARCHIVE_BATCH_SIZE, 默认 10000)
+T2: 第二次归档 → 插入 N2 行 (可能重复，ON CONFLICT 跳过)
+T3: 第三次归档 → 插入 N3 行
+...
+→ 行数无限单调增长，无回落
+唯一缩小路径：用户删除 feed → ON DELETE CASCADE 级联删除该 feed 的所有墓碑
+```
+
+#### 11.9.3 如果真的要实现 max_tombstones=50，LRU vs FIFO 该怎么选？
+
+作为架构分析，假设存在一个 `max_tombstones_per_feed = 50` 的配置需求，比较两种淘汰策略：
+
+| 维度 | FIFO（先进先出） | LRU（最近最少使用） |
+|------|----------------|------------------|
+| 实现复杂度 | 低。只需 `deleted_at` 时间戳，删除最旧的 N 行 | 高。每次检查命中时需要更新"最后使用时间" |
+| 额外存储 | 不需要额外列（已有 `deleted_at`） | 需要额外列 `last_accessed_at` 或维护独立访问计数 |
+| PostgreSQL 实现 | `DELETE FROM entry_tombstones WHERE feed_id=$1 ORDER BY deleted_at ASC LIMIT (count - 50)` | 每次 `IsNewEntry()` 检查命中时需 `UPDATE entry_tombstones SET last_accessed_at=now() WHERE ...`，淘汰时 `ORDER BY last_accessed_at ASC` |
+| 写入开销 | 清理时一次批量 DELETE | 每次存在性检查都产生一次 UPDATE（热路径） |
+| 语义合理性 | RSS 条目天然按时间线性产生，最早的最可能已失效 | RSS 条目不会被"反复使用"，墓碑只用于一次性去重，LRU 的"最近使用"语义没有意义 |
+
+**对于 RSS 条目墓碑场景，FIFO 显然优于 LRU**：
+- RSS 条目是时间敏感的：一篇 3 年前被删除的文章，RSS 源几乎不可能再推送同样内容
+- 墓碑的唯一用途是"防止被重新 ingestion"，一旦条目超过源站历史保留期（通常 30-180 天），墓碑就失去价值
+- 墓碑不存在"被使用"的概念——只在插入新条目时做一次存在性检查，检查命中与否都不需要更新墓碑状态
+- LRU 的 `last_accessed_at` 更新会放大 `IsNewEntry()` 这个热路径的写入开销
+
+#### 11.9.4 为什么 Miniflux 不需要 max_tombstones
+
+从实际数据量来看：
+
+```
+单用户场景估算：
+- 100 个订阅源 × 每源每天 5 篇 × 365 天 = 182,500 篇/年
+- 约 80% 最终被归档产生墓碑 → ~146,000 条墓碑/年
+- 每条约 40 字节 (bigint 8 + text hash 24 + timestamp 8)
+- 年增长约 5.8 MB，索引另算约同量级
+- 10 年增长约 58 MB，对现代 PostgreSQL 实例完全可忽略
+```
+
+对比：一张 `entries` 表存活跃条目（默认已读 60 天 + 未读 180 天）的体量通常是墓碑表的数倍到数十倍。**墓碑表的存储开销在实际使用中可以忽略不计**，这可能是 Miniflux 没有实现清理和淘汰的根本原因——没有足够的收益值得投入工程成本。
+
+#### 11.9.5 三类"有上限清理"在代码库中的对比
+
+虽然没有 max_tombstones，但 Miniflux 确实存在其他"有上限批量处理"的模式：
+
+| 机制 | 上限常量 | 清理策略 | 位置 |
+|------|---------|---------|------|
+| 条目归档批量 | `CLEANUP_ARCHIVE_BATCH_SIZE` (默认 10000) | 按时间窗口，每次最多处理 N 条，不是淘汰而是分批处理 | `config/options.go:125-132` |
+| Feed 刷新批量 | `BATCH_SIZE` (默认 100) | 每次从待刷新队列取 N 条 | `config/options.go:107-114` |
+| 连接池上限 | `DATABASE_MAX_CONNS` (默认 20) | Go `database/sql` 内置连接池管理（非 LRU/FIFO，空闲连接按时间复用） | `config/options.go:169-176` |
+| **entry_tombstones** | **不存在** | **无** | — |
+
+这三类上限都是"批处理大小"或"资源池容量"，与墓碑表的"总量淘汰"问题不属于同一类。
+
+#### 11.9.6 总结
+
+| 问题 | 代码事实 |
+|------|---------|
+| `max_tombstones=50` | **不存在**。无此常量、无此配置、无此逻辑 |
+| LRU 淘汰算法 | 不存在。代码中零 LRU 相关引用 |
+| FIFO 淘汰算法 | 不存在。代码中零 FIFO 相关引用 |
+| entry_tombstones 实际行为 | 无限增长，仅依赖删除 feed 的 `ON DELETE CASCADE` 间接清理 |
+| 如果要实现淘汰 | FIFO 比 LRU 更适合 RSS 场景（墓碑无"最近使用"语义、实现简单、无热路径写入） |
+| 为什么没实现 | 数据量太小（年增长约 6 MB/用户），工程投入无收益 |
