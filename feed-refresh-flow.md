@@ -1165,3 +1165,689 @@ func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
 | 已删除 entry (tombstone) | 静默跳过 | `WHERE NOT EXISTS` 原子检查 |
 | 条目发布日期 | 永不更新 | 防止排序混乱 |
 | 条目阅读状态 | 永不更新 | 保留用户状态 |
+
+---
+
+## 十、User-Agent 与代理设置的完整抓取链路注入
+
+### 10.1 代码注入路径总览
+
+User-Agent 和代理设置的注入发生在抓取链路的**请求构建阶段**，存在**两条独立的调用路径**：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  路径 1: RefreshFeed（周期性自动刷新 / 手动刷新）                   │
+│  handler.go:223-233 - RefreshFeed 函数中构建请求                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  路径 2: CreateFeed（创建新 feed 时预抓取）                         │
+│  handler.go:115-125 - CreateFeed 函数中构建请求                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+                    ┌──────────────────────────┐
+                    │  fetcher.NewRequestBuilder()
+                    │  request_builder.go:49
+                    └─────────────┬────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+   WithUserAgent            WithProxy*系列          其他配置（超时、TLS等）
+   (User-Agent 头)         (三级代理选择)
+```
+
+### 10.2 两条注入路径的代码细节
+
+#### 路径 1: RefreshFeed（自动/手动刷新）
+
+**代码位置**: `handler.go:223-233`
+
+```go
+// handler.go:223-233 — RefreshFeed 函数
+requestBuilder := fetcher.NewRequestBuilder().
+    WithUsernameAndPassword(originalFeed.Username, originalFeed.Password).
+    WithUserAgent(originalFeed.UserAgent, config.Opts.HTTPClientUserAgent()).   // ← UA 注入
+    WithCookie(originalFeed.Cookie).
+    WithTimeout(config.Opts.HTTPClientTimeout()).
+    WithProxyRotator(proxyrotator.ProxyRotatorInstance).                           // ← 代理轮换池
+    WithCustomFeedProxyURL(originalFeed.ProxyURL).                                 // ← feed 级代理
+    WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL()).               // ← 全局级代理
+    UseCustomApplicationProxyURL(originalFeed.FetchViaProxy).                       // ← 启用全局代理标志
+    IgnoreTLSErrors(originalFeed.AllowSelfSignedCertificates).
+    DisableHTTP2(originalFeed.DisableHTTP2)
+```
+
+#### 路径 2: CreateFeed（创建时预抓取）
+
+**代码位置**: `handler.go:115-125`
+
+```go
+// handler.go:115-125 — CreateFeed 函数
+requestBuilder := fetcher.NewRequestBuilder().
+    WithUsernameAndPassword(feedCreationRequest.Username, feedCreationRequest.Password).
+    WithUserAgent(feedCreationRequest.UserAgent, config.Opts.HTTPClientUserAgent()). // ← UA 注入
+    WithCookie(feedCreationRequest.Cookie).
+    WithTimeout(config.Opts.HTTPClientTimeout()).
+    WithProxyRotator(proxyrotator.ProxyRotatorInstance).                           // ← 代理轮换池
+    WithCustomFeedProxyURL(feedCreationRequest.ProxyURL).                           // ← feed 级代理
+    WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL()).               // ← 全局级代理
+    UseCustomApplicationProxyURL(feedCreationRequest.FetchViaProxy).               // ← 启用全局代理标志
+    IgnoreTLSErrors(feedCreationRequest.AllowSelfSignedCertificates).
+    DisableHTTP2(feedCreationRequest.DisableHTTP2)
+```
+
+**注意**: 两条路径的**参数来源不同但注入逻辑完全一致**：
+- RefreshFeed 从 `originalFeed` 对象读取已保存的配置
+- CreateFeed 从 `feedCreationRequest` 读取用户提交的配置
+
+### 10.3 User-Agent 的注入逻辑
+
+**代码位置**: `request_builder.go:75-82`
+
+```go
+func (r *RequestBuilder) WithUserAgent(userAgent string, defaultUserAgent string) *RequestBuilder {
+    if userAgent != "" {
+        r.headers.Set("User-Agent", userAgent)      // feed 级自定义 UA
+    } else {
+        r.headers.Set("User-Agent", defaultUserAgent) // 全局默认 UA
+    }
+    return r
+}
+```
+
+**覆盖优先级**: `feed.UserAgent`（非空） > `config.Opts.HTTPClientUserAgent()`（全局默认）
+
+**全局默认 UA 的构造**: `internal/config/options.go` 中定义为 `"Miniflux/" + version.Version`
+
+### 10.4 代理设置的三级选择逻辑
+
+**代码位置**: `request_builder.go:143-157` — `ExecuteRequest` 方法中实时选择
+
+```go
+func (r *RequestBuilder) ExecuteRequest(requestURL string) (*http.Response, error) {
+    var clientProxyURL *url.URL
+
+    switch {
+    // 优先级 1: Feed 级自定义代理（最高优先级）
+    case r.feedProxyURL != "":
+        clientProxyURL, err = url.Parse(r.feedProxyURL)
+        if err != nil {
+            return nil, fmt.Errorf(`fetcher: invalid feed proxy URL %q: %w`, r.feedProxyURL, err)
+        }
+    // 优先级 2: 全局级应用代理（需 feed.FetchViaProxy=true 启用）
+    case r.useClientProxy && r.clientProxyURL != nil:
+        clientProxyURL = r.clientProxyURL
+    // 优先级 3: 代理轮换池（最低优先级，仅当前面都未设置时使用）
+    case r.proxyRotator != nil && r.proxyRotator.HasProxies():
+        clientProxyURL = r.proxyRotator.GetNextProxy()
+    }
+    // ...
+    if clientProxyURL != nil {
+        transport.Proxy = http.ProxyURL(clientProxyURL)  // 最终注入到 http.Transport
+    }
+}
+```
+
+#### 三级代理的设置方法
+
+| 优先级 | 类型 | 配置注入方法 | 存储字段 |
+|:---:|------|-------------|----------|
+| 1 (最高) | Feed 级代理 | `WithCustomFeedProxyURL(feed.ProxyURL)` | `feeds.proxy_url` |
+| 2 | 全局级代理 | `WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL())` + `UseCustomApplicationProxyURL(feed.FetchViaProxy)` | `HTTP_CLIENT_PROXY` 环境变量 + `feeds.fetch_via_proxy` |
+| 3 (最低) | 代理轮换池 | `WithProxyRotator(proxyrotator.ProxyRotatorInstance)` | `HTTP_CLIENT_PROXIES` 环境变量（逗号分隔） |
+
+#### 代理轮换池的实现
+
+**代码位置**: `internal/proxyrotator/proxyrotator.go`
+
+```go
+type ProxyRotator struct {
+    proxies      []*url.URL
+    currentIndex int
+    mutex        sync.Mutex  // 线程安全，跨 Worker 并发安全
+}
+
+func (pr *ProxyRotator) GetNextProxy() *url.URL {
+    pr.mutex.Lock()
+    proxy := pr.proxies[pr.currentIndex]
+    pr.currentIndex = (pr.currentIndex + 1) % len(pr.proxies)  // 轮询算法
+    pr.mutex.Unlock()
+    return proxy
+}
+```
+
+- **初始化时机**: 程序启动时在 `main.go` 中初始化 `ProxyRotatorInstance` 单例
+- **线程安全**: 通过 `sync.Mutex` 保护，多个 Worker 并发调用时不会冲突
+- **轮询算法**: 简单的 `(currentIndex + 1) % len(proxies)`，平均分配请求
+
+### 10.5 特殊网络配置的注入
+
+除了 User-Agent 和代理，还有以下网络相关配置在同一点注入：
+
+```go
+requestBuilder.
+    WithUsernameAndPassword(...)   // HTTP Basic Auth → Authorization 头 (handler.go:92-96)
+    WithCookie(...)                // Cookie → Cookie 头 (handler.go:84-89)
+    IgnoreTLSErrors(...)           // TLS 证书跳过 → Transport.TLSClientConfig.InsecureSkipVerify (handler.go:213-224)
+    DisableHTTP2(...)              // HTTP/2 禁用 → Transport.ForceAttemptHTTP2=false + TLSNextProto={} (handler.go:226-232)
+    WithTimeout(...)               // 请求超时 → http.Client.Timeout (handler.go:118-121)
+```
+
+### 10.6 代理注入与私有网络检查的协作
+
+**代码位置**: `request_builder.go:199-211`
+
+当同时启用代理和私有网络拦截时，Miniflux 有一个特殊的旁路设计：
+
+```go
+transport.DialContext = directDialer.DialContext  // 直连的 Dialer 有私有网络检查
+
+if !allowPrivateNetworks && proxyDialAddress != "" {
+    // 对代理服务器本身的连接绕过私有网络检查
+    // 因为代理服务器可能在内网，但我们信任它作为跳点
+    transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+        if normalizeDialAddress(addr) == proxyDialAddress {
+            return proxyDialer.DialContext(ctx, network, addr)  // 连接代理本身，无检查
+        }
+        return directDialer.DialContext(ctx, network, addr)     // 其他连接有检查
+    }
+}
+```
+
+**设计意图**: 显式配置的代理是可信跳点，允许连接到内网代理服务器，但通过代理访问的目标地址仍受保护（代理端会进行 DNS 解析）。
+
+---
+
+## 十一、HTTP 客户端重试与 Backoff 算法
+
+### 11.1 核心结论：Miniflux 没有内置 HTTP 客户端重试
+
+经过全代码库搜索，确认 **Miniflux 的 HTTP 客户端（`internal/reader/fetcher/request_builder.go`）没有任何内置的重试逻辑**。具体表现为：
+
+- 无 `retryablehttp` 等第三方重试库
+- 无自定义的 `http.RoundTripper` 重试包装
+- 无循环重试代码（`for` 循环重试）
+- 无指数退避（exponential backoff）算法
+- 无抖动（jitter）算法
+
+**请求执行是一次性的**: `request_builder.go:283` 中只有一次 `client.Do(req)` 调用，失败即返回错误。
+
+### 11.2 两级 Backoff 策略
+
+虽然没有 HTTP 传输层的重试，但 Miniflux 在**应用层**实现了两层 Backoff 机制：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  层级 1: 单 feed 级错误计数退避                             │
+│  - 触发条件: 连续刷新失败                                   │
+│  - 实现: ParsingErrorCount 递增 + 阈值过滤                  │
+│  - 效果: 错误次数 >= POLLING_PARSING_ERROR_LIMIT 时         │
+│          暂不调度（从批次中过滤）                           │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│  层级 2: 源站指令退避（Retry-After）                        │
+│  - 触发条件: 收到 429 Too Many Requests 响应                │
+│  - 实现: 解析 Retry-After 头，调整 next_check_at            │
+│  - 效果: 严格遵守源站指定的重试间隔                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 11.3 层级 1: 错误计数退避的详细参数
+
+**代码位置**: `internal/model/feed.go` + `internal/storage/batch.go`
+
+#### 参数配置
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| `POLLING_PARSING_ERROR_LIMIT` | 3 | 连续错误阈值，超过则从调度批次中过滤 |
+
+#### 退避流程
+
+```
+                        ┌─────────────────┐
+                        │  刷新 feed 失败  │
+                        └────────┬────────┘
+                                 │
+                                 ▼
+                   originalFeed.WithTranslatedErrorMessage(err)
+                   ParsingErrorCount++
+                                 │
+                                 ▼
+                        store.UpdateFeedError(feed)
+                        保存错误计数到数据库
+                                 │
+                                 ▼
+                   ┌───────────────────────────────┐
+                   │  下一轮 BatchBuilder 筛选      │
+                   │  parsing_error_count < limit?  │
+                   └──────────────┬────────────────┘
+                                  │
+                ┌─────────────────┴─────────────────┐
+                │                                   │
+                ▼                                   ▼
+        ParsingErrorCount < 3             ParsingErrorCount >= 3
+        加入下一批次（继续调度）           不加入批次（暂不调度）
+                │                                   │
+                │                                   │
+                ▼                                   ▼
+        下次 POLLING_FREQUENCY               用户手动刷新时恢复
+        后再次尝试
+```
+
+#### 错误重置条件
+
+```go
+// 任何成功刷新都会重置错误计数
+originalFeed.ResetErrorCounter()   // handler.go:364
+```
+
+重置发生在以下情况：
+- 收到 200 OK 且内容解析成功
+- 收到 304 Not Modified（内容未变更，也视为成功）
+
+### 11.4 层级 2: Retry-After 退避的详细参数
+
+**代码位置**: `internal/reader/fetcher/response_handler.go:82-96` + `handler.go:245-255`
+
+#### Retry-After 解析算法
+
+```go
+func (r *ResponseHandler) ParseRetryDelay() time.Duration {
+    retryAfterHeaderValue := r.httpResponse.Header.Get("Retry-After")
+    if retryAfterHeaderValue != "" {
+        // 分支 1: 整数秒数格式 (e.g., "120")
+        if seconds, err := strconv.Atoi(retryAfterHeaderValue); err == nil {
+            return time.Duration(seconds) * time.Second
+        }
+        // 分支 2: HTTP 日期格式 (e.g., "Fri, 31 Dec 2023 23:59:59 GMT")
+        if t, err := time.Parse(time.RFC1123, retryAfterHeaderValue); err == nil {
+            return time.Until(t).Truncate(time.Second)
+        }
+    }
+    return 0  // 无法解析则不额外退避
+}
+```
+
+#### 退避应用
+
+```go
+// handler.go:245-255
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()
+    // 将 Retry-After 的延迟作为 refreshDelay 传入
+    calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+}
+```
+
+在 `ScheduleNextCheck` 中，`refreshDelay` 会覆盖默认的调度间隔：
+
+```go
+// model/feed.go:ScheduleNextCheck
+interval = max(interval, refreshDelay)  // refreshDelay 是 Retry-After 解析出的值
+```
+
+**优先级**: `Retry-After` 退避 > 调度策略基础间隔 > 最小间隔限制
+
+### 11.5 网络错误分类与本地化处理
+
+虽然没有重试，但 Miniflux 对 HTTP 错误进行了精细分类，为不同错误类型提供不同的用户提示。错误分类发生在 `LocalizedError()` 中：
+
+**代码位置**: `response_handler.go:175-229`
+
+```go
+func (r *ResponseHandler) LocalizedError() *locale.LocalizedErrorWrapper {
+    // 第一类: 客户端/网络层错误 (clientErr != nil)
+    if r.clientErr != nil {
+        switch {
+        case isSSLError(r.clientErr):       // TLS 证书错误
+            return locale.NewLocalizedErrorWrapper(err, "error.tls_error", r.clientErr)
+        case isNetworkError(r.clientErr):   // 网络操作错误 (DNS、连接等)
+            return locale.NewLocalizedErrorWrapper(err, "error.network_operation", r.clientErr)
+        case os.IsTimeout(r.clientErr):     // 超时错误
+            return locale.NewLocalizedErrorWrapper(err, "error.network_timeout", r.clientErr)
+        case errors.Is(r.clientErr, io.EOF): // 空响应
+            return locale.NewLocalizedErrorWrapper(err, "error.http_empty_response")
+        default:                             // 其他客户端错误
+            return locale.NewLocalizedErrorWrapper(err, "error.http_client_error", r.clientErr)
+        }
+    }
+
+    // 第二类: Cloudflare 特殊检测
+    if r.isCloudflareChallenge() {
+        return locale.NewLocalizedErrorWrapper(..., "error.http_cloudflare_challenge")
+    }
+
+    // 第三类: HTTP 状态码错误
+    switch r.httpResponse.StatusCode {
+    case http.StatusUnauthorized:      // 401
+        return locale.NewLocalizedErrorWrapper(..., "error.http_not_authorized")
+    case http.StatusForbidden:         // 403
+        return locale.NewLocalizedErrorWrapper(..., "error.http_forbidden")
+    case http.StatusTooManyRequests:   // 429 — 会触发 Retry-After 退避
+        return locale.NewLocalizedErrorWrapper(..., "error.http_too_many_requests")
+    case http.StatusNotFound:          // 404
+    case http.StatusGone:              // 410
+        return locale.NewLocalizedErrorWrapper(..., "error.http_resource_not_found")
+    case http.StatusInternalServerError:  // 500
+        return locale.NewLocalizedErrorWrapper(..., "error.http_internal_server_error")
+    case http.StatusBadGateway:           // 502
+        return locale.NewLocalizedErrorWrapper(..., "error.http_bad_gateway")
+    case http.StatusServiceUnavailable:   // 503
+        return locale.NewLocalizedErrorWrapper(..., "error.http_service_unavailable")
+    case http.StatusGatewayTimeout:       // 504
+        return locale.NewLocalizedErrorWrapper(..., "error.http_gateway_timeout")
+    }
+    // ...
+}
+```
+
+### 11.6 为何没有传输层重试？
+
+从代码设计看，Miniflux 选择不做 HTTP 传输层重试的原因可能是：
+
+1. **RSS 刷新不是关键路径**: 一次刷新失败不影响整体可用性，等下一轮即可
+2. **源站脆弱**: 很多 RSS 源由小服务器或个人博客托管，重试可能加剧源站负担
+3. **避免重复条目**: 重试可能导致部分成功的请求产生副作用（虽然幂等性可以避免，但增加复杂度）
+4. **应用层退避足够**: 错误计数退避 + Retry-After 退避已能有效处理多数场景
+
+---
+
+## 十二、Entry Hash 计算与重复检测的完整代码路径
+
+### 12.1 完整链路总览
+
+Entry Hash 是 Miniflux 去重体系的核心，从计算到存储经过四个阶段：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 1: Hash 计算（Feed 解析阶段）                                 │
+│  - RSS/Atom/JSON/RDF 各自的 adapter 中计算                          │
+│  - 针对不同格式选择不同的 hash 源（GUID/ID/URL/Content 等）          │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 2: Processor 预检测（处理阶段）                               │
+│  - processor.go:95 调用 IsNewEntry()                                │
+│  - 同时检查 entries 表和 entry_tombstones 表                        │
+│  - 决定是否需要 Crawler 抓取全文（仅新条目抓取）                     │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 3: 事务内存在性检查（存储阶段）                               │
+│  - entry.go:213-224 entryExists() 函数                              │
+│  - SELECT true FROM entries WHERE feed_id=? AND hash=? LIMIT 1      │
+│  - 使用 entries_feed_id_hash_key 唯一索引                           │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  阶段 4: 原子化插入（存储阶段）                                     │
+│  - entry.go:81-146 createEntry() 函数                               │
+│  - INSERT ... WHERE NOT EXISTS (SELECT FROM entry_tombstones)       │
+│  - 利用数据库唯一约束 entries_feed_id_hash_key 防并发重复           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 阶段 1: Hash 计算的具体算法
+
+Hash 计算在各 feed 格式的 adapter 中完成，统一使用 SHA-256 十六进制编码：
+
+**代码位置**: `internal/crypto/crypto.go:26-29`
+
+```go
+func SHA256(value string) string {
+    h := sha256.Sum256([]byte(value))
+    return hex.EncodeToString(h[:])  // 64 字符十六进制字符串
+}
+```
+
+#### RSS 2.0 的 Hash 计算（最复杂）
+
+**代码位置**: `internal/reader/rss/adapter.go:116-139`
+
+```go
+seenGUIDs := make(map[string]int)  // 检测重复 GUID
+for _, item := range r.rss.Channel.Items {
+    switch {
+    case item.GUID.Data != "":
+        n := seenGUIDs[item.GUID.Data]
+        seenGUIDs[item.GUID.Data] = n + 1
+        switch {
+        case n == 0:
+            // 第一次出现此 GUID: 直接使用 GUID
+            entry.Hash = crypto.SHA256(item.GUID.Data)
+        case entry.URL != "":
+            // GUID 重复，有 URL: 使用 GUID + "|" + URL 消除歧义
+            entry.Hash = crypto.SHA256(item.GUID.Data + "|" + entry.URL)
+        default:
+            // GUID 重复，无 URL: 使用 GUID + "|" + 序号
+            entry.Hash = crypto.SHA256(item.GUID.Data + "|" + strconv.Itoa(n))
+        }
+    case entryURL != "":
+        // 无 GUID，有 URL: 使用 URL
+        entry.Hash = crypto.SHA256(entryURL)
+    default:
+        // 无 GUID 无 URL: 使用标题 + 内容
+        entry.Hash = crypto.SHA256(entry.Title + entry.Content)
+    }
+}
+```
+
+**Hash 源优先级（RSS）**: `GUID` > `GUID + URL` > `GUID + 序号` > `URL` > `Title + Content`
+
+**重复 GUID 处理的设计意图**: 有些不规范的 feed 为每个 item 使用相同的 GUID，`seenGUIDs` 计数器确保第一次出现保持原 hash 以兼容历史数据，后续出现用 URL 或序号消歧。
+
+#### Atom 1.0 的 Hash 计算
+
+**代码位置**: `internal/reader/atom/atom_10_adapter.go:149-155`
+
+```go
+for _, value := range []string{atomEntry.ID, atomEntry.Links.originalLink()} {
+    if value != "" {
+        entry.Hash = crypto.SHA256(value)
+        break
+    }
+}
+```
+
+**Hash 源优先级（Atom）**: `atom:entry/id` > `atom:entry/link`
+
+#### JSON Feed 的 Hash 计算
+
+**代码位置**: `internal/reader/json/adapter.go:175-181`
+
+```go
+for _, value := range []string{item.ID, item.URL, item.ExternalURL, item.ContentText + item.ContentHTML + item.Summary} {
+    value = strings.TrimSpace(value)
+    if value != "" {
+        entry.Hash = crypto.SHA256(value)
+        break
+    }
+}
+```
+
+**Hash 源优先级（JSON Feed）**: `id` > `url` > `external_url` > `content_text + content_html + summary`
+
+#### RDF / RSS 1.0 的 Hash 计算
+
+**代码位置**: `internal/reader/rdf/adapter.go:74-79`
+
+```go
+hashValue := itemLink
+if hashValue == "" {
+    hashValue = item.Title + item.Description
+}
+entry.Hash = crypto.SHA256(hashValue)
+```
+
+**Hash 源优先级（RDF）**: `rdf:about` (link) > `Title + Description`
+
+### 12.3 阶段 2: Processor 预检测
+
+**代码位置**: `internal/reader/processor/processor.go:95`
+
+```go
+entryIsNew := store.IsNewEntry(feed.ID, entry.Hash)
+contentExtractedSuccessfully := false
+if feed.Crawler && (entryIsNew || forceRefresh) {
+    // 仅对新条目抓取原文，避免重复抓取浪费资源
+    webpageBaseURL := ""
+    // ... 调用 crawler 抓取原文
+}
+```
+
+`IsNewEntry` 同时检查两张表（`entry.go:278-293`）：
+
+```go
+func (s *Storage) IsNewEntry(feedID int64, entryHash string) bool {
+    query := `
+        SELECT
+            EXISTS (SELECT 1 FROM entries WHERE feed_id=$1 AND hash=$2)
+            OR
+            EXISTS (SELECT 1 FROM entry_tombstones WHERE feed_id=$1 AND hash=$2)
+    `
+    var known bool
+    s.db.QueryRow(query, feedID, entryHash).Scan(&known)
+    return !known  // 两张表都不存在才算"新"
+}
+```
+
+**性能优化**: 这个预检测是对 `Crawler` 功能的重要优化——跳过已有条目的网页抓取，节省大量时间和带宽。
+
+### 12.4 阶段 3: 事务内存在性检查
+
+**代码位置**: `internal/storage/entry.go:213-224` — `entryExists`
+
+```go
+func (s *Storage) entryExists(tx *sql.Tx, entry *model.Entry) (bool, error) {
+    var result bool
+    // Note: This query uses entries_feed_id_hash_key index
+    err := tx.QueryRow(
+        `SELECT true FROM entries WHERE feed_id=$1 AND hash=$2 LIMIT 1`,
+        entry.FeedID, entry.Hash,
+    ).Scan(&result)
+    
+    if err != nil && err != sql.ErrNoRows {
+        return result, fmt.Errorf(`store: unable to check if entry exists: %v`, err)
+    }
+    return result, nil
+}
+```
+
+**数据库索引**: `entries_feed_id_hash_key` 是 `unique (feed_id, hash)` 约束自动创建的索引，查询是 O(1) 复杂度。
+
+**调用位置**: `RefreshFeedEntries` 函数中（`entry.go:325`），每个 entry 在事务内先检查再决定插入或更新。
+
+### 12.5 阶段 4: 原子化插入与双重防重
+
+实际写入时，Miniflux 使用**双重防重机制**确保并发安全：
+
+#### 第一层: 数据库唯一约束
+
+```sql
+-- migrations.go:88
+CONSTRAINT entries_feed_id_hash_key UNIQUE (feed_id, hash)
+```
+
+如果两个 Worker 同时检测到 `entryExists=false` 并尝试插入，PostgreSQL 的唯一约束会拒绝第二个插入，返回 `pq: duplicate key value violates unique constraint "entries_feed_id_hash_key"`。
+
+#### 第二层: Tombstone 原子检查
+
+**代码位置**: `entry.go:86-122` — `createEntry`
+
+```go
+func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
+    query := `
+        INSERT INTO entries (...)
+        SELECT $1, $2, ...
+        WHERE NOT EXISTS (
+            SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+        )
+        RETURNING id, status, created_at, changed_at
+    `
+    err := tx.QueryRow(query, ...).Scan(&entry.ID, ...)
+    
+    if errors.Is(err, sql.ErrNoRows) {
+        return ErrEntryTombstoned  // 被 tombstone 阻止
+    }
+    if err != nil {
+        return fmt.Errorf(...)
+    }
+    // ...
+}
+```
+
+**原子性保证**: `INSERT ... WHERE NOT EXISTS` 是一个原子 SQL 语句，在 INSERT 执行的同时检查 tombstone。如果没有这个原子检查，`ArchiveEntries` 并发删除条目时，可能发生以下竞态：
+
+```
+TOCTOU 竞态场景（如果没有原子检查）:
+  时间1: Worker A 检测 entryExists=false, 未检查 tombstone
+  时间2: ArchiveEntries 删除该 entry 并写入 tombstone
+  时间3: Worker A 插入 entry → "僵尸"条目复活
+```
+
+有了 `WHERE NOT EXISTS` 子查询，时间3的 INSERT 会被阻止，因为子查询检测到 tombstone 已存在。
+
+### 12.6 两次存在性检查的差异和必要性
+
+| 检查点 | 检查范围 | 用途 | 原子性 |
+|--------|----------|------|--------|
+| `entryExists` (事务内 SELECT) | 仅 `entries` 表 | 决定 INSERT 还是 UPDATE | 非原子（TOCTOU 窗口） |
+| `WHERE NOT EXISTS` (INSERT 子查询) | 仅 `entry_tombstones` 表 | 防止已删除条目复活 | 原子 |
+
+**为什么需要两次检查**:
+1. `entryExists` 检查用于区分**已有条目**（需要 UPDATE）和**新条目**（需要 INSERT）
+2. `WHERE NOT EXISTS` 检查专门用于防止**已删除条目**被重新插入
+3. 两者都检查 `unique (feed_id, hash)` 约束，最终由数据库保证不重复
+
+### 12.7 Hash 计算的设计权衡
+
+| 设计决策 | 优点 | 缺点 |
+|----------|------|------|
+| 使用业务标识（GUID/ID/URL）而非内容 hash | 标题/内容修正不会产生重复条目；hash 稳定 | 真正的内容更新（原 URL 下文章重写）可能漏更 |
+| SHA-256 十六进制 | 碰撞概率极低；标准算法 | 64 字符较长，占用存储空间 |
+| 对重复 GUID 用 "|" 拼接 URL/序号 | 兼容不规范 feed；保持第一个 GUID 的兼容性 | 使 hash 生成逻辑复杂 |
+| 不包含 `user_id` 在 hash 中 | 同 feed 下同一 entry 跨用户共享 hash | 每个用户下的 entry 仍需独立存储（不能跨用户共享） |
+
+### 12.8 重复检测的完整竞态分析
+
+```
+高并发场景下的重复检测时序:
+
+Worker 1                         Worker 2
+   │                                │
+   ├─ entryExists(feed_id, hash) → false
+   │                                ├─ entryExists(feed_id, hash) → false
+   │                                │
+   ├─ BEGIN TRANSACTION             ├─ BEGIN TRANSACTION
+   ├─ INSERT INTO entries ...       ├─ INSERT INTO entries ...
+   ├─ 成功 (获得唯一约束 lock)      ├─ 阻塞 (等待唯一约束 lock)
+   ├─ COMMIT                        │
+   │                                ├─ 唯一约束违反错误!
+   │                                └─ ROLLBACK + 返回错误
+                                    
+结果: 只有一个 Worker 成功插入，另一个收到重复键错误。
+      这是正常的，上层会捕获并跳过。
+
+Tombstone 并发场景:
+
+Worker A (refresh)                Worker B (archive)
+   │                                │
+   ├─ IsNewEntry → true            ├─ BEGIN TRANSACTION
+   │                                ├─ DELETE FROM entries WHERE ...
+   │                                ├─ INSERT INTO entry_tombstones ...
+   │                                ├─ COMMIT
+   ├─ BEGIN TRANSACTION             │
+   ├─ INSERT ... WHERE NOT EXISTS (SELECT FROM entry_tombstones)
+   └─ 子查询检测到 tombstone → sql.ErrNoRows → ErrEntryTombstoned
+                                    
+结果: 原子检查阻止了已删除条目的复活。
+```
