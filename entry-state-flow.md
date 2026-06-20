@@ -725,7 +725,563 @@ func (e *Entry) ShouldMarkAsReadOnView(user *User) bool {
 
 ---
 
-## 十二、总结
+## 十二、并发更新控制：乐观锁 / 悲观锁与冲突解决
+
+### 12.1 总体设计：以 PostgreSQL MVCC + 唯一约束为核心，不使用显式版本号乐观锁
+
+Miniflux **没有采用传统的"version/revision"字段 + `WHERE version = N` 的乐观锁模式**，也没有对条目状态更新做显式 `FOR UPDATE` 行锁。其并发一致性依赖以下几层机制的组合：
+
+#### 12.1.1 基础层：PostgreSQL MVCC（多版本并发控制）
+
+所有状态变更 SQL 都是单条 `UPDATE`，在 PostgreSQL 的 MVCC 下天然具有以下特性：
+
+- 两个并发事务同时 `UPDATE entries SET status='read' WHERE id=123 AND user_id=456`：后提交者不会产生冲突，只是 `RowsAffected` 可能为 0（若前者已修改）。
+- 写-写冲突不会产生"丢失更新"，但可能产生"最后写入者胜"（Last-Writer-Wins）语义。
+
+#### 12.1.2 `changed_at = now()` 的副作用
+
+所有状态更新 SQL 都包含 `changed_at=now()`，这意味着：
+
+- **changed_at 不是乐观锁条件**：SQL 中**没有** `WHERE changed_at = $old_changed_at` 这样的比较子句，因此它不参与冲突检测。
+- changed_at 仅作为"状态变更时间戳"用于增量同步过滤（API 的 `changed_after` / `changed_before` 参数，见 `api/entry_handlers.go:589-594`）。
+
+```go
+// api/entry_handlers.go:589-594
+if beforeChangedTimestamp := request.QueryInt64Param(r, "changed_before", 0); beforeChangedTimestamp > 0 {
+    builder = builder.BeforeChangedDate(time.Unix(beforeChangedTimestamp, 0))
+}
+if afterChangedTimestamp := request.QueryInt64Param(r, "changed_after", 0); afterChangedTimestamp > 0 {
+    builder = builder.AfterChangedDate(time.Unix(afterChangedTimestamp, 0))
+}
+```
+
+### 12.2 唯一约束作为幂等性保障：`entries_feed_id_hash_key`
+
+**Schema 定义**（`database/migrations.go:74-91`）：
+
+```sql
+CREATE TABLE entries (
+    ...
+    PRIMARY KEY (id),
+    UNIQUE (feed_id, hash),   -- entries_feed_id_hash_key
+    ...
+);
+```
+
+在 `RefreshFeedEntries`（爬虫刷新）中，该唯一约束与显式事务配合实现幂等导入：
+
+**代码**（`storage/entry.go:314-360`）：
+
+```go
+func (s *Storage) RefreshFeedEntries(userID, feedID int64, entries model.Entries, ...) (...) {
+    for _, entry := range entries {
+        tx, err := s.db.Begin()       // 每条 entry 一个独立事务
+
+        entryExists, err := s.entryExists(tx, entry)   // SELECT ... WHERE feed_id=$1 AND hash=$2
+        if entryExists {
+            if updateExistingEntries {
+                err = s.updateEntry(tx, entry)         // UPDATE ... WHERE user_id=$9 AND feed_id=$10 AND hash=$11
+            }
+        } else {
+            err = s.createEntry(tx, entry)             // INSERT ...
+        }
+        tx.Commit()
+    }
+}
+```
+
+**并发竞态分析**：
+
+若两个爬虫 worker 同时刷新同一个 feed 的同一条 entry：
+
+| 时序 | Worker A | Worker B |
+|------|---------|---------|
+| T1 | `BEGIN` |  |
+| T2 | `entryExists()` → false |  |
+| T3 |  | `BEGIN` |
+| T4 |  | `entryExists()` → false |
+| T5 | `createEntry()` → INSERT 成功 |  |
+| T6 | `COMMIT` |  |
+| T7 |  | `createEntry()` → 违反 UNIQUE(feed_id, hash)，报错 |
+| T8 |  | `ROLLBACK` |
+
+此时 Worker B 的 `createEntry` 将返回 `pq: duplicate key value violates unique constraint "entries_feed_id_hash_key"`，被上层捕获为错误，不影响数据一致性。
+
+### 12.3 `createEntry` 中的原子防墓碑检查：`WHERE NOT EXISTS` 子查询
+
+**代码**（`storage/entry.go:81-161`，注释行 83-85）：
+
+```go
+func (s *Storage) createEntry(tx *sql.Tx, entry *model.Entry) error {
+    query := `
+        INSERT INTO entries (...)
+        SELECT $1, $2, ...
+        WHERE NOT EXISTS (
+            SELECT 1 FROM entry_tombstones WHERE feed_id=$9 AND hash=$2
+        )
+        RETURNING id, status, created_at, changed_at
+    `
+    err := tx.QueryRow(...).Scan(...)
+    if errors.Is(err, sql.ErrNoRows) {
+        return ErrEntryTombstoned   // 墓碑存在，拒绝插入
+    }
+}
+```
+
+**注释原文**（第 83-85 行）：
+
+> The WHERE NOT EXISTS guard makes the tombstone check atomic with the insert, so a concurrent archive committing between an earlier existence check and this statement cannot bring a deleted entry back as unread.
+
+这是一个**针对"归档清理 vs 爬虫重新导入"竞态**的专用乐观机制：
+
+1. 归档操作 `ArchiveEntries` 删除 entries 并写入 `entry_tombstones`（带 `ON CONFLICT DO NOTHING`）
+2. 如果没有 `WHERE NOT EXISTS`，时序如下会出错：
+   - T1: `entryExists()` 查询发现 entry 已被删除（返回 false）
+   - T2: 归档事务提交，写入 tombstone
+   - T3: `createEntry()` 直接 INSERT → **已被删除的 entry 复活为 unread**
+3. 加上 `WHERE NOT EXISTS` 后，INSERT 与 tombstone 检查在**同一条 SQL 的同一快照**中执行，由 PostgreSQL 保证原子性。
+
+### 12.4 `ArchiveEntries` 中的悲观锁：`FOR UPDATE SKIP LOCKED`
+
+**代码**（`storage/entry.go:362-404`）：
+
+```go
+func (s *Storage) ArchiveEntries(status string, interval time.Duration, limit int) (int64, error) {
+    query := `
+        WITH to_delete AS (
+            SELECT id, feed_id, hash
+            FROM entries
+            WHERE ...
+            ORDER BY created_at ASC
+            FOR UPDATE SKIP LOCKED   -- ★ 悲观锁：跳过已被锁住的行
+            LIMIT $3
+        ), deleted AS (
+            DELETE FROM entries USING to_delete WHERE entries.id = to_delete.id
+            RETURNING entries.feed_id, entries.hash
+        )
+        INSERT INTO entry_tombstones (feed_id, hash)
+        SELECT feed_id, hash FROM deleted WHERE hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING
+    `
+}
+```
+
+**设计意图**：
+
+- `FOR UPDATE` 对选中行加**排他行锁**，防止同一行被两个并发归档 worker 同时删除
+- `SKIP LOCKED` 跳过已被其他事务锁定的行，避免阻塞等待 → 这是典型的"任务队列"模式
+- 该锁**仅在归档/清理路径使用**，不影响正常的状态更新（SetEntriesStatus/ToggleStarred 等不走这条路径）
+
+### 12.5 入口 Pagination 的事务一致性：`entryPaginationBuilder`
+
+**代码**（`storage/entry_pagination_builder.go:110-142`）：
+
+```go
+func (e *entryPaginationBuilder) Entries() (*model.Entry, *model.Entry, error) {
+    tx, err := e.db.Begin()
+
+    prevID, nextID, err := e.getPrevNextID(tx)   // CTE: lag()/lead() 窗口函数
+    prevEntry, err := e.getEntry(tx, prevID)
+    nextEntry, err := e.getEntry(tx, nextID)
+
+    tx.Commit()   // 三个查询在同一事务中
+}
+```
+
+该显式事务保证：prev/next ID 计算和条目详情读取在**同一数据库快照**下执行，避免"翻页时条目状态改变导致上下条丢失或重复"。
+
+### 12.6 并发冲突处理总结
+
+| 场景 | 机制 | 类型 | 位置 |
+|------|------|------|------|
+| 爬虫并发导入同一条目 | `UNIQUE(feed_id, hash)` + 单条事务 | 唯一约束（事后检测） | `storage/entry.go:314-360` |
+| 归档 vs 爬虫复活竞态 | `INSERT ... WHERE NOT EXISTS (tombstone)` | 原子子查询（事前防护） | `storage/entry.go:86-119` |
+| 并发归档清理竞争 | `FOR UPDATE SKIP LOCKED` | 悲观行锁 + 跳过 | `storage/entry.go:368-389` |
+| 翻页时状态漂移 | 显式事务包裹 prev/next 查询 + 详情读取 | 事务快照一致性 | `storage/entry_pagination_builder.go:110-142` |
+| 两个客户端同时改状态 | PostgreSQL MVCC + Last-Writer-Wins | 数据库原生 | 所有 UPDATE 语句 |
+| 状态 vs 收藏交叉更新 | 无显式冲突检测（最后写入者胜） | 无 | - |
+
+**注意缺失点**：不存在 `WHERE changed_at = ?` 或 `WHERE status = ? AND starred = ?` 的 CAS（Compare-And-Swap）更新。若客户端 A 将条目 123 设为 read，同时客户端 B 设为 starred，两条 UPDATE 都能成功，最终状态是 `status='read', starred=true`，两者互不覆盖——因为 UPDATE 的 SET 子句只修改各自负责的字段，这是 PostgreSQL 的列级更新特性，天然安全。
+
+---
+
+## 十三、未读计数：无缓存设计下的 Fast-Count 索引与一致性保障
+
+### 13.1 核心设计决策：无计数器表 / 无 Redis / 无 Materialized View
+
+通过代码搜索确认：
+- 没有 `CREATE TRIGGER` / `CREATE RULE`（自动维护计数的触发器）
+- 没有独立的计数器表（如 `feed_counters` / `category_counters`）
+- 没有 Materialized View（物化视图预计算）
+- 没有应用层内存缓存（`sync.Map` / `lru` / Redis 等）
+
+所有未读计数均为**实时 SQL 查询**，这是 Miniflux 计数一致性的根本保证。
+
+### 13.2 Fast-Count 支撑：覆盖式 B-Tree 索引体系
+
+为了让实时 count 足够快，Miniflux 通过**一系列精心设计的前缀 B-Tree 索引**，使大部分计数查询可以走**Index Only Scan**（仅扫描索引，不回表）。
+
+**索引演进（migrations.go 中按时间顺序）**：
+
+| 版本 | 索引 | 用途 |
+|------|------|------|
+| v0 | `entries_feed_idx (feed_id)` | 最基础 feed 查询（后被删除） |
+| v? | `entries_user_status_idx (user_id, status)` | 全局未读计数（后被删除，被更宽索引覆盖） |
+| v? | `entries_user_id_status_starred_idx (user_id, status, starred)` | 收藏筛选 + 计数 |
+| v? | `entries_user_feed_idx (user_id, feed_id)` | Feed 内查询 |
+| v? | `entries_id_user_status_idx (id, user_id, status)` | 按 ID 定位并顺带检查状态 |
+| v? | `entries_feed_id_status_hash_idx (feed_id, status, hash)` | Feed 内状态筛选 + hash 去重 |
+| v? | `entries_user_status_feed_idx (user_id, status, feed_id)` | Feed 粒度计数（核心） |
+| v? | `entries_user_status_changed_idx (user_id, status, changed_at)` | 增量同步过滤 |
+| v? | `entries_user_status_published_idx (user_id, status, published_at)` | 按发布时间排序+筛选 |
+| v? | `entries_user_status_created_idx (user_id, status, created_at)` | 按创建时间排序+筛选 |
+| v? | `entries_user_status_changed_published_idx (user_id, status, changed_at, published_at)` | 增量排序 |
+
+**优化证据**（`migrations.go:1522-1535`）——后期迁移显式删除冗余索引：
+
+```go
+// entries_feed_idx is redundant: the unique constraint
+// entries_feed_id_hash_key(feed_id, hash) and the explicit
+// entries_feed_id_status_hash_idx(feed_id, status, hash) both
+// cover feed_id-leading lookups, including FK cascade deletes.
+//
+// entries_user_status_idx is redundant: five three-column indexes
+// share the same (user_id, status) prefix and serve every query
+// that the two-column index could.
+_, err = tx.Exec(`
+    DROP INDEX IF EXISTS entries_feed_idx;
+    DROP INDEX IF EXISTS entries_user_status_idx;
+`)
+```
+
+### 13.3 三类计数查询与索引命中分析
+
+#### 13.3.1 全局未读计数：`GetNavMetadata()`
+
+**SQL**（`storage/nav_metadata.go:20-97`）：
+
+```sql
+SELECT
+    (SELECT count(*)
+       FROM entries e
+       JOIN feeds f ON f.id = e.feed_id
+       JOIN categories c ON c.id = f.category_id
+      WHERE e.user_id = $1
+        AND e.status = 'unread'
+        AND f.hide_globally IS FALSE
+        AND c.hide_globally IS FALSE
+    ) AS count_unread,
+    ...
+```
+
+**索引利用**：
+- `e.user_id = $1 AND e.status = 'unread'` → 命中 `entries_user_status_*` 系列索引（都以 `(user_id, status)` 为前缀）
+- 但因为还要 JOIN `feeds` 和 `categories` 过滤 `hide_globally`，**无法走 Index Only Scan**，必须回表取 `feed_id` 再做 JOIN
+- 这是最慢的计数查询，但只在 Web UI 页面渲染时执行（每个页面一次）
+
+#### 13.3.2 Feed 粒度读/未读计数：`fetchFeedCounter()`
+
+**SQL**（`storage/feed_query_builder.go:302-350`）：
+
+```sql
+SELECT e.feed_id, e.status, count(*)
+FROM entries e
+[INNER JOIN feeds f ON f.id=e.feed_id]   -- 仅当按 category 过滤时
+WHERE e.user_id = $1 AND e.status IN ($2, $3)
+GROUP BY e.feed_id, e.status
+```
+
+**索引利用**：
+- `entries_user_status_feed_idx (user_id, status, feed_id)` 是 **完美覆盖索引**
+- PostgreSQL 可直接对该索引做 Index Only Scan + Group Aggregate，无需回表
+- 按 category 过滤时需 JOIN feeds，但索引仍然先把 `(user_id, status)` 的行集大幅缩小
+
+#### 13.3.3 Category 粒度未读计数：`CategoriesWithFeedCount()`
+
+**SQL**（`storage/category.go:112-170`）：
+
+```sql
+SELECT
+    c.id, c.user_id, c.title, c.hide_globally,
+    coalesce(fc.feed_count, 0),
+    coalesce(uc.unread_count, 0)
+FROM categories c
+LEFT JOIN (
+    SELECT category_id, count(*) AS feed_count FROM feeds ... GROUP BY category_id
+) fc ON fc.category_id = c.id
+LEFT JOIN (
+    SELECT f.category_id, count(*) AS unread_count
+    FROM entries e INNER JOIN feeds f ON f.id = e.feed_id
+    WHERE e.user_id = $2 AND e.status = $1   -- $1 = 'unread'
+    GROUP BY f.category_id
+) uc ON uc.category_id = c.id
+```
+
+**索引利用**：
+- 子查询 `uc` 的 `WHERE e.user_id = $2 AND e.status = $1` → 命中 `entries_user_status_feed_idx`
+- 但需要 `GROUP BY f.category_id`，必须回表 JOIN feeds，无法完全覆盖
+- 使用 `LEFT JOIN + coalesce` 保证"无未读条目时显示 0"而非 NULL
+
+### 13.4 "对账机制"的本质：无缓存 = 对账 = 查询
+
+由于完全不使用缓存，Miniflux **不存在"缓存值 vs 真实值"的对账需求**。每次获取计数就是一次从数据库原始数据的实时聚合。
+
+唯一接近"对账"的是：
+
+1. **Web UI 中的时序控制**（`ui/entry_unread.go:85-93`）：先执行状态写入，再执行 `GetNavMetadata()` 读取计数。代码注释明确说明：
+
+```go
+// Fetching the counters here avoids being off by one.
+navMetadata, _ := h.store.GetNavMetadata(user.ID)
+view.Set("countUnread", navMetadata.CountUnread)
+```
+
+这不是对账，而是**同一请求内的写入后读取（Read-Your-Writes）顺序保证**。
+
+2. **`SetEntriesStatusAndCountVisible` 的 CTE 原子性**（`storage/entry.go:425-449`）：
+
+```sql
+WITH updated AS (
+    UPDATE entries SET status=$1, changed_at=now()
+    WHERE user_id=$2 AND id=ANY($3)
+    RETURNING feed_id
+)
+SELECT count(*) FROM updated u
+    JOIN feeds f ON f.id = u.feed_id
+    JOIN categories c ON c.id = f.category_id
+WHERE NOT f.hide_globally AND NOT c.hide_globally
+```
+
+UPDATE 和 COUNT 在**同一 SQL 语句（隐式事务）**中执行，CTE 的 `updated` 行集就是刚刚被修改的行，不存在时间差，天然一致。
+
+### 13.5 `CountAllEntries`：管理员总览计数
+
+**代码**（`storage/entry.go:23-48`）：
+
+```go
+func (s *Storage) CountAllEntries() (map[string]int64, error) {
+    rows, err := s.db.Query(`SELECT status, count(*) FROM entries GROUP BY status`)
+    // ...
+}
+```
+
+这是管理员仪表盘使用的全库计数，不带 user_id 过滤，走 `entries` 表的全表扫描或主键索引。
+
+---
+
+## 十四、批量标记已读的事务边界分析
+
+### 14.1 事务边界总览：两种模式
+
+Miniflux 中批量标记已读的 Storage 函数可分为两大类：
+
+| 模式 | 代表函数 | 事务类型 | 边界 |
+|------|---------|---------|------|
+| **模式 A：单条 SQL 隐式事务** | `SetEntriesStatus`、`MarkAllAsRead`、`MarkFeedAsRead` 等 | 自动提交（auto-commit） | 整个 UPDATE 是一个原子事务 |
+| **模式 B：显式 BEGIN/COMMIT** | `RefreshFeedEntries`、`InsertEntryForFeed`、`entryPaginationBuilder.Entries()` | 手动控制 | 多条 SQL 在同一事务中 |
+
+### 14.2 模式 A：状态标记函数——全部使用单条 SQL（隐式事务）
+
+所有面向用户入口的状态更新函数**都不使用显式 `BEGIN/COMMIT`**，而是依赖 PostgreSQL 的"单条 SQL = 一个原子事务"：
+
+#### 14.2.1 `SetEntriesStatus` — 批量按 ID 更新
+
+```go
+// storage/entry.go:407-423
+func (s *Storage) SetEntriesStatus(userID int64, entryIDs []int64, status string) error {
+    query := `UPDATE entries SET status=$1, changed_at=now() WHERE user_id=$2 AND id=ANY($3)`
+    _, err := s.db.Exec(query, status, userID, pq.Array(entryIDs))
+    return err
+}
+```
+
+- **事务边界**：单个 `Exec()` 调用 = 一个隐式事务
+- **原子性**：要么所有 `id=ANY($3)` 的行都被更新，要么都不更新
+- **部分失败**：PostgreSQL 中 UPDATE 是原子的，不存在"更新了一部分"的情况
+- **调用方**：API v1 `PUT /v1/entries`、Fever `mark=item`、Google Reader `edit-tag`
+
+#### 14.2.2 `SetEntriesStatusAndCountVisible` — 批量更新 + 返回可见计数
+
+```go
+// storage/entry.go:425-449
+func (s *Storage) SetEntriesStatusAndCountVisible(...) (int, error) {
+    query := `
+        WITH updated AS (
+            UPDATE entries SET status=$1, changed_at=now()
+            WHERE user_id=$2 AND id=ANY($3)
+            RETURNING feed_id
+        )
+        SELECT count(*) FROM updated u JOIN feeds f ... JOIN categories c ...
+        WHERE NOT f.hide_globally AND NOT c.hide_globally
+    `
+    var visible int
+    err := s.db.QueryRow(query, ...).Scan(&visible)
+    return visible, err
+}
+```
+
+- **事务边界**：CTE + SELECT 在**单条 SQL**中，是一个隐式事务
+- **原子性**：UPDATE 和 COUNT 之间不存在时间窗口，不可能出现"计数少算/多算已更新的行"
+- **调用方**：Web UI `POST /entry/status`（`ui/entry_update_status.go:16-35`）
+
+#### 14.2.3 `SetEntriesStarredState` — 批量设置收藏
+
+```go
+// storage/entry.go:451-469
+func (s *Storage) SetEntriesStarredState(userID int64, entryIDs []int64, starred bool) error {
+    query := `UPDATE entries SET starred=$1, changed_at=now() WHERE user_id=$2 AND id=ANY($3)`
+    result, _ := s.db.Exec(query, starred, userID, pq.Array(entryIDs))
+    count, _ := result.RowsAffected()
+    if count == 0 {
+        return errors.New(`store: nothing has been updated`)
+    }
+    return nil
+}
+```
+
+- **事务边界**：单条 `Exec()`
+- **特殊点**：检查 `RowsAffected == 0` 返回错误——这是幂等性检查（所有 ID 都不存在或已经是目标状态）
+- **调用方**：Google Reader `edit-tag`（`googlereader/handler.go:283-287`）
+
+#### 14.2.4 `ToggleStarred` — 单条切换收藏
+
+```go
+// storage/entry.go:472-489
+func (s *Storage) ToggleStarred(userID int64, entryID int64) error {
+    query := `UPDATE entries SET starred = NOT starred, changed_at=now() WHERE user_id=$1 AND id=$2`
+    result, _ := s.db.Exec(query, userID, entryID)
+    count, _ := result.RowsAffected()
+    if count == 0 {
+        return errors.New(`store: unable to toggle bookmark for this entry`)
+    }
+    return nil
+}
+```
+
+- **事务边界**：单条 `Exec()`
+- **原子切换**：`starred = NOT starred` 在数据库层完成，不需要先 SELECT 再 UPDATE，避免了"读-改-写"竞态
+- **调用方**：Web UI `POST /entry/star/{id}`、API v1 `PUT /v1/entries/{id}/bookmark`、Fever `mark=item&as=saved/unsaved`
+
+#### 14.2.5 范围型批量标记已读
+
+```go
+// MarkAllAsRead — storage/entry.go:510-525
+UPDATE entries SET status=$1, changed_at=now() WHERE user_id=$2 AND status=$3
+
+// MarkAllAsReadBeforeDate — storage/entry.go:527-549
+UPDATE entries SET status=$1, changed_at=now()
+WHERE user_id=$2 AND status=$3 AND published_at < $4
+
+// MarkGloballyVisibleFeedsAsRead — storage/entry.go:551-579
+UPDATE entries SET status=$1, changed_at=now()
+FROM feeds
+WHERE entries.feed_id = feeds.id
+  AND entries.user_id=$2 AND entries.status=$3
+  AND feeds.hide_globally=$4
+
+// MarkFeedAsRead — storage/entry.go:581-606
+UPDATE entries SET status=$1, changed_at=now()
+WHERE user_id=$2 AND feed_id=$3 AND status=$4 AND published_at < $5
+
+// MarkCategoryAsRead — storage/entry.go:608-643
+UPDATE entries SET status=$1, changed_at=now()
+FROM feeds
+WHERE feed_id=feeds.id
+  AND feeds.user_id=$2
+  AND status=$3 AND published_at < $4 AND feeds.category_id=$5
+```
+
+全部都是**单条 UPDATE = 一个隐式事务**。特点：
+- `MarkCategoryAsRead` 和 `MarkGloballyVisibleFeedsAsRead` 使用 `FROM feeds` 做跨表 UPDATE，依然是单条 SQL
+- 所有函数都只检查错误，不做重试（PostgreSQL 单条 UPDATE 不会因为并发冲突而回滚，最多 `RowsAffected` 较少）
+
+### 14.3 模式 B：爬虫导入路径——显式事务，每条 entry 一个事务
+
+#### 14.3.1 `RefreshFeedEntries`
+
+```go
+// storage/entry.go:314-360
+func (s *Storage) RefreshFeedEntries(userID, feedID int64, entries model.Entries, ...) (...) {
+    for _, entry := range entries {   // ★ 外层 for 循环
+        tx, err := s.db.Begin()       // 每条 entry 一个 BEGIN
+        entryExists, err := s.entryExists(tx, entry)
+        if entryExists {
+            err = s.updateEntry(tx, entry)    // UPDATE
+        } else {
+            err = s.createEntry(tx, entry)    // INSERT + INSERT enclosures
+        }
+        if err != nil {
+            tx.Rollback()
+            return nil, err
+        }
+        tx.Commit()
+    }
+}
+```
+
+**事务边界设计决策分析**：
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **当前方案：每条 entry 一个事务** | 失败时只回滚单条，不影响已成功的；单事务短小减少锁持有时间 | 大量 entry 时事务开销大；无整体原子性（前几条成功后中间失败时部分导入） |
+| 备选 A：所有 entry 一个大事务 | 原子性——要么全导入要么全不回滚 | 大事务持有锁时间长，可能阻塞其他操作；feed 有 1000 条 entry 时事务日志巨大 |
+| 备选 B：每 N 条一个批量事务 | 平衡开销和原子性 | 实现复杂，部分失败语义不清晰 |
+
+Miniflux 选择了**方案 1（每条 entry 独立事务）**，因为 RSS 刷新是**幂等操作**，下次刷新会重试失败的条目。
+
+#### 14.3.2 `InsertEntryForFeed` — 单条导入
+
+```go
+// storage/entry.go:245-276
+func (s *Storage) InsertEntryForFeed(userID, feedID int64, entry *model.Entry) (bool, error) {
+    tx, err := s.db.Begin()
+    defer tx.Rollback()
+
+    entryID, err := s.getEntryIDByHash(tx, entry.FeedID, entry.Hash)
+    alreadyExistingEntry := entryID > 0
+    if alreadyExistingEntry {
+        entry.ID = entryID
+    } else {
+        s.createEntry(tx, entry)
+    }
+    tx.Commit()
+    return !alreadyExistingEntry, nil
+}
+```
+
+- 单条 entry 的 `SELECT (getEntryIDByHash) + [INSERT (createEntry)]` 需要显式事务包裹，保证 SELECT 和 INSERT 之间不会有并发插入（否则 `createEntry` 的 UNIQUE 约束仍会兜底报错，但 `defer tx.Rollback()` 确保不会泄漏事务）
+
+### 14.4 为什么状态更新不走显式事务？
+
+与爬虫导入不同，所有面向用户的状态更新（SetEntriesStatus / MarkFeedAsRead / ToggleStarred 等）都刻意避免显式事务：
+
+1. **单 SQL 足够**：UPDATE 本身就是原子的，不需要 BEGIN/COMMIT 包装
+2. **减少往返**：显式事务需要 3 次网络往返（BEGIN → UPDATE → COMMIT），单 SQL 只需 1 次
+3. **锁持有时间最短**：单条 UPDATE 的锁只在语句执行期间持有，不跨网络往返
+4. **避免长事务**：HTTP handler 中若 BEGIN 后在计算/日志处阻塞，会导致事务长时间不提交
+
+### 14.5 异常路径：Rollback 触发条件
+
+代码中显式事务的 Rollback 触发场景：
+
+| 函数 | Rollback 时机 |
+|------|--------------|
+| `RefreshFeedEntries` | `entryExists` 报错、`updateEntry` 报错、`createEntry` 报错、`tx.Commit()` 之前任何错误 |
+| `InsertEntryForFeed` | 通过 `defer tx.Rollback()` 兜底——只要没走到 Commit，函数返回时自动回滚 |
+| `entryPaginationBuilder.Entries` | `getPrevNextID` 报错、`getEntry` 报错 |
+| 其他事务（`user.go` / `icon.go` / `category.go` / `feed.go`） | 任何中间步骤出错 |
+
+### 14.6 批量事务边界与未读计数的一致性
+
+由于所有状态更新 SQL：
+1. 要么是**单条隐式事务**（UPDATE 自包含）
+2. 要么 UPDATE + COUNT 是**同一条 SQL 的 CTE**（SetEntriesStatusAndCountVisible）
+
+不存在"UPDATE 已提交但 COUNT 还没跟上"的不一致窗口。未读计数查询在 UPDATE 之后执行时，必然能看到最新状态——这是 PostgreSQL 的事务隔离（Read Committed）保证的。
+
+---
+
+## 十五、总结
 
 ### 状态同步的核心设计原则
 
