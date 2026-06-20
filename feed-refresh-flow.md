@@ -2622,3 +2622,867 @@ func (p *Pool) Shutdown() {
 - 自动刷新经过 Worker Pool 的 channel，受 Worker 池并发度限制
 - 手动刷新在 HTTP handler 的 goroutine 中直接执行，不受 Worker 池限制
 - 这意味着在 Worker 全部忙碌时，手动刷新仍可立即执行（但会增加并发压力）
+
+---
+
+## 十六、Feed Icon / Favicon 抓取完整链路
+
+### 16.1 抓取触发的三种时机
+
+Icon 抓取由 `iconChecker` 驱动，在以下三种时机触发：
+
+| 触发时机 | 代码位置 | 调用方式 | 说明 |
+|----------|----------|----------|------|
+| 1. 创建新 Feed | `handler.go:98` | `UpdateOrCreateFeedIcon()` | 强制更新，无论是否已存在 |
+| 2. 创建订阅 (Discover) | `handler.go:189` | `UpdateOrCreateFeedIcon()` | 同上 |
+| 3. 周期性刷新 | `handler.go:347-349` | 根据响应状态分支 | 200 OK 时 `UpdateOrCreateFeedIcon()`；304 Not Modified 时 `CreateFeedIconIfMissing()` |
+
+**调用代码**:
+
+```go
+// handler.go:345-350
+iconChecker := icon.NewIconChecker(store, originalFeed)
+if responseHandler.Changed() {
+    // 源站内容有变化 → 重新抓取图标（网站可能也换了）
+    iconChecker.UpdateOrCreateFeedIcon()
+} else {
+    // 304 未变化 → 仅在缺失时抓取（可能是旧数据升级时）
+    iconChecker.CreateFeedIconIfMissing()
+}
+```
+
+### 16.2 iconChecker 的两种模式
+
+**代码位置**: `internal/reader/icon/checker.go`
+
+#### 模式 1: CreateFeedIconIfMissing（保守）
+
+```go
+func (c *iconChecker) CreateFeedIconIfMissing() {
+    if c.store.HasFeedIcon(c.feed.ID) {  // 先检查 feed_icons 关联表
+        slog.Debug("Feed icon already exists", ...)
+        return
+    }
+    c.UpdateOrCreateFeedIcon()
+}
+```
+
+- 用途: 304 Not Modified 时避免重复抓取
+- 检查方式: `SELECT true FROM feed_icons WHERE feed_id=$1 LIMIT 1`
+
+#### 模式 2: UpdateOrCreateFeedIcon（强制）
+
+```go
+func (c *iconChecker) UpdateOrCreateFeedIcon() {
+    // 1. 构建与 feed 相同配置的请求（共享 UA / 代理 / TLS 等）
+    requestBuilder := fetcher.NewRequestBuilder().
+        WithUserAgent(c.feed.UserAgent, config.Opts.HTTPClientUserAgent()).
+        WithCookie(c.feed.Cookie).
+        WithTimeout(config.Opts.HTTPClientTimeout()).
+        WithProxyRotator(proxyrotator.ProxyRotatorInstance).
+        WithCustomFeedProxyURL(c.feed.ProxyURL).
+        WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL()).
+        UseCustomApplicationProxyURL(c.feed.FetchViaProxy).
+        IgnoreTLSErrors(c.feed.AllowSelfSignedCertificates).
+        DisableHTTP2(c.feed.DisableHTTP2)
+
+    // 2. 查找图标
+    iconFinder := newIconFinder(requestBuilder, c.feed.SiteURL, c.feed.IconURL)
+    icon, err := iconFinder.findIcon()
+
+    // 3. 存储
+    c.store.StoreFeedIcon(c.feed.ID, icon)
+}
+```
+
+### 16.3 findIcon 的四级回退查找策略
+
+**代码位置**: `internal/reader/icon/finder.go:49-85`
+
+```
+findIcon() 的查找顺序:
+  │
+  ├── ① feed.IconURL（RSS/Atom feed 中显式指定的图标 URL）
+  │     └── 优先使用 feed 中 <icon> 或 <logo> 元素
+  │
+  ├── ② feed.SiteURL（网站首页）HTML 文档中的 link 标签
+  │     ├── 搜索: <link rel="icon" href="...">
+  │     ├── 搜索: <link rel="shortcut icon" href="...">
+  │     ├── 搜索: <link rel="apple-touch-icon" href="...">
+  │     └── 支持 data: URL（内联 base64 图标）
+  │
+  ├── ③ RootURL（网站根目录）HTML 文档中的 link 标签
+  │     └── 当 SiteURL 是子目录时，额外检查根目录
+  │
+  └── ④ /favicon.ico（根目录默认图标）
+        └── 尝试 RootURL + "/favicon.ico"
+```
+
+**HTML 文档解析**（`finder.go:273-312`）:
+
+```go
+query := `link[rel='icon' i][href],
+    link[rel='shortcut icon' i][href],
+    link[rel='icon shortcut' i][href],
+    link[rel='apple-touch-icon'][href]`
+
+for _, s := range doc.Find(query).EachIter() {
+    href, _ := s.Attr("href")
+    // 转换为绝对 URL，加入 iconURLs 列表
+}
+```
+
+**Data URL 支持**（`finder.go:318-356`）:
+
+支持 `data:image/...;base64,...` 和 `data:image/...;utf8,...` 格式的内联图标。
+
+### 16.4 图标下载与后处理
+
+**代码位置**: `internal/reader/icon/finder.go:157-271`
+
+#### downloadIcon 流程
+
+```
+downloadIcon(iconURL)
+    │
+    ├── HTTP 请求（与 feed 抓取共享 RequestBuilder 配置）
+    │
+    ├── 读取响应体（受 HTTP_CLIENT_MAX_BODY_SIZE 限制）
+    │
+    ├── 计算 hash: crypto.HashFromBytes(responseBody)
+    │
+    └── resizeIcon(icon)
+          │
+          ├── SVG: minify 压缩（不改变尺寸）
+          │
+          ├── 位图格式检查（JPEG/PNG/GIF/WebP）:
+          │   ├── 尺寸 > 4096 × 4096 或总像素 > 4096² → 拒绝（返回 nil）
+          │   ├── 尺寸 ≤ 32 × 32 → 无需调整
+          │   └── 尺寸 > 32 → 使用 draw.BiLinear 缩放到 32×32 PNG
+          │
+          └── 不支持格式 → 原样返回
+```
+
+**关键参数**:
+- 最大尺寸: 4096 × 4096 像素
+- 输出尺寸: 32 × 32 像素 PNG
+- 缩放算法: `draw.BiLinear`（双线性插值）
+
+### 16.5 StoreFeedIcon 的原子存储与去重
+
+**代码位置**: `internal/storage/icon.go:99-147`
+
+```go
+func (s *Storage) StoreFeedIcon(feedID int64, icon *model.Icon) error {
+    tx, _ := s.db.Begin()
+
+    // 1. 按 hash 查找是否已有相同图标（跨 feed 去重）
+    err := tx.QueryRow(`SELECT id FROM icons WHERE hash=$1`, icon.Hash).Scan(&icon.ID)
+    if errors.Is(err, sql.ErrNoRows) {
+        // 2. 新图标: 插入 icons 表
+        tx.QueryRow(`INSERT INTO icons (hash, mime_type, content, external_id)
+            VALUES ($1, $2, $3, $4) RETURNING id`,
+            icon.Hash, normalizeMimeType(icon.MimeType),
+            icon.Content, crypto.GenerateRandomStringHex(20),
+        ).Scan(&icon.ID)
+    }
+
+    // 3. 先删除该 feed 原有关联（支持图标更新替换）
+    tx.Exec(`DELETE FROM feed_icons WHERE feed_id=$1`, feedID)
+
+    // 4. 建立 feed ↔ icon 关联
+    tx.Exec(`INSERT INTO feed_icons (feed_id, icon_id) VALUES ($1, $2)`, feedID, icon.ID)
+
+    tx.Commit()
+}
+```
+
+**数据库表结构**:
+
+```
+icons 表:
+  id           (主键)
+  hash         (唯一索引 — 跨 feed 去重)
+  mime_type
+  content      (BLOB)
+  external_id  (用于 URL 访问，随机字符串)
+
+feed_icons 关联表:
+  feed_id      (外键 → feeds.id, ON DELETE CASCADE)
+  icon_id      (外键 → icons.id)
+  primary key (feed_id, icon_id)
+```
+
+**跨 feed 图标共享**: 如果两个 feed 来自同一网站，它们的 icon hash 相同，`StoreFeedIcon` 会复用同一个 `icons` 行，通过不同的 `feed_icons` 行关联。
+
+**孤立图标清理**（`CleanupOrphanIcons`）: 定期删除没有任何 feed 引用的 `icons` 行。
+
+### 16.6 图标访问 URL
+
+**代码位置**: `internal/ui/feed_icon.go`
+
+```
+GET /feed-icon/{externalIconID}
+    │
+    ├── storage.IconByExternalID(externalIconID)
+    │
+    ├── 缓存 72 小时（Cache-Control: public, max-age=259200）
+    │     └── 基于 icon.Hash 做 ETag
+    │
+    └── 返回:
+          ├── Content-Type: icon.MimeType
+          └── Body: icon.Content（非 SVG 时附带 Content-Length 和 Last-Modified）
+```
+
+### 16.7 完整链路数据流图
+
+```
+RefreshFeed 完成
+    │
+    ├── 响应 Changed?
+    │     ├── true  → UpdateOrCreateFeedIcon()   (强制更新)
+    │     └── false → CreateFeedIconIfMissing()  (仅缺失时抓取)
+    │
+    └── iconChecker
+          │
+          └── iconFinder.findIcon()
+                │
+                ├── ① feed.IconURL? → downloadIcon
+                ├── ② SiteURL HTML → <link rel=icon> → downloadIcon
+                ├── ③ RootURL HTML → <link rel=icon> → downloadIcon
+                └── ④ RootURL/favicon.ico → downloadIcon
+                      │
+                      ├── resizeIcon (32×32 PNG)
+                      └── StoreFeedIcon
+                            │
+                            ├── icons 表（按 hash 去重，跨 feed 共享）
+                            └── feed_icons 关联表
+```
+
+---
+
+## 十七、用户阅读状态与未读计数维护
+
+### 17.1 Entry 状态模型
+
+**代码位置**: `internal/model/entry.go`
+
+```go
+const (
+    EntryStatusUnread = "unread"
+    EntryStatusRead   = "read"
+    EntryStatusRemoved = "removed"  // 逻辑删除状态（代码中存在但较少使用）
+)
+```
+
+**状态持久化字段**（entries 表）:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status` | VARCHAR | `unread` / `read` / `removed` |
+| `starred` | BOOLEAN | 收藏标记（独立于阅读状态） |
+| `share_code` | VARCHAR | 分享代码（非空表示已分享，FlushHistory 时保留） |
+| `created_at` | TIMESTAMP | 创建时间（归档时判断是否超过阈值） |
+| `changed_at` | TIMESTAMP | 状态变更时间（每次 SET status 时更新为 now()） |
+
+### 17.2 新 Entry 的默认状态
+
+**代码位置**: `internal/storage/entry.go:86-122` — `createEntry`
+
+```sql
+INSERT INTO entries (..., status, ...)
+SELECT ..., $6, ...   -- $6 = entry.Status
+RETURNING id, status, created_at, changed_at
+```
+
+**代码位置**: `internal/model/entry.go:50` — `NewEntry()` 默认值
+
+```go
+func NewEntry() *Entry {
+    return &Entry{
+        Enclosures: make(EnclosureList, 0),
+        Tags:       make([]string, 0),
+        // Status 字段在模型中无默认值，由解析器或存储层决定
+    }
+}
+```
+
+**实际默认值**: 新 entry 在进入 `RefreshFeedEntries` 时，如果没有显式设置 status，**默认为 `unread`**（由 SQL 默认值 `DEFAULT 'unread'` 保证）。
+
+### 17.3 自动标读: ShouldMarkAsReadOnView
+
+**代码位置**: `internal/model/entry.go:60-74`
+
+```go
+func (e *Entry) ShouldMarkAsReadOnView(user *User) bool {
+    // 1. 已经不是 unread，无需再次标记
+    if e.Status != EntryStatusUnread {
+        return false
+    }
+
+    // 2. 有音视频附件 + 用户开启"播放完成才标读" → 不立即标读
+    if user.MarkReadOnMediaPlayerCompletion && e.Enclosures.ContainsAudioOrVideo() {
+        return false
+    }
+
+    // 3. 取决于用户"查看即标读"设置
+    return user.MarkReadOnView
+}
+```
+
+**用户配置项**（User 模型）:
+
+| 配置 | 默认值 | 说明 |
+|------|--------|------|
+| `MarkReadOnView` | true | 查看条目时立即标记为已读 |
+| `MarkReadOnMediaPlayerCompletion` | false | 音视频播放完毕才标读 |
+| `NoAutoMarkAsRead` | false | 完全不自动标读（全局关闭） |
+
+**调用位置**（UI Handler）:
+
+```go
+// ui/unread_entry_feed.go:39-45
+if entry.ShouldMarkAsReadOnView(user) {
+    err = h.store.SetEntriesStatus(user.ID, []int64{entry.ID}, model.EntryStatusRead)
+}
+```
+
+### 17.4 状态变更的数据库操作
+
+#### 批量状态更新
+
+**代码位置**: `internal/storage/entry.go:407-423`
+
+```go
+func (s *Storage) SetEntriesStatus(userID int64, entryIDs []int64, status string) error {
+    query := `
+        UPDATE entries
+        SET status=$1, changed_at=now()
+        WHERE user_id=$2 AND id=ANY($3)
+    `
+    s.db.Exec(query, status, userID, pq.Array(entryIDs))
+}
+```
+
+使用 `id=ANY($3)` + `pq.Array(entryIDs)` 实现**单 SQL 批量更新**，避免 N+1 查询。
+
+#### 可见性计数版本
+
+**代码位置**: `internal/storage/entry.go:426-449`
+
+```go
+func (s *Storage) SetEntriesStatusAndCountVisible(userID int64, entryIDs []int64, status string) (int, error) {
+    // 单条 CTE: UPDATE → JOIN feeds/categories → 统计 hide_globally=false 的数量
+    query := `
+        WITH updated AS (
+            UPDATE entries SET status=$1, changed_at=now()
+            WHERE user_id=$2 AND id=ANY($3)
+            RETURNING feed_id
+        )
+        SELECT count(*)
+        FROM updated u
+          JOIN feeds f ON (f.id = u.feed_id)
+          JOIN categories c ON (c.id = f.category_id)
+        WHERE NOT f.hide_globally AND NOT c.hide_globally
+    `
+    // 返回变更的条目中"在全局视图中可见"的数量
+}
+```
+
+**设计意图**: 用于 Fever/Google Reader API 中，需要返回被标记条目的"可见计数"（排除用户隐藏的 feed 和 category）。
+
+#### 全部标读
+
+**代码位置**: `internal/storage/entry.go:511-523`
+
+```go
+func (s *Storage) MarkAllAsRead(userID int64) error {
+    query := `UPDATE entries SET status=$1, changed_at=now()
+              WHERE user_id=$2 AND status=$3`
+    s.db.Exec(query, model.EntryStatusRead, userID, model.EntryStatusUnread)
+}
+```
+
+#### 收藏切换
+
+**代码位置**: `internal/storage/entry.go:471-489`
+
+```go
+func (s *Storage) ToggleStarred(userID int64, entryID int64) error {
+    query := `UPDATE entries SET starred = NOT starred, changed_at=now()
+              WHERE user_id=$1 AND id=$2`
+}
+```
+
+### 17.5 未读计数: GetNavMetadata
+
+**代码位置**: `internal/storage/nav_metadata.go`
+
+导航栏的未读计数、错误 feed 计数、是否启用保存功能在**单条 SQL** 中一次性查询：
+
+```go
+func (s *Storage) GetNavMetadata(userID int64) (NavMetadata, error) {
+    query := `
+        SELECT
+            -- 未读条目计数（排除隐藏的 feed / category）
+            (SELECT count(*)
+               FROM entries e
+               JOIN feeds f ON f.id = e.feed_id
+               JOIN categories c ON c.id = f.category_id
+              WHERE e.user_id = $1
+                AND e.status = 'unread'
+                AND f.hide_globally IS FALSE
+                AND c.hide_globally IS FALSE
+            ) AS count_unread,
+
+            -- 是否启用了任何第三方保存集成
+            (SELECT EXISTS(
+                SELECT 1 FROM integrations
+                 WHERE user_id = $1
+                   AND (pinboard_enabled='t' OR instapaper_enabled='t' OR ...)
+            )) AS has_save_entry,
+
+            -- 错误 feed 计数（超过 POLLING_PARSING_ERROR_LIMIT 阈值）
+            (SELECT count(*) FROM feeds
+              WHERE user_id = $1 AND parsing_error_count >= $2
+            ) AS count_error_feeds
+    `
+}
+```
+
+**调用频率**: 几乎每个 UI 页面渲染时都会调用（未读页、历史页、feed 列表、设置页等共 50+ 处）。
+
+**性能影响**: 每次页面加载执行 3 个子查询。未读计数需要扫描 entries + feeds + categories 三表 JOIN，在大型部署中可能是性能热点。
+
+### 17.6 已读条目归档与 Tombstone
+
+**代码位置**: `internal/storage/entry.go:362-404` — `ArchiveEntries`
+
+```go
+func (s *Storage) ArchiveEntries(userID int64, markingDate time.Time) (int64, error) {
+    query := `
+        -- 子查询 1: 加锁选择待删除条目（防止并发归档冲突）
+        WITH deleted AS (
+            DELETE FROM entries
+            WHERE user_id=$1
+              AND starred is false
+              AND share_code=''
+              AND status='read'
+              AND changed_at < $2
+              AND id IN (
+                  SELECT id FROM entries
+                  WHERE user_id=$1 AND status='read'
+                  ORDER BY changed_at ASC
+                  FOR UPDATE SKIP LOCKED  -- ← 并发安全：跳过被其他事务锁定的行
+                  LIMIT $3
+              )
+            RETURNING feed_id, hash
+        )
+        -- 子查询 2: 写入 tombstone 防止重新摄入
+        INSERT INTO entry_tombstones (feed_id, hash)
+        SELECT feed_id, hash FROM deleted WHERE hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING
+    `
+}
+```
+
+**归档条件**（AND 全部满足）:
+- `starred = false`（非收藏）
+- `share_code = ''`（未分享）
+- `status = 'read'`（已读）
+- `changed_at < markingDate`（变更早于指定时间）
+
+**参数**:
+- `markingDate`: 由 CLEANUP_ARCHIVE_READ_DAYS_AFTER 配置（默认 60 天前）
+- `LIMIT $3`: 由 CLEANUP_ARCHIVE_BATCH_SIZE 配置（默认 10000 条/次）
+
+**并发安全**: 使用 `FOR UPDATE SKIP LOCKED` — 如果其他归档进程已锁定某些行，就跳过它们，避免死锁。
+
+### 17.7 历史清空: FlushHistory
+
+**代码位置**: `internal/storage/entry.go:491-508`
+
+```go
+func (s *Storage) FlushHistory(userID int64) error {
+    query := `
+        WITH deleted AS (
+            DELETE FROM entries
+            WHERE user_id=$1 AND status=$2 AND starred is false AND share_code=''
+            RETURNING feed_id, hash
+        )
+        INSERT INTO entry_tombstones (feed_id, hash)
+        SELECT feed_id, hash FROM deleted WHERE hash <> ''
+        ON CONFLICT (feed_id, hash) DO NOTHING
+    `
+    s.db.Exec(query, userID, model.EntryStatusRead)
+}
+```
+
+与 `ArchiveEntries` 的区别：
+- 不按时间限制，删除**所有**非收藏/非分享的已读条目
+- 不使用 `SKIP LOCKED`（用户主动触发，通常不会并发执行）
+
+### 17.8 状态维护数据流图
+
+```
+新 Entry 入库 (createEntry)
+    │
+    └── 默认 status = 'unread'
+          │
+          ▼
+    用户查看条目 (ShouldMarkAsReadOnView)
+    ├── status == unread?
+    ├── 有音视频 + MarkReadOnMediaPlayerCompletion? → 等待播放完成
+    └── MarkReadOnView == true?
+          │
+          └── 是 → SetEntriesStatus([entryID], 'read')
+                │
+                └── changed_at = now()
+                      │
+                      ▼
+              条目存在 N 天后
+              (CLEANUP_ARCHIVE_READ_DAYS_AFTER)
+                      │
+                      ▼
+              ArchiveEntries 后台清理
+              ├── FOR UPDATE SKIP LOCKED (并发安全)
+              ├── DELETE FROM entries
+              └── INSERT INTO entry_tombstones (防止重复摄入)
+
+用户交互:
+  ├── 手动 ToggleStarred → starred 翻转
+  ├── 手动 MarkAllAsRead → 所有 unread → read
+  ├── 手动 FlushHistory  → 删除所有已读非收藏非分享
+  └── SetEntriesStatus批量操作 → 任意 entryIDs 列表状态变更
+
+未读计数:
+  └── GetNavMetadata (几乎每个页面调用)
+      ├── COUNT unread entries (JOIN feeds + categories, hide_globally 过滤)
+      ├── EXISTS integrations (是否有保存集成)
+      └── COUNT error feeds (parsing_error_count >= 阈值)
+```
+
+---
+
+## 十八、第三方集成推送（Pocket / Instapaper 等）完整链路
+
+### 18.1 两种推送模式
+
+Miniflux 的第三方集成分两种模式，触发时机完全不同：
+
+| 模式 | 触发时机 | 推送对象 | 入口函数 | 说明 |
+|------|----------|----------|----------|------|
+| **自动推送** | Feed 刷新检测到新 Entry 时 | 本次刷新的所有新条目 | `integration.PushEntries()` | 通知类集成（Webhook / Matrix / Discord / Slack / Ntfy / Pushover / Telegram / Apprise）+ 部分"稍后读"类自动推送 |
+| **手动保存** | 用户点击"保存"按钮时 | 单个 Entry | `integration.SendEntry()` | 稍后读/书签类集成（Pinboard / Instapaper / Wallabag / Notion / Webhook 等 20+ 种） |
+
+**调用位置**:
+
+```go
+// 自动推送 — handler.go:339-342
+if len(newEntries) > 0 {
+    userIntegrations, _ := store.Integration(userID)
+    integration.PushEntries(originalFeed, newEntries, userIntegrations)
+}
+
+// 手动保存 — 由 UI "保存条目" handler 触发 (api / ui entry_save handler)
+integration.SendEntry(entry, userIntegrations)
+```
+
+### 18.2 自动推送: PushEntries 的集成列表
+
+**代码位置**: `internal/integration/integration.go:511-719`
+
+自动推送支持的集成分为"批量通知"和"逐条推送"两类：
+
+#### 批量通知类（一次性推送整个 feed 的新条目列表）
+
+| 集成 | 类型 | 推送方式 | Feed 级开关 |
+|------|------|----------|:---:|
+| Matrix Bot | 即时通讯 | `matrixbot.PushEntries(feed, entries, ...)` | 无 |
+| Webhook | 通用 | `webhook.SendNewEntriesWebhookEvent(feed, entries)` | 无（Feed 可覆盖 URL） |
+| Ntfy | 推送通知 | `ntfy.SendMessages(feed, entries)` | `feed.NtfyEnabled` |
+| Apprise | 多平台通知 | `apprise.SendNotification(feed, entries)` | 无（Feed 可覆盖 ServiceURLs） |
+| Discord | 即时通讯 | `discord.SendDiscordMsg(feed, entries)` | 无 |
+| Slack | 即时通讯 | `slack.SendSlackMsg(feed, entries)` | 无 |
+| Pushover | 推送通知 | `pushover.SendMessages(feed, entries)` | `feed.PushoverEnabled` |
+
+#### 逐条推送类（遍历新条目逐个推送）
+
+| 集成 | 类型 | 推送方式 |
+|------|------|----------|
+| Telegram Bot | 即时通讯 | `telegrambot.PushEntry(feed, entry, ...)` — 每条目一次 HTTP 请求 |
+| Readeck Push | 稍后读 | `readeck.CreateBookmark(entry.URL, ...)` — 每条目一次 |
+
+#### Webhook URL 覆盖优先级
+
+```go
+// integration.go:536-542
+var webhookURL string
+if feed.WebhookURL != "" {
+    webhookURL = feed.WebhookURL        // Feed 级自定义 URL（最高优先级）
+} else {
+    webhookURL = userIntegrations.WebhookURL  // 用户级全局 URL
+}
+```
+
+同理 Apprise 也有 feed 级覆盖 (`feed.AppriseServiceURLs`)。
+
+### 18.3 手动保存: SendEntry 的集成列表
+
+**代码位置**: `internal/integration/integration.go:41-508`
+
+手动保存支持的集成全部是"逐条"模式，覆盖 20+ 种稍后读/书签服务：
+
+#### 稍后读 / 文档管理类
+
+| 集成 | API 调用 | 推送内容 |
+|------|----------|----------|
+| **Pocket** → 实际为 `Pinboard`（Miniflux 无原生 Pocket） | `pinboard.NewClient(token).CreateBookmark(url, title, tags, toread)` | URL + 标题 + 标签 |
+| **Instapaper** | `instapaper.NewClient(username, password).AddURL(url, title)` | URL + 标题 |
+| Wallabag | `wallabag.NewClient(...).CreateEntry(url, title, content)` | URL + 标题 + 全文 |
+| Notion | `notion.NewClient(token, pageID).UpdateDocument(url, title)` | URL + 标题（追加到指定页面） |
+| Readeck | `readeck.NewClient(...).CreateBookmark(url, title, content)` | URL + 标题 + 全文 |
+| Readwise | `readwise.NewClient(key).CreateDocument(url)` | URL |
+| Omnivore | `omnivore.NewClient(key, url).SaveURL(url)` | URL |
+| Karakeep | `karakeep.NewClient(key, url, tags).SaveURL(url)` | URL |
+
+#### 书签 / 链接管理类
+
+| 集成 | API 调用 |
+|------|----------|
+| Pinboard | `CreateBookmark(url, title, tags, toread)` |
+| LinkAce | `AddURL(url, title)` |
+| Linkding | `CreateBookmark(url, title)` |
+| LinkTaco | `CreateBookmark(url, title, content)` |
+| Linkwarden | `CreateBookmark(url, title)` |
+| Raindrop | `CreateRaindrop(url, title)` |
+| Shaarli | `CreateLink(url, title)` |
+| Shiori | `CreateBookmark(url, title)` |
+| Espial | `CreateLink(url, title, tags)` |
+| Cubox | `SaveLink(url)` |
+| Betula | `CreateBookmark(url, title, tags)` |
+| archive.org | `SendURL(url)`（Wayback Machine 归档） |
+
+#### 手动保存的 Webhook
+
+```go
+// integration.go:422-447 — 手动保存的 Webhook（SendEntry 内）
+var webhookURL string
+if entry.Feed != nil && entry.Feed.WebhookURL != "" {
+    webhookURL = entry.Feed.WebhookURL
+} else {
+    webhookURL = userIntegrations.WebhookURL
+}
+webhookClient.SendSaveEntryWebhookEvent(entry)  // 事件类型不同: save_entry vs new_entries
+```
+
+### 18.4 典型集成实现: Pinboard / Instapaper / Wallabag
+
+#### Pinboard（书签）
+
+**代码位置**: `internal/integration/pinboard/pinboard.go` + `post.go`
+
+```go
+type Client struct { token string }
+
+func (c *Client) CreateBookmark(url, title, tags string, markAsUnread bool) error {
+    values := url.Values{}
+    values.Set("url", url)
+    values.Set("description", title)
+    values.Set("tags", tags)
+    values.Set("toread", boolToString(markAsUnread))  // "yes" / "no"
+
+    apiEndpoint := "https://api.pinboard.in/v1/posts/add?auth_token=" + c.token + "&" + values.Encode()
+
+    resp, _ := http.Get(apiEndpoint)  // Pinboard 使用 HTTP GET（非 RESTful）
+    // 解析 XML 响应 <result code="done" />
+}
+```
+
+#### Instapaper（稍后读）
+
+**代码位置**: `internal/integration/instapaper/instapaper.go`
+
+```go
+type Client struct { username, password string }
+
+func (c *Client) AddURL(url, title string) error {
+    // 使用 XAuth 认证 (HTTP Basic)
+    apiEndpoint := "https://www.instapaper.com/api/add"
+    values := url.Values{}
+    values.Set("url", url)
+    values.Set("title", title)
+
+    req, _ := http.NewRequest("POST", apiEndpoint, strings.NewReader(values.Encode()))
+    req.SetBasicAuth(c.username, c.password)
+    req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+    // 检查 201 Created
+}
+```
+
+#### Wallabag（自托管稍后读）
+
+**代码位置**: `internal/integration/wallabag/wallabag.go`
+
+```go
+type Client struct {
+    baseURL, clientID, clientSecret, username, password, tags string
+    onlyURL bool
+}
+
+func (c *Client) CreateEntry(url, title, content string) error {
+    // 1. OAuth2 获取 access_token
+    accessToken, err := c.getAccessToken()  // password grant
+
+    // 2. POST /api/entries.json
+    values := url.Values{}
+    values.Set("url", url)
+    if !c.onlyURL {  // WallabagOnlyURL 开关控制是否发送全文
+        values.Set("title", title)
+        values.Set("content", content)
+        values.Set("tags", c.tags)
+    }
+
+    req, _ := http.NewRequest("POST", c.baseURL+"/api/entries.json", ...)
+    req.Header.Set("Authorization", "Bearer "+accessToken)
+}
+```
+
+### 18.5 两种 Webhook 事件类型
+
+**代码位置**: `internal/integration/webhook/webhook.go`
+
+Webhook 集成区分两种事件，payload 不同：
+
+| 事件 | 触发 | Webhook 方法 | Payload |
+|------|------|-------------|---------|
+| `new_entries` | 自动推送 (PushEntries) | `SendNewEntriesWebhookEvent(feed, entries)` | 包含 feed 信息 + 多个 entry |
+| `save_entry` | 手动保存 (SendEntry) | `SendSaveEntryWebhookEvent(entry)` | 仅单个 entry 信息 |
+
+**安全认证**:
+
+```go
+type Client struct { webhookURL, secret string }
+
+func (c *Client) sendWebhook(payload any, eventType string) error {
+    body, _ := json.Marshal(payload)
+
+    // HMAC-SHA256 签名
+    mac := hmac.New(sha256.New(), []byte(c.secret))
+    mac.Write(body)
+    signature := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+
+    req.Header.Set("X-Miniflux-Event-Type", eventType)
+    req.Header.Set("X-Miniflux-Signature", signature)
+}
+```
+
+接收方可以用共享密钥 (`WebhookSecret`) 验证 `X-Miniflux-Signature` 确保请求来自 Miniflux。
+
+### 18.6 集成配置模型
+
+**代码位置**: `internal/model/integration.go`（对应数据库 `integrations` 表）
+
+```
+integrations 表 (~100 列):
+  user_id (主键)
+
+  ├── 通知类 (PushEntries 自动触发):
+  │   ├── matrix_bot_enabled, matrix_bot_url, matrix_bot_user, matrix_bot_password, matrix_bot_chat_id
+  │   ├── webhook_enabled, webhook_url, webhook_secret
+  │   ├── ntfy_enabled, ntfy_url, ntfy_topic, ntfy_api_token, ntfy_username, ntfy_password, ntfy_icon_url
+  │   ├── apprise_enabled, apprise_url, apprise_services_url
+  │   ├── discord_enabled, discord_webhook_link
+  │   ├── slack_enabled, slack_webhook_link
+  │   ├── pushover_enabled, pushover_user, pushover_token, pushover_device, pushover_prefix
+  │   ├── telegram_bot_enabled, telegram_bot_token, telegram_bot_chat_id, telegram_bot_topic_id
+  │   └── telegram_bot_disable_web_page_preview, telegram_bot_disable_notification, telegram_bot_disable_buttons
+  │
+  ├── 稍后读/书签类 (SendEntry 手动触发 + 部分 PushEntries 自动):
+  │   ├── betula_enabled, betula_url, betula_token
+  │   ├── pinboard_enabled, pinboard_token, pinboard_tags, pinboard_mark_as_unread
+  │   ├── instapaper_enabled, instapaper_username, instapaper_password
+  │   ├── wallabag_enabled, wallabag_url, wallabag_client_id, wallabag_client_secret
+  │   │   └── wallabag_username, wallabag_password, wallabag_tags, wallabag_only_url
+  │   ├── notion_enabled, notion_token, notion_page_id
+  │   ├── readeck_enabled, readeck_url, readeck_api_key, readeck_labels, readeck_only_url
+  │   │   └── readeck_push_enabled (同时参与自动推送)
+  │   ├── readwise_enabled, readwise_api_key
+  │   ├── linkace_enabled, linkace_url, linkace_api_key, linkace_tags, linkace_private, linkace_check_disabled
+  │   ├── linkding_enabled, linkding_url, linkding_api_key, linkding_tags, linkding_mark_as_unread
+  │   ├── linktaco_enabled, linktaco_api_token, linktaco_org_slug, linktaco_tags, linktaco_visibility
+  │   ├── linkwarden_enabled, linkwarden_url, linkwarden_api_key, linkwarden_collection_id
+  │   ├── nunux_keeper_enabled, nunux_keeper_url, nunux_keeper_api_key
+  │   ├── omnivore_enabled, omnivore_api_key, omnivore_url
+  │   ├── karakeep_enabled, karakeep_api_key, karakeep_url, karakeep_tags
+  │   ├── raindrop_enabled, raindrop_token, raindrop_collection_id, raindrop_tags
+  │   ├── espial_enabled, espial_url, espial_api_key, espial_tags
+  │   ├── cubox_enabled, cubox_api_link
+  │   ├── shiori_enabled, shiori_url, shiori_username, shiori_password
+  │   ├── shaarli_enabled, shaarli_url, shaarli_api_secret
+  │   └── archiveorg_enabled
+  │
+  └── API 兼容类 (独立协议实现):
+      ├── fever_enabled, fever_username, fever_token (md5(username:password))
+      └── googlereader_enabled, googlereader_username, googlereader_password (bcrypt hash)
+```
+
+### 18.7 Feed 级 vs 用户级集成覆盖
+
+部分集成分成两级配置，Feed 级可覆盖用户级：
+
+| 集成 | 用户级配置 | Feed 级覆盖 | 覆盖字段 |
+|------|----------|-------------|----------|
+| Webhook | `WebhookURL` | `feed.WebhookURL` | URL |
+| Apprise | `AppriseServicesURL` | `feed.AppriseServiceURLs` | 服务 URL 列表 |
+| Ntfy | `NtfyTopic` | `feed.NtfyTopic` | Topic |
+| Ntfy | `NtfyEnabled` | `feed.NtfyEnabled` | 启用开关 |
+| Pushover | (全局配置) | `feed.PushoverEnabled`, `feed.PushoverPriority` | 开关 + 优先级 |
+
+### 18.8 推送数据流图
+
+```
+RefreshFeed 完成
+    │
+    ├── newEntries 非空?
+    │
+    └── integration.PushEntries(feed, newEntries, userIntegrations)
+          │
+          ├── 批量通知类 (一条 HTTP 请求)
+          │   ├── Matrix Bot → matrixbot.PushEntries
+          │   ├── Webhook     → webhook.SendNewEntriesWebhookEvent (HMAC-SHA256 签名)
+          │   ├── Discord     → discord.SendDiscordMsg
+          │   ├── Slack       → slack.SendSlackMsg
+          │   ├── Ntfy        → ntfy.SendMessages (需 feed.NtfyEnabled)
+          │   ├── Apprise     → apprise.SendNotification
+          │   └── Pushover    → pushover.SendMessages (需 feed.PushoverEnabled)
+          │
+          └── 逐条推送类 (每条目一条 HTTP 请求)
+              ├── TelegramBot → telegrambot.PushEntry (N 条)
+              └── Readeck Push → readeck.CreateBookmark (N 条, 需 ReadeckPushEnabled)
+
+用户点击"保存条目"按钮
+    │
+    └── integration.SendEntry(entry, userIntegrations)
+          │
+          ├── 稍后读类
+          │   ├── Instapaper  → instapaper.AddURL (HTTP Basic Auth)
+          │   ├── Wallabag    → wallabag.CreateEntry (OAuth2 password grant)
+          │   ├── Notion      → notion.UpdateDocument
+          │   ├── Readeck     → readeck.CreateBookmark
+          │   ├── Readwise    → readwise.CreateDocument
+          │   ├── Omnivore    → omnivore.SaveURL
+          │   └── Karakeep    → karakeep.SaveURL
+          │
+          ├── 书签类
+          │   ├── Pinboard    → pinboard.CreateBookmark (HTTP GET)
+          │   ├── LinkAce / Linkding / LinkTaco / Linkwarden
+          │   ├── Shaarli / Shiori / Espial / Raindrop
+          │   └── Cubox / Betula
+          │
+          ├── 归档类
+          │   └── archive.org → archiveorg.SendURL
+          │
+          └── Webhook (save_entry 事件)
+              └── webhook.SendSaveEntryWebhookEvent (HMAC-SHA256 签名)
+```
