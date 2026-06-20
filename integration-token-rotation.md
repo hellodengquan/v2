@@ -435,9 +435,9 @@ if err := client.CreateEntry(entry.URL, entry.Title, entry.Content); err != nil 
 
 ---
 
-## 七、深度拆解：refresh_token 过期后的降级路径
+## 五、深度拆解：refresh_token 过期后的降级路径
 
-### 7.1 代码事实：Miniflux 中不存在 refresh_token 的使用
+### 5.1 代码事实：Miniflux 中不存在 refresh_token 的使用
 
 在整个代码库中搜索 `refresh_token`/`refreshToken`/`RefreshToken`，结果仅有 3 处命中：
 
@@ -467,7 +467,7 @@ func (c *Client) getAccessToken() (string, error) {
 
 **不存在降级路径的原因：** `getAccessToken()` 的认证策略是 **"每次用密码重取"** 而非 "先用缓存 token → 401 则用 refresh_token → 再 401 则用密码"。这是一种单层扁平策略——无论 token 处于什么状态（有效、过期、被撤销），都直接走 `grant_type=password`。
 
-### 7.2 假设性推演：如果 refresh_token 被使用，过期后的降级应怎样？
+### 5.2 假设性推演：如果 refresh_token 被使用，过期后的降级应怎样？
 
 按照 OAuth2 标准流程（RFC 6749 §6），一个完整的降级路径应为：
 
@@ -488,7 +488,7 @@ func (c *Client) getAccessToken() (string, error) {
 
 **Miniflux 的实际代码直接跳到了降级链的中间**——它绕过了 access_token 缓存和 refresh_token 两个环节，每次都执行 `grant_type=password`。这等效于降级链的"最终回退"操作变成了常规操作。
 
-### 7.3 Wallabag 的 password grant 失败后的完整路径
+### 5.3 Wallabag 的 password grant 失败后的完整路径
 
 ```
 CreateEntry() → getAccessToken()
@@ -515,7 +515,7 @@ CreateEntry() → getAccessToken()
 
 **关键缺陷：** 当 `createEntry()` 返回 401 时（比如 token 在获取和使用之间被撤销，或者 Wallabag 服务端时钟偏移导致 token 立即过期），代码不会重新获取 token 后重试，而是直接失败。这是因为 `getAccessToken()` 和 `createEntry()` 是两个串行的独立步骤，中间没有重试循环。
 
-### 7.4 其他"类型 B"集成的等效分析
+### 5.4 其他"类型 B"集成的等效分析
 
 | 集成 | 认证方式 | refresh_token 概念 | 认证失败后的回退 |
 |---|---|---|---|
@@ -527,9 +527,9 @@ CreateEntry() → getAccessToken()
 
 ---
 
-## 八、深度拆解：多个第三方 Provider 串行调用时的失败隔离机制
+## 六、深度拆解：多个第三方 Provider 串行调用时的失败隔离机制
 
-### 8.1 Pocket 集成的历史与现状
+### 6.1 Pocket 集成的历史与现状
 
 Pocket 集成**已从代码库中移除**。数据库迁移记录了它的生命周期：
 
@@ -559,7 +559,7 @@ func(tx *sql.Tx) (err error) {
 
 Pocket 曾使用 OAuth2 流程获取 `pocket_access_token`（通过 `pocket_consumer_key`），但这个集成已经被完全移除。当前的 `model.Integration` 结构体和 `integration.go` 的 `SendEntry()`/`PushEntries()` 中均不包含任何 Pocket 相关代码。
 
-### 8.2 当前代码中的串行调用拓扑
+### 6.2 当前代码中的串行调用拓扑
 
 `SendEntry()` 和 `PushEntries()` 的调用拓扑是完全串行的、if-guard 隔离的：
 
@@ -589,7 +589,7 @@ PushEntries(feed, entries, userIntegrations)
         readeck.CreateBookmark()
 ```
 
-### 8.3 失败隔离机制的代码层分析
+### 6.3 失败隔离机制的代码层分析
 
 **隔离靠的是 if-guard + 独立 client 实例，不是 try-catch 或 circuit breaker。**
 
@@ -637,7 +637,7 @@ if userIntegrations.ReadeckPushEnabled { ... }
 
 4. **Telegram 内部循环的隔离**：Telegram 在 `PushEntries()` 中按 entry 逐条发送，一条发送失败不会中断其余条目的发送。但错误级别是 `slog.Error`（非 Warn），说明设计者认为单条推送失败值得记录。
 
-### 8.4 缺失的隔离机制
+### 6.4 缺失的隔离机制
 
 | 机制 | 是否存在 | 影响 |
 |---|---|---|
@@ -648,7 +648,7 @@ if userIntegrations.ReadeckPushEnabled { ... }
 | 集成间并发执行 | ❌ 不存在 | 所有启用的集成严格串行执行 |
 | 错误聚合与上报 | ❌ 不存在 | 错误仅分散在日志中，不回传给调用者 |
 
-### 8.5 以 Telegram 为例的具体失败场景
+### 6.5 以 Telegram 为例的具体失败场景
 
 Telegram Bot API 使用 `botToken` 直接嵌入 URL：`https://api.telegram.org/bot{token}/sendMessage`
 
@@ -678,9 +678,9 @@ Telegram 的 token 不会过期（bot token 是永久的），但如果 token �
 
 ---
 
-## 九、深度拆解：Token 持久化——加密密钥来源与轮换周期
+## 七、深度拆解：Token 持久化——加密密钥来源与轮换周期
 
-### 9.1 代码事实：Miniflux 不对存储的 Token 做应用层加密
+### 7.1 代码事实：Miniflux 不对存储的 Token 做应用层加密
 
 逐层排查整个加密与存储链路：
 
@@ -747,7 +747,7 @@ type Integration struct {
 
 没有 `Encrypted` 标签、没有自定义 `Scan()/Value()` 方法、没有 `sql.Scanner` 接口实现来做透明的加解密。
 
-### 9.2 唯一做了哈希处理的秘密：Web Session Secret
+### 7.2 唯一做了哈希处理的秘密：Web Session Secret
 
 ```go
 // model/web_session.go:70-76
@@ -768,7 +768,7 @@ func hashWebSessionSecret(secret string) []byte {
 
 Web Session 的 secret 用 SHA-256 哈希存储（`secret_hash` 列），这是**单向哈希**而非加密——不需要解密，只需验证。这与集成 token 的使用场景完全不同：集成 token 需要在每次调用时还原出明文传给第三方 API，所以不能做单向哈希。
 
-### 9.3 Google Reader 密码的存储方式：bcrypt
+### 7.3 Google Reader 密码的存储方式：bcrypt
 
 ```go
 // storage/integration.go:56-81
@@ -784,7 +784,7 @@ func (s *Storage) GoogleReaderUserCheckPassword(username, password string) error
 
 Google Reader 密码存储为 **bcrypt 哈希**——同样是单向的，只做验证不做还原。这是因为 Google Reader 认证是"用户提供密码，Miniflux 验证"模式，不需要还原明文。
 
-### 9.4 安全边界：依赖 PostgreSQL 和传输层
+### 7.4 安全边界：依赖 PostgreSQL 和传输层
 
 Miniflux 的 token 安全策略是**不在应用层做加密，而是依赖底层基础设施**：
 
@@ -811,7 +811,7 @@ func (c *configOptions) ConfigMap(redactSecret bool) []*optionPair {
 
 这只是防止 `ADMIN_PASSWORD`、`OAUTH2_CLIENT_SECRET` 等配置项在日志/调试输出中泄露，**不影响数据库中集成 token 的存储方式**。
 
-### 9.5 假如要实现 Token 加密，需要什么？
+### 7.5 假如要实现 Token 加密，需要什么？
 
 当前架构下，集成 token 必须以明文形式使用（调用第三方 API 时需要原始值），所以如果要做应用层加密，需要一个**对称加密方案**。然而代码中不存在任何这样的基础设施：
 
@@ -829,9 +829,285 @@ Miniflux 选择了**不在应用层加密 token** 的设计决策，把数据安
 - 没有 key rotation 的概念，因为没有 key
 - 如果需要加密，需要从零构建整套对称加密基础设施
 
-## 十、设计决策总结与潜在问题
+---
 
-### 10.1 为什么没有 Token 缓存和刷新？
+## 八、深度补全：AES-256 加密密钥的轮换周期——代码层面的最终确认
+
+### 8.1 彻底排查：代码库中不存在任何对称加密基础设施
+
+这是上一章结论的强化验证。从代码库的多个维度交叉确认：
+
+**维度一：Go 标准库 crypto/cipher 的使用——零命中**
+
+全库搜索 `cipher.NewGCM`、`aes.NewCipher`、`crypto/cipher`、`crypto/aes` 均返回零结果。没有任何文件 `import` 了这些包。
+
+**维度二：crypto 包的能力边界**
+
+`internal/crypto/crypto.go` 暴露的函数全部是单向操作或随机数生成：
+
+| 函数 | 类型 | 是否可逆 |
+|---|---|---|
+| `HashFromBytes` | FNV-1a 哈希 | ❌ 单向 |
+| `SHA256` | SHA-256 哈希 | ❌ 单向 |
+| `HashPassword` | bcrypt | ❌ 单向 |
+| `GenerateSHA256Hmac` | HMAC 签名 | ❌ 单向（但可验证） |
+| `GenerateRandomBytes` / `GenerateRandomStringHex` | 随机数生成 | N/A |
+| `GenerateUUID` | UUID v4 生成 | N/A |
+| `ConstantTimeCmp` | 常量时间比较 | N/A |
+
+**维度三：配置项中不存在任何加密密钥相关选项**
+
+`internal/config/options.go` 中所有 `secret: true` 的配置项如下：
+
+| 配置项 | 用途 |
+|---|---|
+| `ADMIN_PASSWORD` | 初始管理员密码 |
+| `DATABASE_URL` | 数据库连接串（可能含密码） |
+| `AUTH_PROXY_HEADER_SECRET` | Auth Proxy 的 Header 签名密钥 |
+| `OAUTH2_CLIENT_SECRET` | OAuth2 客户端密钥 |
+| `HTTPS_CERT_FILE` / `HTTPS_KEY_FILE` | TLS 证书和私钥路径 |
+| `WEB_PASSPHRASE` | WebAuthn 相关 |
+
+**没有任何 `ENCRYPTION_KEY`/`DATA_KEY`/`SECRET_KEY` 之类的配置项。** 连配置的基础设施都不存在，更不用说密钥轮换了。
+
+**维度四：数据库存储层的明文证据**
+
+`storage/integration.go:376-636` 的 `UpdateIntegration()` 中，22 个集成的所有 token/secret/password 字段都是直接以 Go `string` 类型传入 `db.Exec()` 的参数，中间没有任何 `encrypt()` / `cipher.Encrypt()` 包装。对应的 `Integration()` 读取函数也对称地直接 `Scan()` 为 `string`。
+
+### 8.2 结论：密钥轮换周期 = 不存在（无密钥则无轮换）
+
+从代码层面可以 100% 确认：
+
+1. **没有加密密钥** — 不存在任何对称加密的主密钥（KEK）或数据密钥（DEK）
+2. **没有加密函数** — 没有 AES-256-GCM、AES-CBC 等对称加密的调用
+3. **没有密钥来源** — 没有从环境变量、文件、HSM、KMS 读取密钥的逻辑
+4. **没有轮换机制** — 没有调度任务、没有 API 端点、没有手动命令来轮换任何加密密钥
+5. **没有加密版本号或盐值字段** — 数据库 schema 中不存在 `encryption_version`、`key_id`、`salt` 等字段
+
+**因此"密钥轮换周期"这个问题的前提就不成立**——Miniflux 在应用层不加密任何数据，也就不存在密钥及其轮换。所有敏感 token 以明文形式存储在 PostgreSQL 的 `integrations` 表中，安全边界完全由 PostgreSQL 的访问控制（`pg_hba.conf`、角色权限）和连接加密（`sslmode`）提供。
+
+---
+
+## 九、深度补全：Mastodon / Pleroma（ActivityPub）Provider 的存在性与隔离路径
+
+### 9.1 代码事实：Mastodon、Pleroma、ActivityPub 均不存在
+
+全库搜索 `mastodon`、`pleroma`、`activitypub` 三个关键词，**结果为零命中**（不区分大小写）。
+
+进一步交叉验证：
+
+- `model/integration.go` 的 `Integration` 结构体中没有 Mastodon/Pleroma 相关字段
+- `storage/integration.go` 的 SQL 读写中没有 Mastodon/Pleroma 列
+- `integration/integration.go` 的 `SendEntry()`/`PushEntries()` 中没有 Mastodon/Pleroma 的调用分支
+- `database/migrations.go` 中没有 Mastodon/Pleroma 相关的 DDL 迁移记录
+- `internal/integration/` 目录下没有 `mastodon/` 或 `pleroma/` 子目录
+- `internal/oauth2/manager.go` 的 `NewManager()` 只接受 `"oidc"` 和 `"google"` 两个 provider
+
+**Mastodon 和 Pleroma 在这个版本的 Miniflux 中完全不存在。**
+
+### 9.2 关于 errgroup 隔离路径的澄清
+
+用户提到"errgroup 隔离路径"——但代码库中**同样不存在 `golang.org/x/sync/errgroup` 或任何并发隔离框架**。全库搜索 `errgroup`、`ErrGroup`、`semaphore` 均返回零结果。
+
+实际的并发模型非常简单：
+
+```go
+// entry_save.go:36 — 手动保存
+go integration.SendEntry(entry, userIntegrations)
+
+// handler.go:338 — 自动推送
+go integration.PushEntries(originalFeed, newEntries, userIntegrations)
+```
+
+这是**裸 goroutine**，没有 WaitGroup、没有 errgroup、没有 context 取消、没有 panic recovery（goroutine 内部 panic 会导致整个进程崩溃）。每个 `SendEntry`/`PushEntries` 调用启动一个独立的 goroutine，goroutine 内部的多个 provider 调用仍是**纯串行**：
+
+```
+goroutine (SendEntry)
+  ├── Betula.CreateBookmark()   — 串行 1
+  ├── Pinboard.CreateBookmark() — 串行 2
+  ├── Instapaper.AddURL()       — 串行 3
+  ├── Wallabag.CreateEntry()    — 串行 4
+  └── ... (共 22 个)
+```
+
+**失败隔离完全靠 if-guard + 吞掉错误**，不靠任何并发框架。这一点在第六章已有详细分析。
+
+### 9.3 如果未来要接入 Mastodon/Pleroma，会是什么路径？
+
+虽然代码中不存在，但可以基于现有模式推演：
+
+Mastodon/Pleroma 都是 ActivityPub 协议实现，其 API 认证通常使用 **OAuth2 Authorization Code + Bearer Token**。如果接入，大概率会走"类型 A"（静态 Bearer Token，用户在 UI 中填入 `access_token`）或"类型 B"（每次用 client credentials 换取 token）的模式。其隔离路径会和现有 22 个集成完全一致：
+
+```go
+// 假设未来的实现
+if userIntegrations.MastodonEnabled {
+    if err := mastodon.CreatePost(entry.URL, entry.Title); err != nil {
+        slog.Error("Unable to send entry to Mastodon", ...)
+        // 错误被吞掉，继续下一个集成
+    }
+}
+// 后续 Readeck、Telegram 等不受影响
+```
+
+---
+
+## 十、深度补全：refresh_token 过期后登录页跳转在 Provider 禁用时的触发条件
+
+### 10.1 问题拆解：两个独立的概念
+
+需要明确区分：
+
+1. **refresh_token 过期** — 属于第三方 OAuth2 provider（如 Google、OIDC）管理的 token 生命周期
+2. **Miniflux 登录页跳转** — 属于 Miniflux 自身 Web Session 失效后的行为
+
+这两者在 Miniflux 中**没有任何关联**，因为 Miniflux **不保存 OAuth2 的 access_token 和 refresh_token**（见第一章第 6 节和第五章）。OAuth2 仅用于"首次身份验证"——用户通过 OAuth2 provider 授权后，Miniflux 获取用户 profile，然后创建/绑定本地用户，之后认证完全依赖 Miniflux 自己的 Web Session。
+
+### 10.2 登录页跳转的真实触发条件
+
+登录页跳转的唯一触发点在 `web_session_middleware.go:52-55`：
+
+```go
+if !request.IsAuthenticated(r) && !isPublicRoute(r) {
+    response.HTMLRedirect(w, r, loginRedirectURL(m.basePath, r.RequestURI))
+    return
+}
+```
+
+展开这个条件：
+
+```
+触发跳转 = (未认证) AND (非公开路由)
+```
+
+其中 `request.IsAuthenticated()` 的判断链路是：
+
+```go
+// http/request/context.go:48-58
+func IsAuthenticated(r *http.Request) bool {
+    if getContextBoolValue(r, IsAuthenticatedContextKey) {
+        return true
+    }
+    if session := WebSession(r); session != nil {
+        return session.IsAuthenticated()  // session.UserID() 是否非零
+    }
+    return false
+}
+```
+
+**登录页跳转与 OAuth2 provider 的状态完全无关。** 只看 Web Session 是否绑定了用户。
+
+### 10.3 Web Session 失效导致跳转的场景
+
+Session 失效有以下几种路径：
+
+| 场景 | 触发点 | 结果 |
+|---|---|---|
+| **Cookie 不存在** | 首次访问 / 手动清除 Cookie | `loadWebSessionFromCookie()` → nil → 创建新 session → 未认证 → 跳转登录页 |
+| **Cookie 格式错误** | Cookie 被篡改，不含 `.` 分隔符 | `strings.Cut()` 失败 → nil → 同上 |
+| **Session ID 数据库查不到** | 定时清理任务删除了过期 session | `WebSessionByID()` → nil → 创建新 session → 跳转 |
+| **Secret 验证失败** | Secret 被篡改 / 数据库中 SecretHash 不匹配 | `!session.VerifySecret(secret)` → nil → 同上 |
+| **Session 未绑定用户** | session 存在但 UserID 为 0（匿名 session） | `session.IsAuthenticated()` → false → 跳转 |
+
+**没有任何一条路径会检查 OAuth2 provider 是否禁用。**
+
+### 10.4 Provider 禁用时的行为分析
+
+**OAuth2 Provider 禁用**指的是将 `OAUTH2_PROVIDER` 环境变量从 `"google"` 或 `"oidc"` 改为空值（或删除该变量）。
+
+禁用后，系统的行为分两层：
+
+**第一层：登录页 UI 的变化**
+
+```html
+<!-- templates/views/login.html:47-55 -->
+{{ if hasOAuth2Provider "google" }}
+    <a class="oauth2-login-button" href="{{ route "oauth2Redirect" "provider" "google" }}">
+        Sign in with Google
+    </a>
+{{ else if hasOAuth2Provider "oidc" }}
+    <a class="oauth2-login-button" href="{{ route "oauth2Redirect" "provider" "oidc" }}">
+        Sign in with {{ oauth2ProviderName }}
+    </a>
+{{ end }}
+```
+
+`hasOAuth2Provider` 模板函数检查的是 `config.Opts.OAuth2Provider()` 的值。provider 被禁用后，登录页的"Sign in with Google/OIDC"按钮消失。
+
+**第二层：OAuth2 路由的显式拒绝**
+
+即使按钮消失，用户仍可能手动构造 URL 访问 `/oauth2/{provider}/redirect` 和 `/oauth2/{provider}/callback`。这两个路由的处理逻辑是：
+
+```go
+// oauth2_redirect.go:23-31
+authProvider, err := getOAuth2Manager(r.Context()).FindProvider(provider)
+if err != nil {
+    slog.Error("Unable to initialize OAuth2 provider", ...)
+    response.HTMLRedirect(w, r, h.routePath("/"))   // ← 重定向到首页
+    return
+}
+
+// oauth2_callback.go:49-57 — 同样的逻辑
+authProvider, err := getOAuth2Manager(r.Context()).FindProvider(provider)
+if err != nil {
+    slog.Error("Unable to initialize OAuth2 provider", ...)
+    response.HTMLRedirect(w, r, h.routePath("/"))   // ← 重定向到首页
+    return
+}
+```
+
+关键代码在 `oauth2/manager.go:34-56` 的 `NewManager()`：
+
+```go
+func NewManager(ctx context.Context, provider, ...) *Manager {
+    m := &Manager{providers: make(map[string]Provider)}
+    switch provider {
+    case "oidc":
+        m.AddProvider("oidc", oidcProvider)
+    case "google":
+        m.AddProvider("google", NewGoogleProvider(...))
+    default:
+        slog.Error("Unsupported OAuth2 provider", ...)
+        // ← provider 为空或不支持时，providers map 是空的
+    }
+    return m
+}
+```
+
+当 `OAUTH2_PROVIDER` 为空时，`providers` map 中没有任何条目，`FindProvider()` 返回 `"oauth2 provider not found"` 错误，然后 `/redirect` 和 `/callback` 都会重定向到首页（`/`）。
+
+**但注意：首页 `/` 是公开路由**（见 `routes.go:39`），不会触发登录页跳转。
+
+### 10.5 综合场景推演：Session 过期 + Provider 已禁用
+
+| 步骤 | 行为 | 代码依据 |
+|---|---|---|
+| 1. 用户有有效 session，Provider 被禁用 | 不受影响，正常使用 | session 认证不依赖 OAuth2 |
+| 2. 用户 session 被清理（过期/手动 flush） | 用户访问 `/unread` → WebSessionByID() → nil → 创建新 session → 未认证且非公开路由 → 302 到 `/`?redirect_url=/unread | `web_session_middleware.go:52-55` |
+| 3. 浏览器加载 `/`（登录页） | 展示用户名密码表单，**不展示 OAuth2 登录按钮** | `login.html:47-55` |
+| 4. 用户尝试手动访问 `/oauth2/google/redirect` | Manager.FindProvider() → error → 302 到 `/` | `oauth2_redirect.go:23-31` |
+| 5. 用户之前 bookmark 了 OAuth2 callback URL，直接访问 `/oauth2/google/callback?code=xxx&state=xxx` | Manager.FindProvider() → error → 302 到 `/` | `oauth2_callback.go:49-57` |
+| 6. 如果同时禁用了本地登录（`DISABLE_LOCAL_AUTH=1`） | 登录页只有 WebAuthn 选项；如果用户也没设 WebAuthn，将无法登录 | `login.html` 模板逻辑 |
+
+**关键结论：Provider 禁用不会触发登录页跳转**——触发跳转的是 Session 失效。Provider 禁用只影响登录页上 OAuth2 按钮的显示和 OAuth2 路由的可用性。Session 失效后，用户会被重定向到登录页，然后发现 OAuth2 登录方式不可用，只能用用户名密码或 WebAuthn（如果启用）。
+
+### 10.6 关于 OAuth2 Unlink 的保护
+
+还有一个相关场景：用户已经通过 OAuth2 绑定了账号，现在想在 Settings 页面 Unlink。
+
+```go
+// oauth2_unlink.go:17-23
+if config.Opts.DisableLocalAuth() {
+    slog.Warn("blocking oauth2 unlink attempt, local auth is disabled", ...)
+    response.HTMLRedirect(w, r, h.routePath("/"))
+    return
+}
+```
+
+此外还检查用户是否有密码（`hasPassword`），没有密码则不允许 unlink。这防止了用户在唯一的登录方式是 OAuth2 的情况下解绑后无法登录。但这个保护与"登录页跳转"是两个独立的安全机制。
+
+## 十一、设计决策总结与潜在问题
+
+### 11.1 为什么没有 Token 缓存和刷新？
 
 Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每次请求都重新获取 token（类型 B）或本地生成 token（类型 C）。这带来了：
 
@@ -845,7 +1121,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 - 对第三方服务造成不必要的认证负载（特别是 Matrix 的设备注册问题）
 - Wallabag 集成忽略了 refresh_token，无法利用 OAuth2 的标准刷新机制
 
-### 10.2 潜在问题
+### 11.2 潜在问题
 
 1. **Wallabag 的 `grant_type=password`**：OAuth2 规范中，Resource Owner Password Grant 已被废弃（RFC 6819），且每次都走密码授权而非 refresh_token，既不安全也不高效
 2. **Matrix 设备累积**：每次推送都通过 `m.login.password` 登录，Matrix 服务端会为每次登录创建一个新的 device session，长期运行可能产生大量设备
@@ -853,7 +1129,7 @@ Miniflux 的第三方集成采用了一种**"无状态"的认证策略**：每�
 4. **无集成健康状态**：Token 失效不会反馈到 UI，用户无法感知集成是否正常工作
 5. **Ntfy 的认证优先级**：当 API Token 和用户名密码同时设置时，两者都会被加到请求头，而非互斥回退
 
-### 10.3 与 Web Session 轮换的对比
+### 11.3 与 Web Session 轮换的对比
 
 Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"防 session fixation 的机制，但它也缺少：
 - 滚动续期（每次活跃使用时延长有效期）
@@ -862,7 +1138,7 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 
 ---
 
-## 十一、代码文件索引
+## 十二、代码文件索引
 
 | 文件路径 | 作用 |
 |---|---|
@@ -898,3 +1174,11 @@ Web Session 的轮换是 Miniflux 中唯一实现了"认证后替换标识符"�
 | `internal/database/migrations.go` | 数据库迁移（含 Pocket 集成的添加与删除） |
 | `internal/ui/entry_save.go` | 手动保存条目入口（go SendEntry） |
 | `internal/reader/handler/handler.go` | Feed 刷新时推送入口（go PushEntries） |
+| `internal/ui/routes.go` | 路由定义、公开路由判定、登录跳转 URL 构建 |
+| `internal/ui/login_show.go` | 登录页渲染（已认证用户重定向） |
+| `internal/ui/oauth2_unlink.go` | OAuth2 账号解绑（含禁用本地登录保护） |
+| `internal/http/request/context.go` | IsAuthenticated()、UserID() 等上下文辅助函数 |
+| `internal/config/options.go` | 配置项（含所有 secret 标记的配置项列表） |
+| `internal/config/parser.go` | 配置解析（含 OAUTH2_PROVIDER 校验） |
+| `internal/template/functions.go` | 模板函数 hasOAuth2Provider |
+| `internal/template/templates/views/login.html` | 登录页模板（OAuth2 按钮显隐逻辑） |
