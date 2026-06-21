@@ -61,25 +61,79 @@ config.Opts, err = cfg.ParseEnvironmentVariables()     // cli.go:89
 
 **覆盖规则**：后加载者覆盖前者。最终优先级 = **环境变量 > 配置文件 > 默认值**。
 
-### 2.2 覆盖机制实现细节
+### 2.2 覆盖机制实现细节：空字符串为何不覆盖
 
-代码位置：`internal/config/parser.go:163-240` `parseLine()`
+代码位置：`internal/config/parser.go:163-240` `parseLine()` + 各类型 `parseXxxValue()` 函数
 
-所有解析函数都使用 "新值非空则覆盖，否则保留旧值" 模式，例如：
+#### 完整调用链（以 string 类型为例）
+
+```
+环境变量 "LOG_FILE=" (空值) 进入 parseLines()
+    │
+    └─ parseLine("LOG_FILE", "")            parser.go:163
+         │
+         ├─ 1. 查表: options["LOG_FILE"] 存在，valueType = stringType
+         ├─ 2. validator (如有) 通过
+         └─ 3. switch valueType → stringType 分支:
+              │
+              └─ field.parsedStringValue = parseStringValue("", field.parsedStringValue)
+                        │                               ↑
+                        │                        这是当前已有的值（来自默认值或配置文件）
+                        │
+                        └─ parseStringValue("" , "stderr")
+                             │
+                             └─ if "" == "" → return "stderr"  ← 原值不变！
+```
+
+#### 各类型对空值的判定逻辑
+
+| 类型 | 解析函数 | 空值判定条件 | 行为 |
+|------|---------|-------------|------|
+| `stringType` | `parseStringValue` | `value == ""` | 返回 fallback，不覆盖 |
+| `stringListType` | `parseStringListValue` | `value == ""` | 返回 fallback，不覆盖 |
+| `boolType` | `parseBoolValue` | `value == ""` | 返回 fallback，不覆盖（注意 bool 设为空字符串不等价于 false） |
+| `intType` | `parseIntValue` | `value == ""` **或** `strconv.Atoi` 失败 | 返回 fallback，不覆盖（"0" 是合法值，会覆盖为 0） |
+| `int64Type` | `ParsedInt64Value` | 同上 | 同上 |
+| `secondType/minuteType/hourType/dayType` | `parseDurationValue` | `value == ""` **或** `strconv.Atoi` 失败 | 返回 fallback，不覆盖 |
+| `urlType` | `parseURLValue` | `value == ""` | 返回 fallback，不覆盖 |
+| `secretFileType` | `readSecretFileValue` | 文件内容 `TrimSpace` 后 `== ""` | **报错**（不静默，区别于其他类型） |
+| `bytesType` | 内联在 parseLine | `value == ""` | 跳过赋值，保持原值 |
+
+**测试验证**（见 `parser_test.go` 和 `options_parsing_test.go`）：
 
 ```go
-func parseStringValue(value string, fallback string) string {
-    if value == "" {
-        return fallback  // 空值不覆盖，保留上一层（默认/配置文件）的值
+// parser_test.go:21-25
+result := parseStringValue("", "fallback")
+// result == "fallback" ✅
+
+// options_parsing_test.go:368-381
+os.Setenv("LOG_FILE", "")          // 环境变量设为空字符串
+configParser.ParseEnvironmentVariables()
+configOptions.LogFile() == "stderr"  // 仍为默认值 ✅
+```
+
+**特别注意 `intType` 的"伪覆盖"陷阱**：
+- `parseIntValue("0", 42)` → 返回 **0**（覆盖成功，"0" 不是空）
+- `parseIntValue("", 42)` → 返回 **42**（不覆盖）
+- `parseIntValue("invalid", 42)` → 返回 **42**（解析失败也不覆盖，无报错）
+
+这意味着如果想把 `BATCH_SIZE` 设为 0（虽然不合法，但在边界校验之前），必须显式写 `BATCH_SIZE=0`，而不是 `BATCH_SIZE=`。
+
+#### 未知键的处理
+
+`parseLine()` 开头（`parser.go:164-171`）：
+```go
+field, exists := cp.options.options[key]
+if !exists {
+    if key == "FILTER_ENTRY_MAX_AGE_DAYS" {
+        slog.Warn("Configuration option FILTER_ENTRY_MAX_AGE_DAYS is deprecated...")
     }
-    return value
+    // 其他未知键：静默忽略，直接 return nil
+    return nil
 }
 ```
 
-这意味着：
-- 在配置文件里写 `DATABASE_URL=`（空字符串）→ **不会** 覆盖默认值
-- 在环境变量里 `export DATABASE_URL=` → 同样不会覆盖，行为一致
-- 未知键被**静默忽略**（parser.go:164-171），不会因无关环境变量报错
+即：系统里无关的环境变量（如 `PATH`、`HOME`、`SHELL`）会被完全忽略，不会污染配置也不会报错。只有 `FILTER_ENTRY_MAX_AGE_DAYS` 这一个已废弃键会打警告日志。
 
 ### 2.3 `_FILE` 后缀的密钥注入机制
 
@@ -145,32 +199,128 @@ if err := store.Ping(); err != nil { ... }   // cli.go:170-172
 
 两种方式调用的是同一个函数。
 
-### 3.3 Migrate() 内部逻辑
+### 3.3 Migrate() 内部逻辑与 Schema 版本对照
 
-代码位置：`internal/database/migrations.go:13-51`
+代码位置：`internal/database/migrations.go` + `internal/database/database.go:13-61`
+
+#### 重要前置说明：Miniflux 的迁移组织方式
+
+很多项目用 `migrations/001_xxx.sql`、`migrations/002_xxx.sql` 这样的独立 SQL 文件，通过文件名前缀的数字与 schema_version 对照。**Miniflux 不采用这种模式**——所有迁移 SQL 都内联在 Go 代码的 `migrations` 数组中：
+
+```go
+// migrations.go:13-16
+var schemaVersion = len(migrations)  // 当前代码期望的目标版本 = 数组长度
+
+var migrations = [...]func(tx *sql.Tx) error{
+    func(tx *sql.Tx) (err error) {   // migrations[0]  ← version 0 → 执行后变为 v1
+        sql := `CREATE TABLE schema_version (...); CREATE TABLE users (...); ...`
+        _, err = tx.Exec(sql)
+        return err
+    },
+    func(tx *sql.Tx) (err error) {   // migrations[1]  ← version 1 → 执行后变为 v2
+        ...
+    },
+    // ... 依次追加，新增迁移必须放在数组末尾
+}
+```
+
+因此：**不存在 "migration 文件名与版本号的匹配校验"**——因为根本没有文件。版本号就是数组下标，对照关系是硬编码的数组顺序。
+
+#### 版本号对照关系详解
+
+```
+数据库 schema_version 表的值    migrations 数组下标      执行操作
+────────────────────────────   ────────────────────   ─────────────
+             0              →   不执行任何迁移         （不可能的状态，除非手动篡改）
+             1              →   migrations[1..N]      （从第 2 个迁移开始跑）
+            ...
+             v              →   migrations[v .. N-1]  （执行 v 到 N-1 之间所有迁移）
+             N              →   不执行（已是最新）
+```
+
+注意这个容易混淆的 off-by-one：
+- `migrations[0]` 执行完成后，`schema_version` 被写入 **1**（不是 0）
+- 数据库当前版本 `v` 表示 "已经执行完 `migrations[0]` 到 `migrations[v-1]`"
+- 需要从 `migrations[v]` 开始继续执行
+
+#### Migrate() 完整执行流程
 
 ```go
 func Migrate(db *sql.DB) error {
     var currentVersion int
+    // ── Step 1: 读当前版本 ──────────────────────────────────────
     db.QueryRow(`SELECT version FROM schema_version`).Scan(&currentVersion)
-    // 注意：这里没有检查 Scan 错误！
-    // 首次安装（无 schema_version 表）时 Scan 返回 error，currentVersion=0
-    // 刚好 migrations[0] 就是 CREATE TABLE schema_version + 所有初始表
+    // ↑ 刻意忽略 Scan 错误
+    //   - 如果表存在 → currentVersion = 表中的整数值
+    //   - 如果表不存在 → Scan 返回 sql.ErrNoRows，currentVersion 保持零值 0
+    //   - 如果是纯空库（连 PostgreSQL 本身都没 schema）→ 也会出错 → currentVersion=0
+    //
+    //   刚好 migrations[0] 就是 "CREATE TABLE schema_version + 建所有初始表"，
+    //   所以 currentVersion=0 时从 migrations[0] 开始跑，恰好完成首次初始化。
+    //   这是整个迁移系统的核心隐式约定。
 
+    slog.Info("Running database migrations",
+        slog.Int("current_version", currentVersion),
+        slog.Int("latest_version", schemaVersion),
+    )
+
+    // ── Step 2: 逐个执行缺失迁移 ────────────────────────────────
     for version := currentVersion; version < schemaVersion; version++ {
-        tx, _ := db.Begin()
-        migrations[version](tx)    // 执行第 version+1 号迁移
+        newVersion := version + 1
+
+        tx, err := db.Begin()   // 每个迁移独立事务
+        if err != nil { return ... }
+
+        if err := migrations[version](tx); err != nil {
+            tx.Rollback()       // 出错回滚，不污染后续迁移
+            return fmt.Errorf("[Migration v%d] %v", newVersion, err)
+        }
+
+        // ── Step 3: 更新 schema_version 表 ─────────────────────
+        // 先清空（表里永远只有一行），再插入新版本号
         tx.Exec(`TRUNCATE schema_version`)
-        tx.Exec(`INSERT INTO schema_version (version) VALUES ($1)`, version+1)
-        tx.Commit()
+        tx.Exec(`INSERT INTO schema_version (version) VALUES ($1)`, newVersion)
+        // ↑ 注意：schema_version 的 version 列定义是 text 类型，
+        //   但插入和查询都用整数——PostgreSQL 会自动做类型转换。
+        //   migrations[0] 建表时写的是 "version text not null"，
+        //   这是早期设计遗留，但因两边都走 int↔text 隐式转换，工作正常。
+
+        if err := tx.Commit(); err != nil {
+            return fmt.Errorf("[Migration v%d] %v", newVersion, err)
+        }
     }
+
+    return nil
 }
 ```
 
-**关键特性**：
-- 迁移 ID = `migrations` 数组下标，**从 0 开始**，`schemaVersion = len(migrations)`
-- 每个版本在**独立事务**中执行；任何一步失败会 Rollback 并返回错误，**不会继续后续迁移**
-- 首次安装（schema_version 不存在）：`Scan` 返回 `sql.ErrNoRows`，但代码忽略错误，`currentVersion=0`，恰好从第 0 个迁移（建表）开始，**这是设计上的隐式约定**
+**关键特性总结**：
+1. **迁移 ID = 数组下标**：从 0 开始，连续递增，没有分支、没有时间戳命名
+2. **事务隔离**：每个版本一个独立事务；失败即 Rollback，不会留下半执行状态
+3. **幂等执行**：如果版本已是最新，循环体一次都不会跑，直接返回
+4. **首次安装的隐式约定**：`schema_version` 表不存在 → `Scan` 出错被忽略 → `currentVersion=0` → 从 `migrations[0]` 开始（建表），恰好闭环
+5. **没有文件名校验/排序逻辑**：因为不使用外部 SQL 文件，`migrations` 数组的声明顺序就是唯一的执行顺序来源；如果有人在数组中间插入新迁移而非追加末尾，就会导致版本号错位，已升级到 v57 的数据库会重新执行被插入位置之后的迁移（从而出现 "relation already exists" 错误）。这就是代码注释 "Order is important. Add new migrations at the end of the list." 的原因。
+
+#### schema_version 表的类型细节（易被忽略）
+
+`migrations[0]` 建表 DDL：
+```sql
+CREATE TABLE schema_version (
+    version text not null   -- 注意：是 TEXT，不是 INTEGER
+);
+```
+
+但读写时都用整数：
+```go
+// 读：Scan 到 int 变量
+var currentVersion int
+db.QueryRow(`SELECT version FROM schema_version`).Scan(&currentVersion)
+
+// 写：用 $1 占位符传 int
+tx.Exec(`INSERT INTO schema_version (version) VALUES ($1)`, newVersion)
+```
+
+依赖 PostgreSQL 的隐式类型转换（int → text 写入，text → int 读出）。虽然能工作，但如果表里手动写入了非数字字符串（如 `abc`），`Scan` 会失败，`currentVersion=0`，导致从 `migrations[0]` 重新开始执行（会出现一堆 "relation already exists" 错误）。生产环境不要手动改 `schema_version` 表。
 
 ### 3.4 Schema 一致性守门检查
 
