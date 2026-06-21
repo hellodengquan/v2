@@ -780,3 +780,300 @@ for _, category := range categories {
 | 分类列表页 | 2 个分类都能看到 | 分类列表不过滤 hide_globally |
 | 进入"摸鱼"分类 | 7 条未读（5+2） | 分类详情页显示所有内容 |
 | 其他用户 | 0 条 | 完全不可见 |
+
+---
+
+## 十二、分类删除时的级联处理
+
+### 12.1 核心前提：没有"已订阅用户"的概念
+
+首先需要再次强调：**Miniflux 中每个用户的 feed 都是独立副本**，不存在"多个用户订阅同一个 feed 实例"的情况。
+
+当用户 A 导入一个 feed 时，会在 `feeds` 表创建一条属于 A 的记录；用户 B 导入同一个 feed URL 时，会创建另一条独立的属于 B 的记录。两者除了 URL 相同外，没有任何关联。
+
+因此，"分类被删除时已订阅用户的级联处理"这个问题的答案是：**不存在跨用户影响，每个用户的数据完全隔离**。
+
+### 12.2 两种删除策略
+
+代码中提供了两种删除分类的方式，行为差异很大：
+
+#### 12.2.1 RemoveCategory：直接删除 + 数据库级联清理
+
+文件：`internal/storage/category.go:224-242`
+
+```go
+func (s *Storage) RemoveCategory(userID, categoryID int64) error {
+    query := `DELETE FROM categories WHERE id = $1 AND user_id = $2`
+    result, err := s.db.Exec(query, categoryID, userID)
+    // ...
+}
+```
+
+**工作原理**：
+- 直接执行 `DELETE FROM categories`
+- 依赖数据库外键约束 `ON DELETE CASCADE` 自动清理
+- 整个过程**没有显式事务**，由数据库保证原子性
+
+**级联清理路径**（由数据库自动完成）：
+
+```
+删除 categories 记录
+    ↓  ON DELETE CASCADE (feeds.category_id → categories.id)
+删除该分类下的所有 feeds 记录
+    ↓  ON DELETE CASCADE (entries.feed_id → feeds.id)
+删除这些 feed 下的所有 entries 记录
+    ↓  ON DELETE CASCADE (enclosures.entry_id → entries.id)
+删除这些 entry 下的所有 enclosures 记录
+    ↓  ON DELETE CASCADE (feed_icons.feed_id → feeds.id)
+删除这些 feed 的图标关联
+```
+
+**数据库约束定义**（`internal/database/migrations.go:56-72`）：
+
+```sql
+CREATE TABLE feeds (
+    -- ...
+    foreign key (user_id) references users(id) on delete cascade,
+    foreign key (category_id) references categories(id) on delete cascade
+);
+
+CREATE TABLE entries (
+    -- ...
+    foreign key (feed_id) references feeds(id) on delete cascade
+);
+```
+
+**调用者**：
+- Web UI：`internal/ui/category_remove.go:32`
+- REST API：`internal/api/category_handlers.go:149`
+
+**结果**：分类和其下的所有 feed、entry、enclosure 都被**物理删除**，不保留任何副本。
+
+#### 12.2.2 RemoveAndReplaceCategoriesByName：移动 feed 后再删除
+
+文件：`internal/storage/category.go:244-290`
+
+```go
+func (s *Storage) RemoveAndReplaceCategoriesByName(userid int64, titles []string) error {
+    tx, err := s.db.Begin()
+    // 1. 检查删除后至少保留 1 个分类
+    // 2. 将待删除分类下的 feed 移到用户的第一个分类
+    // 3. 删除分类
+    tx.Commit()
+}
+```
+
+**完整执行流程**（在一个事务内）：
+
+1. **检查至少保留一个分类**：
+   ```sql
+   SELECT count(*) FROM categories WHERE user_id = $1 and title != ANY($2)
+   ```
+   如果剩余分类数 < 1，回滚事务并返回错误。
+
+2. **移动 feed 到第一个剩余分类**：
+   ```sql
+   WITH d_cats AS (SELECT id FROM categories WHERE user_id = $1 AND title = ANY($2))
+   UPDATE feeds
+   SET category_id = (
+       SELECT id FROM categories
+       WHERE user_id = $1 AND id NOT IN (SELECT id FROM d_cats)
+       ORDER BY title ASC LIMIT 1
+   )
+   WHERE user_id = $1 AND category_id IN (SELECT id FROM d_cats)
+   ```
+
+3. **删除分类**：
+   ```sql
+   DELETE FROM categories WHERE user_id = $1 AND title = ANY($2)
+   ```
+
+4. **提交事务**
+
+**调用者**：
+- Google Reader API：`internal/googlereader/handler.go:768`（删除标签时调用）
+
+**结果**：feed 被**保留**，只是移动到其他分类；分类本身被删除。
+
+### 12.3 两种策略对比
+
+| 维度 | RemoveCategory | RemoveAndReplaceCategoriesByName |
+|------|---------------|----------------------------------|
+| 事务 | 无（依赖数据库） | 显式事务包裹整个操作 |
+| feed 处理 | 级联删除 | 移动到第一个剩余分类 |
+| entry 处理 | 级联删除 | 保留（随 feed 移动） |
+| 调用方 | Web UI / REST API | Google Reader API |
+| 数据丢失 | 完全丢失 | 不丢失 |
+| 适用场景 | 用户主动删除分类 | 删除标签时保留订阅 |
+
+### 12.4 关键结论
+
+1. **不存在跨用户级联**：删除分类只会影响当前用户的数据，其他用户完全不受影响
+2. **UI 删除是硬删除**：通过 Web UI 或 REST API 删除分类会级联删除该分类下的所有 feed 和 entry
+3. **Google Reader API 删除是软移动**：删除标签会将 feed 移到其他分类，保留数据
+4. **数据库级联是可靠保障**：所有级联删除由数据库外键约束保证，不会出现 orphan 记录
+
+---
+
+## 十三、订阅同步的事务边界
+
+订阅同步（主要是 OPML 导入/导出）的事务处理比较分散，没有统一的大事务。以下是各环节的事务边界梳理：
+
+### 13.1 OPML 导出：无事务
+
+文件：`internal/reader/opml/handler.go:20-57`
+
+```go
+func (h *Handler) Export(userID int64) (string, error) {
+    feeds, err := h.store.Feeds(userID)  // 单次查询
+    // 序列化
+    return serialize(subscriptions), nil
+}
+```
+
+- **事务范围**：无
+- **原子性**：`Feeds()` 是单次查询，数据库层面保证一致性
+- **失败处理**：任何步骤失败直接返回错误，没有需要回滚的操作
+
+### 13.2 OPML 导入：外层无事务，内层细粒度事务
+
+文件：`internal/reader/opml/handler.go:59-95`
+
+```go
+func (h *Handler) Import(userID int64, data io.Reader) error {
+    subscriptions, _ := parse(data)  // 解析
+    
+    for _, subscription := range subscriptions {
+        if h.store.FeedURLExists(userID, subscription.FeedURL) {
+            continue  // 已存在则跳过
+        }
+        
+        // 解析/创建分类（无事务）
+        category, err := h.resolveCategory(userID, subscription.CategoryName)
+        
+        // 验证（无事务）
+        validateSubscription(userID, category.ID, h.store, subscription)
+        
+        // 创建 feed（内部有事务）
+        feed := &model.Feed{...}
+        applySubscriptionSettings(feed, subscription)
+        h.store.CreateFeed(feed)
+    }
+    return nil
+}
+```
+
+**事务边界分析**：
+
+```
+OPML Import 外层（无事务）
+├─ parse(data)                     无事务
+├─ for each subscription:
+│   ├─ FeedURLExists()              无事务（单条查询）
+│   ├─ resolveCategory()            无事务
+│   │   ├─ FirstCategory() /        单条查询
+│   │   ├─ CategoryByTitle() /      单条查询
+│   │   └─ CreateCategory()         单条 INSERT，无事务
+│   ├─ validateSubscription()       无事务
+│   └─ CreateFeed()                 内部有细粒度事务
+│       ├─ INSERT feed              无事务（单条语句）
+│       └─ for each entry:
+│           └─ BEGIN
+│              ├─ entryExists()     检查是否存在
+│              ├─ createEntry()     不存在则插入
+│              └─ COMMIT
+└─ return
+```
+
+#### 13.2.1 resolveCategory：无事务
+
+文件：`internal/reader/opml/handler.go:97-119`
+
+```go
+func (h *Handler) resolveCategory(userID int64, categoryName string) (*model.Category, error) {
+    if categoryName == "" {
+        return h.store.FirstCategory(userID)  // 单条查询
+    }
+    
+    category, err := h.store.CategoryByTitle(userID, categoryName)  // 单条查询
+    
+    if category == nil {
+        // 创建新分类 - 单条 INSERT，无事务
+        category, err = h.store.CreateCategory(userID, &model.CategoryCreationRequest{Title: categoryName})
+    }
+    return category, nil
+}
+```
+
+#### 13.2.2 CreateFeed：外层无事务，entry 级有事务
+
+文件：`internal/storage/feed.go:216-326`
+
+```go
+func (s *Storage) CreateFeed(feed *model.Feed) error {
+    // 1. 插入 feed（单条 SQL，无事务）
+    err := s.db.QueryRow(sql, ...).Scan(&feed.ID)
+    
+    // 2. 插入每个 entry（每个 entry 一个独立事务）
+    for _, entry := range feed.Entries {
+        tx, err := s.db.Begin()           // 每个 entry 开启事务
+        
+        entryExists, err := s.entryExists(tx, entry)
+        if !entryExists {
+            s.createEntry(tx, entry)
+        }
+        
+        tx.Commit()
+    }
+    return nil
+}
+```
+
+### 13.3 事务边界总结表
+
+| 操作 | 事务范围 | 原子性粒度 | 失败影响 |
+|------|---------|-----------|---------|
+| OPML Export | 无 | - | 直接返回错误，无数据变更 |
+| OPML Import 外层 | 无 | 每个 feed 独立 | 部分成功部分失败，已成功的 feed 保留 |
+| resolveCategory | 无 | 单条 SQL | 失败不影响其他 |
+| CreateCategory | 无 | 单条 INSERT | 失败不影响其他 |
+| CreateFeed (feed 插入) | 无 | 单条 INSERT | 失败回滚（数据库自动） |
+| CreateFeed (entry 插入) | 每个 entry 一个事务 | 单条 entry | 单个 entry 失败不影响 feed 和其他 entry |
+| RemoveCategory | 无（数据库级联） | 整条删除链 | 要么全部删除，要么不删 |
+| RemoveAndReplaceCategoriesByName | 整个操作一个事务 | 多个 SQL 原子执行 | 失败全部回滚 |
+| CreateUser | 整个操作一个事务 | 用户+分类+集成设置 | 失败全部回滚 |
+
+### 13.4 潜在问题与风险
+
+#### 13.4.1 OPML 导入的部分成功问题
+
+**场景**：导入 100 个 feed，前 50 个成功，第 51 个失败。
+
+**结果**：前 50 个 feed 已永久保存，后面的不再处理。没有自动回滚。
+
+**用户体验**：用户需要手动删除已导入的 feed，或者修复问题后重新导入（已存在的会被跳过）。
+
+#### 13.4.2 CreateFeed 中 entry 事务的细粒度问题
+
+每个 entry 单独开启事务，导入一个有 100 条 entry 的 feed 会执行 100 次事务提交，性能较低。
+
+但这样设计的好处是某个 entry 解析异常不会影响整个 feed 的导入。
+
+#### 13.4.3 resolveCategory 的竞态条件
+
+在高并发下，两个请求同时导入同一个不存在的分类名：
+1. 请求 A：`CategoryByTitle` → 不存在
+2. 请求 B：`CategoryByTitle` → 不存在
+3. 请求 A：`CreateCategory` → 成功
+4. 请求 B：`CreateCategory` → 失败（数据库 `unique (user_id, title)` 约束）
+
+但实际场景中 OPML 导入通常是单用户操作，这个问题影响很小。
+
+### 13.5 设计意图分析
+
+为什么 OPML 导入不包一个大事务？可能的考虑：
+
+1. **失败可恢复**：部分成功比全部回滚更友好，用户可以修正问题后继续
+2. **导入时间长**：OPML 导入需要抓取 feed，可能耗时很久，长事务会占用数据库连接
+3. **幂等性**：`FeedURLExists` 检查保证重复导入不会重复创建，支持断点续导
+4. **feed 创建可能失败**：网络抓取可能失败，不应该因为一个 feed 失败导致全部回滚
