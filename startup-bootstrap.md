@@ -355,6 +355,112 @@ func IsSchemaUpToDate(db *sql.DB) error {
 
 > 💡 **核心结论**：生产环境如果担心迁移破坏数据，用 `RUN_MIGRATIONS=false` + 先跑一次 `-migrate` 子命令做人工确认；容器化/单实例部署可以直接开 `RUN_MIGRATIONS=true` 简化运维。
 
+### 3.6 多实例迁移并发安全：锁机制分析
+
+代码位置：`internal/database/database.go:13-61` `Migrate()`
+
+#### 关键发现：Miniflux 没有任何迁移互斥锁
+
+与很多需要集群部署的服务（如使用 `pg_advisory_lock` 或 `SELECT ... FOR UPDATE` 做迁移锁）不同，**Miniflux 的 `Migrate()` 函数完全没有实现任何数据库级别的互斥或领导者选举机制**。
+
+完整的 `Migrate()` 函数（无任何锁逻辑）：
+
+```go
+func Migrate(db *sql.DB) error {
+    var currentVersion int
+    // 读版本：无锁，无事务
+    db.QueryRow(`SELECT version FROM schema_version`).Scan(&currentVersion)
+
+    slog.Info("Running database migrations",
+        slog.Int("current_version", currentVersion),
+        slog.Int("latest_version", schemaVersion),
+    )
+
+    for version := currentVersion; version < schemaVersion; version++ {
+        newVersion := version + 1
+
+        tx, err := db.Begin()    // 每个迁移一个独立事务
+        if err != nil { return ... }
+
+        if err := migrations[version](tx); err != nil {
+            tx.Rollback()
+            return fmt.Errorf("[Migration v%d] %v", newVersion, err)
+        }
+
+        // 更新版本号：先 TRUNCATE 再 INSERT
+        tx.Exec(`TRUNCATE schema_version`)
+        tx.Exec(`INSERT INTO schema_version (version) VALUES ($1)`, newVersion)
+
+        if err := tx.Commit(); err != nil {
+            return fmt.Errorf("[Migration v%d] %v", newVersion, err)
+        }
+    }
+
+    return nil
+}
+```
+
+#### 多实例并发迁移的竞态分析
+
+假设 Kubernetes 滚动更新同时启动 2 个新 Pod，都设置了 `RUN_MIGRATIONS=true`，可能出现以下时序：
+
+```
+T0  Pod-A: 读 schema_version → v57
+T1  Pod-B: 读 schema_version → v57  （读到同样的版本）
+T2  Pod-A: 执行 migrations[57] + BEGIN tx1
+T3  Pod-B: 执行 migrations[57] + BEGIN tx2
+T4  Pod-A: ALTER TABLE feeds ADD COLUMN xxx → 持有 DDL 锁
+T5  Pod-B: ALTER TABLE feeds ADD COLUMN xxx → 阻塞等待 Pod-A 的 DDL 锁
+T6  Pod-A: TRUNCATE schema_version + INSERT v58 + COMMIT tx1 → 成功，版本变为 v58
+T7  Pod-B: 获取到 DDL 锁 → 执行 ALTER TABLE → 报错 "column xxx already exists"
+T8  Pod-B: ROLLBACK tx2 → Migrate() 返回错误
+T9  Pod-B: printErrorAndExit() → 进程退出，退出码 1
+```
+
+**结果**：Pod-A 成功完成迁移并继续启动；Pod-B 因迁移失败而崩溃退出。Kubernetes 会重启 Pod-B，重启后：
+- 数据库版本已经是 v58
+- Pod-B 读 `schema_version` → v58 == schemaVersion
+- `for` 循环一次都不执行，`Migrate()` 直接返回 nil
+- Pod-B 正常启动
+
+所以**最终结果是正确的**（只有一个实例真正执行了迁移，另一个会失败重启后正常），但过程中会看到一个 Pod 崩溃的"噪声"。
+
+#### 如果两个实例同时执行不同的迁移版本呢？
+
+理论上可能出现的更复杂时序（概率低但不是不可能）：
+
+```
+T0  schema_version = v57
+T1  Pod-A 开始执行 migrations[57]（需要 5 秒的大表变更）
+T2  Pod-A 还没 COMMIT，schema_version 仍是 v57
+T3  Pod-B 读 schema_version → v57
+T4  Pod-B 也开始执行 migrations[57]
+T5  Pod-B 被 DDL 锁阻塞
+T6  Pod-A COMMIT → schema_version = v58
+T7  Pod-B 获得锁 → 执行失败 → ROLLBACK → 退出
+```
+
+仍然是一样的结果：一个成功，另一个失败重启。
+
+#### 为什么不使用 `pg_advisory_lock`？
+
+Miniflux 作者的设计哲学似乎是"简单优先"：
+1. 大部分部署是单实例（个人使用场景），并发迁移问题根本不存在
+2. 即使多实例，上面分析的"失败-重启"路径最终也能收敛到正确状态
+3. 增加 advisory lock 会引入新的复杂度（锁超时、死锁、连接断开后锁是否释放等）
+
+#### 集群部署的最佳实践
+
+如果你在 Kubernetes / 多副本环境部署，有三种选择：
+
+| 策略 | 实现方式 | 适用场景 |
+|------|---------|---------|
+| **手动迁移** | `RUN_MIGRATIONS=false`，滚动更新前先跑 `miniflux -migrate` Job | 对可用性要求极高的生产环境 |
+| **单实例先启动** | Deployment `strategy: RollingUpdate` 设 `maxSurge=1, maxUnavailable=0`，让第一个 Pod 先完成迁移再启动其他 | 大多数 K8s 部署 |
+| **接受短暂失败** | 直接 `RUN_MIGRATIONS=true`，依赖"失败-重启"收敛 | 测试环境 / 非关键部署 |
+
+> ⚠️ **重要**：无论哪种策略，**永远不要在迁移过程中杀进程**（例如 `kubectl delete pod` 强制删除）。虽然每个迁移是独立事务，不会留下半完成状态，但如果在 `TRUNCATE schema_version` 之后、`INSERT` 之前被杀（极小概率窗口），`schema_version` 会变成空表，下次启动时 `currentVersion=0`，会从 migrations[0] 从头开始执行，产生大量 "relation already exists" 错误。
+
 ---
 
 ## 四、Daemon 启动：从初始化到首请求可用
@@ -426,6 +532,139 @@ hasAutocert(CERT_DOMAIN) → modeAutocertTLS
 - `HasSchedulerService() && !HasMaintenanceMode()` → **调度器完全不启动**（不刷新 feed、不清理）
 - HTTP 服务器仍会启动，访问 UI 时会显示维护消息但仍可静态资源可访问
 - 管理员自动创建 `CREATE_ADMIN` 不受维护模式影响，仍在 daemon 启动前执行
+
+### 4.5 优雅关闭：SIGTERM/SIGINT 信号处理链路
+
+代码位置：`internal/cli/daemon.go:23-102` `startDaemon()`
+
+#### 信号注册与等待
+
+```go
+func startDaemon(store *storage.Storage) {
+    stop := make(chan os.Signal, 1)
+    signal.Notify(stop, os.Interrupt)      // SIGINT (Ctrl+C)
+    signal.Notify(stop, syscall.SIGTERM)   // SIGTERM (systemd stop / k8s kill)
+
+    // ... [启动所有服务] ...
+
+    <-stop  // 阻塞在此，直到收到上述任一信号
+```
+
+**关键点**：
+- 只监听 `SIGINT` 和 `SIGTERM`，忽略其他信号（如 `SIGHUP`、`SIGUSR1` 等）
+- 信号 channel 缓冲大小为 1，确保不会丢失信号
+- 收到信号后，`<-stop` 立即返回，开始执行关闭流程
+
+#### 完整的关闭时序
+
+```
+收到 SIGTERM / SIGINT
+    │
+    ├─ [1] cancelMetrics()                     // 停止 Metrics 采集（取消 context）
+    │
+    ├─ [2] 创建 5 秒超时的 ctx
+    │   ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    │
+    ├─ [3] 遍历所有 HTTP Server 执行 Shutdown(ctx)
+    │       ├─ 停止 accept 新连接（Listener 关闭）
+    │       ├─ 等待所有活跃请求处理完成（最多 5 秒）
+    │       └─ ✗ 5 秒未完成 → 强制关闭所有活跃连接
+    │
+    ├─ [4] pool.Shutdown()                      // 关闭 Worker 池
+    │       ├─ close(p.queue)                   // 关闭任务 channel，worker 不再接收新 job
+    │       └─ p.wg.Wait()                      // 等待所有当前正在执行的 feed 刷新完成
+    │                                                  （没有超时限制！可能会卡很久）
+    │
+    ├─ [5] slog.Info("Process gracefully stopped")
+    │
+    └─ [6] startDaemon() 返回 → defer db.Close() 生效
+              │
+              └─ sql.DB.Close()                // 关闭数据库连接池
+                                                 （等待所有连接返回池中）
+```
+
+#### 各组件的关闭细节
+
+**① HTTP Server Shutdown（5 秒超时）**
+
+调用的是 Go 标准库 `http.Server.Shutdown(ctx)`，行为：
+- 立即关闭 `net.Listener`，不再 accept 新连接
+- 对所有 idle 连接：立即关闭
+- 对所有 active 连接：设置 `Connection: close` header，等待请求处理完成后关闭
+- 如果 5 秒内仍有活跃连接未完成：**强制关闭**（返回 `context.DeadlineExceeded` 错误）
+- 注意：所有监听地址（HTTP、TLS、UnixSocket、Systemd）都会依次执行 Shutdown
+
+**② Worker Pool Shutdown（无超时）**
+
+```go
+// internal/worker/pool.go:26-30
+func (p *Pool) Shutdown() {
+    close(p.queue)   // 关闭 channel，worker 的 for range 循环会退出
+    p.wg.Wait()      // 阻塞直到所有 worker 调用 wg.Done()
+}
+```
+
+Worker 侧（`internal/worker/worker.go:24-49`）：
+```go
+func (w *worker) Run(c <-chan model.Job, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for job := range c {
+        feedHandler.RefreshFeed(w.store, job.UserID, job.FeedID, false)
+        // ↑ 这个调用可能执行很久（网络请求慢、feed 条目多等）
+    }
+}
+```
+
+**⚠️ 重要风险**：`pool.Shutdown()` 没有超时限制。如果某个 worker 正在刷新一个慢 feed（网络超时默认 30 秒，还可能重试），`wg.Wait()` 会一直阻塞，导致整个进程无法退出。此时如果 systemd/k8s 发送第二次 `SIGKILL`（通常在 `TimeoutStopSec` 后，默认 90 秒），进程会被强制杀死，可能导致正在执行的数据库操作中断（但每个 `RefreshFeed` 内部也是事务，回滚安全）。
+
+**③ 数据库连接池关闭（defer 顺序）**
+
+`defer db.Close()` 注册在 `cli.go:166`，是在 `Parse()` 函数中，而不是在 `startDaemon()` 中。这意味着：
+
+```
+Parse() 函数执行顺序：
+  ├─ db, _ := database.NewConnectionPool(...)
+  ├─ defer db.Close()          ← 注册在最外层
+  │
+  ├─ ... [数据库 Ping、迁移、检查] ...
+  │
+  └─ startDaemon(store)
+        ├─ ... [收到信号后执行关闭流程] ...
+        └─ startDaemon 返回 → 回到 Parse() → 触发 defer db.Close()
+```
+
+所以 `db.Close()` 是**最后一步**，在所有 HTTP Server、Worker Pool 都关闭之后才执行。`sql.DB.Close()` 的行为：
+- 阻止新连接被创建
+- 等待所有连接返回到池中
+- 然后关闭所有连接
+- 如果有连接长期不返回（例如某个查询卡住），Close() 会阻塞
+
+#### 连接池在关闭流程中的角色
+
+整个关闭流程中，**数据库连接池一直在正常工作**，直到最后一步 `db.Close()`：
+1. HTTP 请求处理期间：正常从连接池获取连接
+2. Shutdown(ctx) 等待请求完成：这些请求仍在使用连接
+3. Worker 刷新 feed：仍在使用连接池
+4. 所有请求和 worker 都完成后：`db.Close()` 关闭池
+
+这是合理的设计——如果先关闭数据库再等 HTTP 请求完成，那些请求会因为拿不到连接而 500 错误。
+
+#### 信号处理的几个"坑"
+
+| 问题 | 现象 | 代码根因 |
+|------|------|---------|
+| **关闭缓慢** | 发了 SIGTERM 后几十秒甚至几分钟进程不退出 | Worker Pool Shutdown 没有超时，某个 feed 刷新卡住 |
+| **502 Bad Gateway** | systemd/k8s 滚动更新时部分请求失败 | HTTP Shutdown 超时设为 5 秒，如果有长请求（如大文件导出）会被强制断开 |
+| **SIGKILL** | systemd 最终发 SIGKILL 强杀进程 | `TimeoutStopSec` 默认 90s，worker 刷新超过这个时间 |
+| **数据库连接泄漏** | 进程退出但 PostgreSQL 还能看到 idle 连接 | 理论上不会，因为 `defer db.Close()` 最后执行；如果真的出现，说明 `db.Close()` 阻塞了 |
+
+#### 如果想调优关闭行为
+
+可以考虑的修改方向（需要改代码）：
+1. 给 `pool.Shutdown()` 加超时（用 `select` 配合 `time.After`）
+2. 让 `RefreshFeed` 支持 context 取消（目前不支持，feed 刷新没有 context 参数）
+3. 调大 HTTP Shutdown 的 5 秒超时（如果有长请求场景）
+4. 调小 `POLLING_FREQUENCY` 或 `MAX_CONCURRENT_JOBS` 减少关闭时的积压任务
 
 ---
 
