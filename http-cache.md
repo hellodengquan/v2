@@ -976,28 +976,582 @@ if b.limitPerHost > 0 {
 3. **乐观锁**：使用 `checked_at` 作为版本号，更新时检查版本是否匹配
 4. **唯一约束**：利用数据库唯一索引防止重复条目（已在 entry 表实现）
 
-## 十二、相关文件清单
+## 十二、4xx/5xx 错误响应的缓存策略与错误雪崩避免
+
+当 feed 拉取遇到客户端错误（4xx）或服务器错误（5xx）时，Miniflux 实现了一套完整的错误处理和退避策略，以避免错误雪崩。
+
+### 12.1 错误分类与处理流程
+
+#### 12.1.1 错误检测层次
+
+`RefreshFeed` 函数的错误检测按以下顺序逐层进行（`internal/reader/handler/handler.go:242-292`）：
+
+```
+1. 连接层错误（clientErr）
+   ├─ TLS 错误（证书问题）
+   ├─ 网络错误（连接失败、DNS 解析失败）
+   ├─ 超时错误
+   └─ EOF（空响应）
+   
+2. Cloudflare 挑战检测（特殊 403）
+   
+3. HTTP 状态码错误
+   ├─ 401 Unauthorized
+   ├─ 403 Forbidden（非 Cloudflare 挑战）
+   ├─ 429 Too Many Requests（限流，特殊处理）
+   ├─ 404 / 410 资源不存在
+   ├─ 500 内部服务器错误
+   ├─ 502 Bad Gateway
+   ├─ 503 Service Unavailable
+   ├─ 504 Gateway Timeout
+   └─ 其他 >= 400 状态码
+   
+4. 响应体错误
+   ├─ Content-Length = 0（非 304）
+   ├─ 响应体过大（超过 HTTP_CLIENT_MAX_BODY_SIZE）
+   ├─ 响应体读取失败
+   └─ 空响应体
+   
+5. 解析错误
+   ├─ 格式检测失败（ErrFeedFormatNotDetected）
+   └─ XML/JSON 解析异常
+   
+6. 数据一致性错误
+   ├─ 重复 Feed URL
+   └─ 数据库操作错误
+```
+
+#### 12.1.2 LocalizedError 详细分类
+
+`internal/reader/fetcher/response_handler.go:175-229` 中 `LocalizedError()` 方法负责将底层错误映射为用户友好的本地化错误：
+
+```go
+func (r *ResponseHandler) LocalizedError() *locale.LocalizedErrorWrapper {
+    // 第一层：客户端/网络错误（clientErr != nil）
+    if r.clientErr != nil {
+        switch {
+        case isSSLError(r.clientErr):        // → error.tls_error
+        case isNetworkError(r.clientErr):    // → error.network_operation
+        case os.IsTimeout(r.clientErr):      // → error.network_timeout
+        case errors.Is(r.clientErr, io.EOF): // → error.http_empty_response
+        default:                             // → error.http_client_error
+        }
+    }
+
+    // 第二层：Cloudflare 挑战（CAPTCHA）
+    if r.isCloudflareChallenge() {            // → error.http_cloudflare_challenge
+        // ...
+    }
+
+    // 第三层：HTTP 状态码分类
+    switch r.httpResponse.StatusCode {
+    case 401: // → error.http_not_authorized
+    case 403: // → error.http_forbidden（排除 Cloudflare 挑战后）
+    case 429: // → error.http_too_many_requests
+    case 404, 410: // → error.http_resource_not_found
+    case 500: // → error.http_internal_server_error
+    case 502: // → error.http_bad_gateway
+    case 503: // → error.http_service_unavailable
+    case 504: // → error.http_gateway_timeout
+    }
+
+    // 第四层：兜底错误
+    if r.httpResponse.StatusCode >= 400 {
+        // → error.http_unexpected_status_code
+    }
+
+    // 第五层：空响应体检查（非 304 状态）
+    if r.httpResponse.StatusCode != 304 && r.httpResponse.ContentLength == 0 {
+        // → error.http_empty_response_body
+    }
+
+    return nil
+}
+```
+
+### 12.2 错误计数与退避机制
+
+#### 12.2.1 错误计数器
+
+`internal/model/feed.go:100-110` 提供了错误计数的基础方法：
+
+```go
+// WithTranslatedErrorMessage adds a new error message and increment the error counter.
+func (f *Feed) WithTranslatedErrorMessage(message string) {
+    f.ParsingErrorCount++
+    f.ParsingErrorMsg = message
+}
+
+// ResetErrorCounter removes all previous errors.
+func (f *Feed) ResetErrorCounter() {
+    f.ParsingErrorCount = 0
+    f.ParsingErrorMsg = ""
+}
+```
+
+**计数规则：**
+- 每次发生任何类型的错误（HTTP、解析、数据库等），`ParsingErrorCount++`
+- 每次成功刷新（包括 304 Not Modified），调用 `ResetErrorCounter()` 清零
+- 持久化到 `feeds.parsing_error_count` 和 `feeds.parsing_error_msg` 列
+
+#### 12.2.2 错误上限过滤（批次层面）
+
+`internal/storage/batch.go:61-69` 中的 `WithErrorLimit` 方法在批次查询时过滤掉错误次数过多的 feed：
+
+```go
+func (b *batchBuilder) WithErrorLimit(errorLimit int) *batchBuilder {
+    if errorLimit > 0 {
+        b.conditions = append(b.conditions, "parsing_error_count < $"+strconv.Itoa(b.argsIndex))
+        b.args = append(b.args, errorLimit)
+        b.argsIndex++
+    }
+    return b
+}
+```
+
+**配置项** `POLLING_PARSING_ERROR_LIMIT`（默认值 3）：
+- 当 `parsing_error_count >= 3` 时，该 feed **不再被自动调度刷新**
+- 用户仍可通过 UI/API 手动触发刷新（手动刷新不经过此过滤）
+- 设为 0 表示无限制（不过滤任何 feed）
+
+#### 12.2.3 429 限流特殊处理（响应层面）
+
+`internal/reader/handler/handler.go:245-255` 中对 429 Too Many Requests 做了独立于常规错误流程的特殊处理：
+
+```go
+if responseHandler.IsRateLimited() {
+    retryDelay := responseHandler.ParseRetryDelay()
+    calculatedNextCheckInterval := originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+
+    slog.Warn("Feed is rate limited",
+        slog.String("feed_url", originalFeed.FeedURL),
+        slog.Int("retry_delay_in_seconds", int(retryDelay.Seconds())),
+        slog.Int("calculated_next_check_interval_in_minutes", int(calculatedNextCheckInterval.Minutes())),
+        slog.Time("new_next_check_at", originalFeed.NextCheckAt),
+    )
+}
+```
+
+**处理逻辑：**
+1. 在 `LocalizedError()` 检测之前**先检测限流状态**（即使限流也继续走完错误流程）
+2. 解析 `Retry-After` 响应头（支持秒数或 HTTP-date 两种格式）
+3. 以 `Retry-After` 值作为 `refreshDelay` 重新计算 `NextCheckAt`
+4. 确保不会早于服务器要求的时间重试
+
+> **关键设计**：429 处理在错误检测**之前**执行，即使最终抛出错误并提前返回，`NextCheckAt` 的调整也已经在 `UpdateFeedError` 中被持久化。
+
+### 12.3 错误时的缓存字段策略
+
+#### 12.3.1 错误持久化路径
+
+`internal/reader/handler/handler.go:30-38` 中的 `getTranslatedLocalizedError()` 是所有错误的统一出口：
+
+```go
+func getTranslatedLocalizedError(store *storage.Storage, userID int64, originalFeed *model.Feed, localizedError *locale.LocalizedErrorWrapper) *locale.LocalizedErrorWrapper {
+    user, storeErr := store.UserByID(userID)
+    if storeErr != nil {
+        return locale.NewLocalizedErrorWrapper(storeErr, "error.database_error", storeErr)
+    }
+    originalFeed.WithTranslatedErrorMessage(localizedError.Translate(user.Language))
+    store.UpdateFeedError(originalFeed)
+    return localizedError
+}
+```
+
+**调用时机**：所有 `return getTranslatedLocalizedError(...)` 的分支。
+
+#### 12.3.2 UpdateFeedError 持久化字段
+
+`internal/storage/feed.go:427-452` 中的 `UpdateFeedError` 只更新**与错误相关的字段**：
+
+```go
+func (s *Storage) UpdateFeedError(feed *model.Feed) (err error) {
+    query := `
+        UPDATE feeds
+        SET
+            parsing_error_msg=$1,
+            parsing_error_count=$2,
+            checked_at=$3,
+            next_check_at=$4
+        WHERE
+            id=$5 AND user_id=$6
+    `
+    _, err = s.db.Exec(query,
+        feed.ParsingErrorMsg,    // 新增：错误信息
+        feed.ParsingErrorCount,  // 新增：错误次数 +1
+        feed.CheckedAt,          // 更新：刷新开始时间
+        feed.NextCheckAt,        // 更新：下次检查时间（已调整）
+        feed.ID, feed.UserID,
+    )
+    return nil
+}
+```
+
+**缓存字段策略（错误时）：**
+
+| 字段 | 错误时是否更新 | 说明 |
+|------|--------------|------|
+| `etag_header` | ❌ **不更新** | 保留上次成功响应的 ETag |
+| `last_modified_header` | ❌ **不更新** | 保留上次成功响应的 Last-Modified |
+| `parsing_error_msg` | ✅ 更新 | 记录最新的本地化错误信息 |
+| `parsing_error_count` | ✅ 更新 | 计数 +1 |
+| `checked_at` | ✅ 更新 | 记录本次检查尝试时间 |
+| `next_check_at` | ✅ 更新 | 根据调度策略计算（可能包含 Retry-After） |
+
+#### 12.3.3 缓存字段保留的意义
+
+**为什么错误时不清除 ETag 和 Last-Modified？**
+
+1. **服务器恢复后仍可协商**：当服务器从故障中恢复时，下次请求可以继续使用之前的 ETag/Last-Modified 进行条件请求。如果服务器端内容未变化，仍可获得 304 响应，节省带宽。
+
+2. **渐进式错误恢复**：假设服务器出现 5 分钟故障后恢复：
+   - 故障期间：每次请求返回 5xx，ETag 保持不变，`parsing_error_count` 递增
+   - 服务恢复后：请求携带原 ETag，内容未变化 → 304，`parsing_error_count` 清零
+   - 如果清除了 ETag：恢复后的首次请求必然下载完整内容 → 200，浪费带宽
+
+**考虑场景**：CDN 或源站短暂故障
+```
+T0: 正常刷新，Etag="v3", error_count=0
+T1: 源站故障，返回 502
+    → ETag 保持 "v3"，error_count=1，next_check_at = now() + 1h
+T2: 源站仍故障，返回 502
+    → ETag 保持 "v3"，error_count=2，next_check_at = now() + 1h  
+T3: 源站仍故障，返回 502
+    → ETag 保持 "v3"，error_count=3 → 达到上限，停止自动调度
+T4: 用户手动刷新，源站已恢复
+    → 携带 If-None-Match: "v3"，内容未变
+    → 304 Not Modified，error_count=0（清零）
+```
+
+### 12.4 错误雪崩防护机制总结
+
+错误雪崩是指大量 feed 同时失败导致系统资源耗尽的场景。Miniflux 通过以下多层机制防止雪崩：
+
+#### 12.4.1 多层防线总结
+
+| 防线层级 | 机制 | 作用 | 代码位置 |
+|---------|------|------|---------|
+| **第一层：调度过滤** | `WithErrorLimit()` | 错误次数超标的 feed 不再进入刷新批次 | `internal/storage/batch.go:61-69` |
+| **第二层：主机限流** | `WithLimitPerHost()` | 限制同一主机的并发请求数 | `internal/storage/batch.go:107-120` |
+| **第三层：请求超时** | `WithTimeout()` | 单个请求超时限制（默认 20 秒），避免 worker 永久阻塞 | `internal/config/options.go` |
+| **第四层：响应体限制** | `ReadBody(maxBodySize)` | 响应体大小限制，避免大响应耗尽内存 | `internal/reader/fetcher/response_handler.go:156-173` |
+| **第五层：429 退避** | `IsRateLimited() + ParseRetryDelay()` | 严格遵循服务器的 Retry-After 指示 | `internal/reader/handler/handler.go:245-255` |
+| **第六层：退避调度** | `ScheduleNextCheck()` | 下次检查时间按调度间隔指数级（实际线性）推后 | `internal/model/feed.go:121-149` |
+| **第七层：错误计数** | `UpdateFeedError()` | 错误计数递增，配合第一层过滤 | `internal/model/feed.go:100-110` |
+| **第八层：缓存字段保留** | ETag/Last-Modified 不清除 | 故障恢复后可继续缓存协商 | `internal/storage/feed.go:427-452` |
+
+#### 12.4.2 雪崩场景模拟分析
+
+**场景：某大型 CDN 故障，1000 个 feed 同时失败**
+
+| 时间点 | 事件 | 防护机制 |
+|--------|------|---------|
+| T0 | 故障开始，大量 feed 进入刷新批次 | 主机级并发限制 → 同一主机的 feed 分批处理 |
+| T0+30s | 每个 feed 请求超时或返回 5xx | 超时限制 → worker 在 20s 内释放，不被永久占用 |
+| T0+60s | 下一轮调度周期，生成新批次 | 错误计数已递增，部分 feed 被过滤；next_check_at 已推远，不在下次批次 |
+| T0+180s | 继续调度 | 大部分 feed 的 error_count >= 3，被 `WithErrorLimit()` 完全过滤，系统负载显著下降 |
+| TN | 用户反馈，手动刷新单个 feed | 手动刷新绕过 `WithErrorLimit()` 过滤，正常重试 |
+| TN+5min | CDN 恢复，故障解除 | 恢复后的首次请求使用旧 ETag → 304，节省带宽，error_count 清零 |
+
+**无此机制的后果对比：**
+
+| 维度 | 有防护机制 | 无防护机制 |
+|------|-----------|-----------|
+| 每秒请求数 | 快速收敛到接近 0 | 持续维持高位（所有 feed 每分钟重试） |
+| Worker 占用率 | 错误计数达上限后下降 | 持续 100% 占用 |
+| 带宽消耗 | 429+ETag 保留 → 最小化 | 5xx 响应 + 完整请求 → 持续浪费 |
+| 恢复后首小时带宽 | 304 为主，几乎无额外开销 | 全量下载 1000 个 feed → 带宽峰值 |
+
+### 12.5 Cloudflare 挑战的特殊处理
+
+Cloudflare 的 bot 保护机制会返回 403 状态码，但语义上不同于普通的 403 Forbidden。Miniflux 在 `internal/reader/fetcher/response_handler.go:231-243` 中专门识别这种场景：
+
+```go
+func (r *ResponseHandler) isCloudflareChallenge() bool {
+    if r.httpResponse == nil {
+        return false
+    }
+
+    return r.httpResponse.StatusCode == http.StatusForbidden &&
+        strings.EqualFold(r.httpResponse.Header.Get("cf-mitigated"), "challenge") &&
+        strings.HasPrefix(strings.ToLower(r.ContentType()), "text/html")
+}
+```
+
+**三要素判定（AND 条件）：**
+1. **状态码 403**：Cloudflare 拦截返回的标准状态码
+2. **`cf-mitigated: challenge` 响应头**：Cloudflare 官方提供的机器检测信号头（最可靠）
+3. **Content-Type 以 `text/html` 开头**：挑战页面是 HTML，不是预期的 RSS/Atom/JSON feed
+
+**检测后的处理：**
+- 返回独立的 `error.http_cloudflare_challenge` 错误类型
+- UI 层会向用户展示明确提示：网站受 Cloudflare bot 验证保护，Miniflux 无法自动通过
+- 但该错误在计数层面与其他错误相同（`parsing_error_count++`），不会被区别对待
+
+## 十三、HTTP 代理与 CDN 中间层的缓存协商语义影响
+
+当 feed 请求经过 HTTP 代理或 CDN 时，缓存协商的语义可能被中间层改写。本节分析 Miniflux 的代理配置及其对缓存协商的实际影响。
+
+### 13.1 代理层级与配置
+
+Miniflux 支持三级代理配置，优先级从高到低（`internal/reader/fetcher/request_builder.go:143-157`）：
+
+```go
+switch {
+case r.feedProxyURL != "":
+    // 第一优先级：单个 feed 专属代理（Feed.ProxyURL）
+    clientProxyURL, err = url.Parse(r.feedProxyURL)
+case r.useClientProxy && r.clientProxyURL != nil:
+    // 第二优先级：应用级全局代理 + Feed.FetchViaProxy 标志
+    clientProxyURL = r.clientProxyURL
+case r.proxyRotator != nil && r.proxyRotator.HasProxies():
+    // 第三优先级：代理轮换池（HTTP_CLIENT_PROXIES）
+    clientProxyURL = r.proxyRotator.GetNextProxy()
+}
+```
+
+#### 13.1.1 三级代理配置详解
+
+| 优先级 | 配置来源 | 配置项/字段 | 作用域 | 适用场景 |
+|--------|---------|-----------|--------|---------|
+| 1（最高） | Feed 级 | `Feed.ProxyURL` (`proxy_url` JSON 字段) | 单个 feed | 为特定 feed 指定独立代理（绕过封锁） |
+| 2 | 混合级 | `HTTP_CLIENT_PROXY` + `Feed.FetchViaProxy` | 标记 feed | 需要代理的 feed（如国外站点）才走全局代理 |
+| 3（最低） | 轮换池 | `HTTP_CLIENT_PROXIES` | 所有 feed | 多个代理随机轮换，分布式爬取 |
+
+#### 13.1.2 请求构建中的代理配置
+
+`internal/reader/handler/handler.go:223-233` 在每个 feed 刷新时完整配置代理：
+
+```go
+requestBuilder := fetcher.NewRequestBuilder().
+    // ...
+    WithProxyRotator(proxyrotator.ProxyRotatorInstance).       // 第三优先级
+    WithCustomFeedProxyURL(originalFeed.ProxyURL).              // 第一优先级
+    WithCustomApplicationProxyURL(config.Opts.HTTPClientProxyURL()). // 第二优先级基础
+    UseCustomApplicationProxyURL(originalFeed.FetchViaProxy).   // 第二优先级开关
+    // ...
+```
+
+### 13.2 HTTP 客户端与中间层交互
+
+#### 13.2.1 http.Client 的缓存语义
+
+**Go `http.Client` 本身不做任何缓存。** 所有缓存协商完全由 Miniflux 代码控制，具体体现在：
+
+1. **请求头由代码显式设置**：`WithETag()` 和 `WithLastModified()` 手动添加 `If-None-Match` 和 `If-Modified-Since`
+2. **响应头由代码解析**：`ResponseHandler.ETag()` 和 `LastModified()` 手动读取并存储
+3. **304 判断由代码完成**：`IsModified()` 方法手动判断状态码并比较缓存头
+
+**这意味着中间层无法改变缓存协商的逻辑正确性，只能改变最终收到的响应内容。**
+
+#### 13.2.2 透明代理的潜在影响
+
+当用户网络环境存在**透明 HTTP 代理**（并非由 Miniflux 配置，而是网络层面的强制代理，如企业网关、ISP 缓存、运营商劫持等）时，可能出现以下语义改写：
+
+| 中间层行为 | 对缓存协商的影响 | Miniflux 是否有对应处理 |
+|-----------|---------------|----------------------|
+| **剥离条件请求头**：移除 `If-None-Match`/`If-Modified-Since` | 源站始终返回 200 完整内容，无法获得 304 | ❌ 无特殊处理（Miniflux 会认为内容每次都"修改"，但不会出错） |
+| **剥离缓存响应头**：移除 `ETag`/`Last-Modified`/`Cache-Control` | Miniflux 无法保存缓存头，下一次请求无法协商 | ❌ 无特殊处理（退化为无缓存模式，按最小间隔刷新） |
+| **伪造 304 响应**：中间层自行决定返回 304 | Miniflux 按正常 304 处理，不会读取新内容 | ⚠️ 风险：中间层判断错误可能导致用户看不到新内容 |
+| **篡改 ETag**：中间层重新生成 ETag（如将弱 ETag `W/"abc"` 改为强 ETag `"abc"`） | 字符串比较失败，导致误判为内容修改 | ⚠️ 会增加不必要的完整响应下载 |
+| **CDN 边缘缓存过期**：CDN 在源站未修改时也返回 200 | 重复拉取相同内容，浪费带宽 | ✅ 最终通过 ETag 或 Last-Modified 比较可判断内容实际上未修改（如果 CDN 保留了原头） |
+
+### 13.3 Vary 头的处理缺失
+
+**RFC 9110 规范要求**：当响应包含 `Vary` 头时，缓存必须记录请求中对应头的值，后续请求只有在这些头的值都匹配时才能使用缓存。
+
+**Miniflux 的现状**：
+
+1. **Miniflux 作为客户端（请求 feed）时**：
+   - ❌ **完全忽略 `Vary` 响应头**
+   - `ResponseHandler` 没有 `Vary()` 方法，也不存储任何 Vary 相关信息
+   - 缓存键实际上只有 `feed_id`，不区分任何请求头
+
+2. **潜在风险场景**：
+
+   **场景 A：基于 Accept-Encoding 的 Vary**
+   ```
+   请求 1: Accept-Encoding: gzip → 响应: Vary: Accept-Encoding, ETag: "abc"
+   请求 2: Accept-Encoding: identity → 携带 If-None-Match: "abc"
+     → 中间层可能错误返回 304（本应返回 200 + 未压缩内容）
+     → Miniflux 认为未修改，不会尝试读取不同编码的内容
+   ```
+   
+   **场景 B：基于 User-Agent 的 Vary**（某些 CDN 根据 UA 返回不同内容格式）
+   ```
+   请求 1: User-Agent: "Miniflux/2.x" → 响应: Vary: User-Agent, ETag: "v1"
+   用户修改自定义 User-Agent 后
+   请求 2: User-Agent: "MyCustomUA/1.0" → 携带 If-None-Match: "v1"
+     → 实际上 CDN 会返回不同内容，但 ETag 可能被认为匹配
+     → 或者 CDN 返回新的 ETag "v2"，Miniflux 正确检测到修改
+   ```
+
+3. **实际影响评估**：
+
+   对于 feed 拉取场景，Vary 头的实际影响非常有限：
+   - **Accept-Encoding**：Miniflux 让 Go `http.Transport` 自动处理压缩（除非 `WithoutCompression()`），相同请求的 Accept-Encoding 是稳定的
+   - **User-Agent**：除非用户主动修改 feed 的自定义 UA，否则 UA 不变
+   - **Accept**：Miniflux 请求的 Accept 头固定为 `"application/xml,application/atom+xml,..."`，不会变化
+   - **Accept-Language**：Miniflux 不发送此头，无影响
+
+   **结论**：Vary 头处理缺失在实际使用中几乎不会造成问题。
+
+### 13.4 CDN 边缘节点的 ETag 一致性问题
+
+当 feed 通过多层 CDN（如 Cloudflare + Fastly + 源站）或多层代理时，可能出现 ETag 不一致问题。
+
+#### 13.4.1 ETag 场景分析
+
+**场景 1：CDN 保留源站 ETag（最理想）**
+```
+源站 → ETag: "abc123"
+  ↓ Cloudflare 边缘节点（原样转发）
+Miniflux 收到 → ETag: "abc123"
+下次请求 → If-None-Match: "abc123"
+  ↓
+Cloudflare 校验 → 匹配 → 304 ✓
+```
+
+**场景 2：CDN 重新生成 ETag**
+```
+源站 → ETag: "abc123"
+  ↓ Cloudflare 自动压缩（或修改响应体）→ 重新计算 ETag: "xyz789"
+Miniflux 收到 → ETag: "xyz789"
+下次请求 → If-None-Match: "xyz789"
+  ↓
+Cloudflare 边缘校验 → 匹配 → 304 ✓（CDN 内部处理，不回源）
+  但如果 CDN 边缘缓存失效，需要回源：
+  → Cloudflare 将 "xyz789" 转换为源站的 "abc123" → 304 ✓（CDN 做 ETag 映射）
+```
+✅ 即使 ETag 被重写，只要 CDN 内部维护映射关系，缓存协商仍然有效。
+
+**场景 3：多层代理 ETag 不兼容（最坏情况）**
+```
+源站 → ETag: "abc123"（强 ETag）
+  ↓ 代理 1 转为弱 ETag: W/"abc123"
+  ↓ 代理 2 再次转为强 ETag: "def456"
+Miniflux 收到 → ETag: "def456"
+下次请求 → If-None-Match: "def456"
+  ↓
+代理 2 缓存命中 → 304 ✓
+  但如果代理 2 缓存失效，需要回源到代理 1：
+  → "def456" 与代理 1 的 W/"abc123" 不匹配
+  → 代理 1 回源，携带源站的 "abc123"
+  → 源站返回 200 完整内容（因为代理 1 无法映射 ETag）
+  → 完整内容重新经过两层代理 → 浪费带宽
+```
+⚠️ 但数据仍然**一致**，只是退化为完整下载模式。
+
+#### 13.4.2 Miniflux 的 ETag 比较策略
+
+`IsModified()` 方法使用**简单字符串相等比较**（`internal/reader/fetcher/response_handler.go:102-116`）：
+
+```go
+if r.ETag() != "" {
+    return r.ETag() != lastEtagValue
+}
+```
+
+**没有处理的 RFC 规范细节：**
+
+1. **强弱 ETag 区分**：RFC 9110 第 8.8.1.1 节规定弱 ETag（`W/"..."`）只能用于 `If-None-Match` 的缓存协商，不能用于 `If-Match`。Miniflux 只使用 `If-None-Match`，因此即使是弱 ETag 也能正确工作。
+
+2. **多个 ETag 值**：`If-None-Match` 可以包含多个 ETag 值，用逗号分隔。但 Miniflux 每次只发送一个 ETag，且只存储一个，这符合单一资源缓存的场景。
+
+3. **`*` 通配符**：`If-None-Match: *` 表示"只要资源存在就算匹配"。Miniflux 不使用此功能。
+
+**实际上，简单字符串比较对于 feed 场景是足够的**，因为：
+- Miniflux 是 HTTP/1.1 客户端，ETag 的往返路径只要一致就能工作
+- 即使中间层对 ETag 做了转换，只要保持来回一致，字符串比较就成立
+- 不一致时最坏情况只是退化为全量下载，不会数据错误
+
+### 13.5 代理级缓存（HTTP_CLIENT_PROXY 指向缓存代理）
+
+当用户配置 Miniflux 使用本地缓存代理（如 Squid、Varnish、Nginx proxy_cache 等）时，会形成两级缓存：
+
+```
+┌─────────────┐    ETag/Last-Modified     ┌─────────────┐    If-None-Match      ┌──────────┐
+│  Miniflux   │ ────────────────────────▶ │  本地缓存   │ ────────────────────▶ │  源站    │
+│  客户端缓存  │ ◀──────────────────────── │  代理服务器 │ ◀──────────────────── │  服务器  │
+│ (数据库存储) │    304 / 200 + 新ETag     │  (内存/磁盘) │    304 / 200 + 新ETag │          │
+└─────────────┘                           └─────────────┘                        └──────────┘
+```
+
+**两级缓存的协作语义：**
+
+| 场景 | Miniflux 判断 | 本地代理行为 | 最终效果 |
+|------|-------------|-----------|---------|
+| Miniflux 有有效 ETag，代理也缓存了 | 发送 If-None-Match → 304 | 代理命中本地缓存，直接返回 304，不回源 | ⚡ 最快：完全本地 |
+| Miniflux 有有效 ETag，代理缓存过期 | 发送 If-None-Match | 代理向源站转发条件请求，源站 304 → 代理更新缓存 → 返回 304 | ✅ 节省带宽 |
+| Miniflux 无 ETag，代理缓存有效 | 发送无条件请求 | 代理直接返回缓存 200，携带原缓存头 | ✅ 节省源站带宽，但 Miniflux 需处理完整内容 |
+| 两者都无缓存 | 发送无条件请求 | 代理向源站转发 → 200 → 双方都更新缓存 | 📥 正常全量下载 |
+
+**潜在语义分歧**：当本地缓存代理**剥离了条件请求头**直接返回缓存内容时：
+- Miniflux 会收到 200 响应（而非 304），即使内容未变
+- 通过 `IsModified()` 比较新响应的 ETag 与存储值
+- 如果代理保留了源站的 ETag，`r.ETag() == lastEtagValue` → `IsModified()` 返回 false，**语义上等价于 304**
+- Miniflux **不会处理条目**，直接进入 304 分支 ✅
+
+> **关键代码验证** (`internal/reader/handler/handler.go:272`)：
+> ```go
+> if ignoreHTTPCache || responseHandler.IsModified(originalFeed.EtagHeader, originalFeed.LastModifiedHeader) {
+>     // 处理内容变更
+> } else {
+>     // 未修改分支（304 或 ETag/Last-Modified 未变的 200）
+> }
+> ```
+> 
+> 即使代理剥离开条件请求头导致收到 200，只要 ETag 相同，`IsModified()` 会返回 false，逻辑正确。
+
+### 13.6 代理与缓存协商语义总结
+
+| 场景 | 缓存协商语义是否被改写 | 数据一致性 | 带宽效率 | 代码适配 |
+|------|---------------------|-----------|---------|---------|
+| 无代理，直连源站 | ❌ 不改变 | ✅ 完全一致 | ✅ 最优 | ✅ 标准处理 |
+| Feed 专属代理（ProxyURL） | ⚠️ 取决于代理实现 | ✅ 一致 | ⚠️ 取决于代理 | ✅ 正常工作 |
+| 全局代理（FetchViaProxy） | ⚠️ 取决于代理实现 | ✅ 一致 | ⚠️ 取决于代理 | ✅ 正常工作 |
+| 代理轮换池（ProxyRotator） | ⚠️⚠️ 可能不一致 | ✅ 一致 | ❌ 可能较差（每次不同 IP，CDN 边缘未命中） | ⚠️ 可能降低缓存命中率 |
+| 透明代理（非 Miniflux 配置） | ⚠️⚠️ 完全不可控 | ✅ 一致 | ❌ 可能较差（可能剥离缓存头） | ❌ 无处理 |
+| 反向 CDN（源站自行配置） | ⚠️ CDN 内部 ETag 映射 | ✅ 一致 | ✅ 通常良好（CDN 会保留缓存头语义） | ✅ 正常工作 |
+| 本地缓存代理（多级缓存） | ⚠️ 可能收到 200 而非 304 | ✅ 一致 | ✅ 良好（`IsModified()` 兜底） | ✅ ETag 比较提供等价语义 |
+| Cloudflare 挑战（bot 保护） | ❌ 完全不缓存 | ✅ N/A（错误） | ❌ 每次都是 403 错误页 | ✅ 专门识别并提示用户 |
+
+**核心设计思想**：
+- Miniflux 的缓存协商逻辑不依赖 Go `http.Client` 的内置缓存（实际上没有）
+- 所有缓存判断在 Miniflux 代码层完成，语义可控
+- 即使中间层改变了响应状态码（如 200 → 304 或 304 → 200），通过 ETag/Last-Modified 的**事后比较**仍能维持正确的业务语义
+- 最坏情况是**效率降低**（多下载完整内容），但不会出现**数据错误**（漏看新内容或显示旧内容）
+
+## 十四、相关文件清单
 
 | 文件路径 | 作用 |
 |----------|------|
-| `internal/model/feed.go` | Feed 数据模型，包含缓存字段和调度逻辑 |
+| `internal/model/feed.go` | Feed 数据模型，包含缓存字段、调度逻辑和错误计数 |
 | `internal/model/job.go` | Job 数据模型，用于刷新任务队列 |
 | `internal/model/web_session.go` | Web 会话管理，包含强制刷新防刷机制 |
-| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，设置缓存协商头 |
-| `internal/reader/fetcher/response_handler.go` | HTTP 响应处理，解析缓存头、判断修改 |
-| `internal/reader/handler/handler.go` | Feed 刷新业务逻辑 |
+| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，设置缓存协商头，三级代理配置 |
+| `internal/reader/fetcher/response_handler.go` | HTTP 响应处理，解析缓存头、错误分类、Cloudflare 挑战检测 |
+| `internal/reader/fetcher/response_handler_test.go` | 响应处理测试，包含 Cloudflare 挑战和 IsModified 测试用例 |
+| `internal/reader/handler/handler.go` | Feed 刷新业务逻辑，429 限流处理、错误持久化出口 |
 | `internal/reader/rss/rss.go` | RSS XML 结构定义，包含 TTL 字段 |
 | `internal/reader/rss/adapter.go` | RSS 适配器，TTL 字段解析转换 |
 | `internal/reader/processor/processor.go` | Feed 条目处理逻辑 |
-| `internal/storage/feed.go` | Feed 数据持久化 |
-| `internal/storage/batch.go` | 批次构建，生成刷新任务 |
-| `internal/storage/entry.go` | 条目数据操作，包含 FOR UPDATE SKIP LOCKED 示例 |
+| `internal/storage/feed.go` | Feed 数据持久化，UpdateFeedError 只更新错误相关字段 |
+| `internal/storage/batch.go` | 批次构建，WithErrorLimit 错误过滤、WithLimitPerHost 主机限流 |
+| `internal/storage/entry.go` | 条目数据操作，包含 FOR UPDATE SKIP LOCKED 行锁示例 |
+| `internal/storage/nav_metadata.go` | 导航元数据，错误 feed 计数统计 |
 | `internal/database/migrations.go` | 数据库表结构定义 |
-| `internal/cli/refresh_feeds.go` | CLI 批量刷新调度 |
-| `internal/cli/scheduler.go` | 后台调度器，定时触发刷新 |
-| `internal/worker/pool.go` | Worker 池管理 |
-| `internal/worker/worker.go` | Worker 执行逻辑 |
-| `internal/ui/feed_refresh.go` | Web UI 刷新接口 |
+| `internal/cli/refresh_feeds.go` | CLI 批量刷新调度入口 |
+| `internal/cli/scheduler.go` | 后台调度器，传递 POLLING_PARSING_ERROR_LIMIT 配置 |
+| `internal/worker/pool.go` | Worker 池管理，channel 任务队列 |
+| `internal/worker/worker.go` | Worker 执行逻辑，调用 RefreshFeed |
+| `internal/ui/feed_refresh.go` | Web UI 刷新接口（单个/全部），ForceRefreshInterval 防刷 |
 | `internal/ui/category_refresh.go` | Web UI 分类刷新接口 |
 | `internal/api/feed_handlers.go` | API 刷新接口 |
-| `internal/config/options.go` | 配置选项，包含调度和刷新相关配置 |
+| `internal/proxyrotator/proxyrotator.go` | 代理轮换池实现，HTTP_CLIENT_PROXIES 处理 |
+| `internal/config/options.go` | 配置选项，POLLING_PARSING_ERROR_LIMIT、三级代理等配置定义 |
+| `internal/config/options_parsing_test.go` | 配置解析测试，包含 PARSING_ERROR_LIMIT 测试用例 |
+| `internal/http/server/middleware.go` | HTTP 服务器中间件，X-Forwarded-Proto 处理 |
+| `internal/http/response/builder.go` | HTTP 响应构建，Miniflux 作为服务端的 Vary: Accept-Encoding 设置 |
+| `internal/http/request/client_ip.go` | 客户端 IP 解析，X-Forwarded-For / X-Real-Ip 处理 |
+| `internal/locale/translations/zh_CN.json` | 中文翻译，包含 Cloudflare 挑战提示信息 |
