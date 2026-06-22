@@ -2064,26 +2064,614 @@ type FeedCacheKey struct {
 
 ---
 
-## 十六、相关文件清单
+## 十六、ETag / Cache Header 与持久化路径的结合
+
+本节从代码层面详细跟踪 ETag、Last-Modified、Cache-Control 等 HTTP 缓存头在"抓取 → 判断 → 写入数据库"全链路中与持久化的结合方式。
+
+### 16.1 三条持久化路径
+
+Miniflux 的 feed 缓存数据通过三条不同的 SQL 路径写入数据库，每条路径更新的字段集合不同：
+
+| 路径 | 函数 | 触发时机 | 更新的缓存相关字段 |
+|------|------|---------|-----------------|
+| **完整更新** | `UpdateFeed()` | 刷新成功（内容修改或未修改） | `etag_header`, `last_modified_header`, `checked_at`, `next_check_at`, `parsing_error_count=0`, `parsing_error_msg=""` |
+| **错误更新** | `UpdateFeedError()` | 刷新失败（任何错误） | `parsing_error_msg`, `parsing_error_count++`, `checked_at`, `next_check_at`（**不更新** etag_header / last_modified_header） |
+| **创建写入** | `CreateFeed()` | 首次订阅 feed | `etag_header`, `last_modified_header`（从初始响应获取）|
+
+### 16.2 创建 Feed 时的缓存头初始化
+
+#### 16.2.1 路径一：从 HTTP 响应创建（CreateFeed）
+
+`internal/reader/handler/handler.go:103-192`
+
+```
+用户提交订阅 URL
+    │
+    ▼
+1. 构建 HTTP 请求（CreateFeed 不带缓存协商头，因为是首次请求）
+    requestBuilder := fetcher.NewRequestBuilder().
+        WithUsernameAndPassword(...).
+        WithUserAgent(...).
+        // 注意：没有 WithETag() / WithLastModified()
+        // 首次请求没有已知的缓存值
+    
+2. 执行请求，获取响应
+    responseHandler := fetcher.NewResponseHandler(requestBuilder.ExecuteRequest(feedURL))
+    
+3. 检查重复
+    store.FeedURLExists(userID, responseHandler.EffectiveURL())
+    → SQL: SELECT true FROM feeds WHERE user_id=$1 AND feed_url=$2 LIMIT 1
+    
+4. 从响应头提取缓存值
+    subscription.EtagHeader = responseHandler.ETag()           ← 写入
+    subscription.LastModifiedHeader = responseHandler.LastModified() ← 写入
+    subscription.FeedURL = responseHandler.EffectiveURL()
+    
+5. 设置初始时间戳
+    subscription.CheckedNow()  → CheckedAt = now()
+    // ScheduleNextCheck 未在 CreateFeed 中调用
+    // NextCheckAt 使用数据库默认值 now()
+    
+6. 持久化到数据库
+    store.CreateFeed(subscription)
+    → SQL INSERT 包含 etag_header ($6) 和 last_modified_header ($7)
+```
+
+**关键代码** (`internal/reader/handler/handler.go:170-175`)：
+```go
+subscription.EtagHeader = responseHandler.ETag()
+subscription.LastModifiedHeader = responseHandler.LastModified()
+subscription.FeedURL = responseHandler.EffectiveURL()
+subscription.ProxyURL = feedCreationRequest.ProxyURL
+subscription.WithCategoryID(feedCreationRequest.CategoryID)
+subscription.CheckedNow()
+```
+
+#### 16.2.2 路径二：从订阅发现创建（CreateFeedFromSubscriptionDiscovery）
+
+`internal/reader/handler/handler.go:40-101`
+
+此路径用于 OPML 导入或浏览器扩展推送等场景，**不发送 HTTP 请求**，而是直接使用上游已获取的缓存头：
+
+```go
+subscription.EtagHeader = feedCreationRequest.ETag
+subscription.LastModifiedHeader = feedCreationRequest.LastModified
+```
+
+`FeedCreationRequestFromSubscriptionDiscovery` 结构体携带了上游传递的缓存值：
+```go
+type FeedCreationRequestFromSubscriptionDiscovery struct {
+    Content      io.ReadSeeker
+    ETag         string           // ← 上游已获取的 ETag
+    LastModified string           // ← 上游已获取的 Last-Modified
+    FeedCreationRequest
+}
+```
+
+### 16.3 刷新 Feed 时的缓存头更新路径
+
+#### 16.3.1 成功刷新 → UpdateFeed
+
+**代码位置** (`internal/reader/handler/handler.go:272-371`)
+
+```
+RefreshFeed 开始
+    │
+    ├─ originalFeed.CheckedNow()  → CheckedAt = now()
+    ├─ originalFeed.ScheduleNextCheck(weeklyEntryCount, 0)  → NextCheckAt 推远
+    │
+    ├─ 构建 HTTP 请求（带缓存协商头）
+    │   requestBuilder.WithETag(originalFeed.EtagHeader)
+    │   requestBuilder.WithLastModified(originalFeed.LastModifiedHeader)
+    │
+    ├─ 执行请求，获取响应
+    │
+    ├─ 判断 IsModified()
+    │   │
+    │   ├─ 内容已修改 (200)
+    │   │   ├─ ReadBody → 解码 (gzip/br)
+    │   │   ├─ ParseFeed → 解析 XML/JSON
+    │   │   ├─ ScheduleNextCheck(refreshDelay)  → NextCheckAt 基于 TTL/Cache-Control/Expires
+    │   │   ├─ ProcessFeedEntries → 处理条目
+    │   │   ├─ RefreshFeedEntries → 写入条目
+    │   │   │
+    │   │   ├─ ★ originalFeed.EtagHeader = responseHandler.ETag()
+    │   │   ├─ ★ originalFeed.LastModifiedHeader = responseHandler.LastModified()
+    │   │   │
+    │   │   └─ originalFeed.ResetErrorCounter()
+    │   │       → ParsingErrorCount = 0
+    │   │       → ParsingErrorMsg = ""
+    │   │
+    │   └─ 内容未修改 (304 或 ETag/Last-Modified 相同)
+    │       ├─ ScheduleNextCheck 未再调用（使用刷新开始时设置的值）
+    │       │
+    │       ├─ ★ if responseHandler.LastModified() != "" {
+    │       │      originalFeed.LastModifiedHeader = responseHandler.LastModified()
+    │       │  }
+    │       │  // 注意：304 时不更新 ETag（因为 304 响应通常不携带新 ETag）
+    │       │
+    │       └─ originalFeed.ResetErrorCounter()
+    │           → ParsingErrorCount = 0
+    │           → ParsingErrorMsg = ""
+    │
+    └─ ★ store.UpdateFeed(originalFeed)
+        → SQL UPDATE 包含 etag_header=$5, last_modified_header=$6
+        → WHERE id=$40 AND user_id=$41
+```
+
+**UpdateFeed 的完整字段映射** (`internal/storage/feed.go:329-418`)：
+
+```sql
+UPDATE feeds SET
+    feed_url=$1,
+    site_url=$2,
+    title=$3,
+    category_id=$4,
+    etag_header=$5,              ← 缓存头
+    last_modified_header=$6,     ← 缓存头
+    checked_at=$7,               ← 时间戳
+    parsing_error_msg=$8,        ← 错误信息（成功时为空）
+    parsing_error_count=$9,      ← 错误计数（成功时为 0）
+    ...
+    next_check_at=$22,           ← 调度时间
+    ignore_http_cache=$23,       ← 缓存开关
+    ...
+WHERE id=$40 AND user_id=$41
+```
+
+#### 16.3.2 刷新失败 → UpdateFeedError
+
+**代码位置** (`internal/reader/handler/handler.go:30-38` → `internal/storage/feed.go:427-452`)
+
+```
+RefreshFeed 遇到错误
+    │
+    ├─ getTranslatedLocalizedError()
+    │   ├─ originalFeed.WithTranslatedErrorMessage(message)
+    │   │   → ParsingErrorCount++
+    │   │   → ParsingErrorMsg = 翻译后的错误信息
+    │   │
+    │   └─ store.UpdateFeedError(originalFeed)
+    │       → SQL UPDATE 只更新 4 个字段:
+    │           parsing_error_msg=$1
+    │           parsing_error_count=$2
+    │           checked_at=$3
+    │           next_check_at=$4
+    │       → ★ etag_header 和 last_modified_header 不在 UPDATE 列表中
+    │       → 保留上次成功的缓存值
+```
+
+**UpdateFeedError 的 SQL** (`internal/storage/feed.go:428-438`)：
+```sql
+UPDATE feeds SET
+    parsing_error_msg=$1,
+    parsing_error_count=$2,
+    checked_at=$3,
+    next_check_at=$4
+WHERE id=$5 AND user_id=$6
+```
+
+#### 16.3.3 429 限流时的特殊路径
+
+429 处理在 `LocalizedError()` 之前执行，同时影响 `NextCheckAt`：
+
+```
+RefreshFeed 遇到 429
+    │
+    ├─ responseHandler.IsRateLimited() → true
+    │   ├─ retryDelay = responseHandler.ParseRetryDelay()
+    │   └─ originalFeed.ScheduleNextCheck(weeklyEntryCount, retryDelay)
+    │       → NextCheckAt = now() + max(基础间隔, retryDelay)
+    │
+    ├─ responseHandler.LocalizedError() → 返回 429 错误
+    │
+    └─ getTranslatedLocalizedError()
+        ├─ ParsingErrorCount++
+        └─ store.UpdateFeedError(originalFeed)
+            → NextCheckAt 已包含 Retry-After 延迟
+            → etag_header / last_modified_header 保留不变
+```
+
+### 16.4 缓存头持久化的完整字段追踪
+
+| 阶段 | etag_header | last_modified_header | checked_at | next_check_at | parsing_error_count | 触发的 SQL |
+|------|------------|---------------------|-----------|--------------|-------------------|-----------|
+| 首次创建 | 响应的 ETag | 响应的 Last-Modified | now() | now()（默认） | 0 | `INSERT` |
+| 刷新 - 200 修改 | 新 ETag | 新 Last-Modified | now() | now()+interval | 0（清零） | `UpdateFeed` |
+| 刷新 - 304 未修改 | 保持不变 | 更新（如有新值） | now() | 刷新开始时已设置 | 0（清零） | `UpdateFeed` |
+| 刷新 - 4xx/5xx 错误 | 保持不变 | 保持不变 | now() | now()+interval | +1 | `UpdateFeedError` |
+| 刷新 - 429 限流 | 保持不变 | 保持不变 | now() | now()+max(interval, Retry-After) | +1 | `UpdateFeedError` |
+| 刷新 - 网络错误 | 保持不变 | 保持不变 | now() | 刷新开始时已设置 | +1 | `UpdateFeedError` |
+
+### 16.5 304 与 200 的 ETag/Last-Modified 更新差异
+
+#### 16.5.1 内容修改时（200）
+
+```go
+// internal/reader/handler/handler.go:341-342
+originalFeed.EtagHeader = responseHandler.ETag()           // 总是更新
+originalFeed.LastModifiedHeader = responseHandler.LastModified() // 总是更新
+```
+
+200 响应通常携带完整的缓存头，两者都会更新。
+
+#### 16.5.2 内容未修改时（304）
+
+```go
+// internal/reader/handler/handler.go:357-361
+if responseHandler.LastModified() != "" {
+    originalFeed.LastModifiedHeader = responseHandler.LastModified()
+}
+// 注意：没有对 ETag 做类似的更新
+```
+
+**为什么 304 时更新 Last-Modified 但不更新 ETag？**
+
+1. **RFC 9111 第 3.2 节和第 4.3.4 节**：304 响应可以携带更新的缓存头，用于"新鲜度验证"后更新已缓存的响应元数据
+2. **Last-Modified 可能更新**：即使内容未变，服务器可能返回更精确的修改时间（如时间戳精度从秒提升到亚秒）
+3. **ETag 通常不变**：304 响应中的 ETag 应与请求中的 `If-None-Match` 值相同（服务器只在内容变化时改变 ETag）。但 304 响应**可能不携带 ETag 头**（合法行为），此时 `responseHandler.ETag()` 返回空字符串。如果强行更新，会把有效的 ETag 清空，导致下次请求无法协商
+
+**设计逻辑**：
+- Last-Modified 即使被更新，也只是时间精度的变化，不影响"内容是否修改"的判断
+- ETag 如果被清空，后果严重——退化为无缓存模式，浪费带宽
+
+### 16.6 数据库约束对缓存数据完整性的保障
+
+#### 16.6.1 feeds 表约束
+
+```sql
+-- internal/database/migrations.go:56-72
+CREATE TABLE feeds (
+    id BIGSERIAL,
+    user_id int not null,
+    category_id int not null,
+    feed_url text not null,
+    site_url text not null,
+    etag_header text default '',           -- 缓存字段
+    last_modified_header text default '',   -- 缓存字段
+    parsing_error_count int default 0,
+    primary key (id),
+    unique (user_id, feed_url),            -- ★ 同一用户不能有重复 URL
+    foreign key (user_id) references users(id) on delete cascade,
+    foreign key (category_id) references categories(id) on delete cascade
+);
+```
+
+**关键约束**：`UNIQUE (user_id, feed_url)` — 同一用户下 feed URL 唯一。但**不同用户可以订阅相同的 feed URL**，各自拥有独立的 feed 记录和缓存值。
+
+#### 16.6.2 entries 表约束
+
+```sql
+-- internal/database/migrations.go:76-91
+CREATE TABLE entries (
+    id BIGSERIAL,
+    user_id int not null,
+    feed_id bigint not null,
+    hash text not null,
+    ...
+    primary key (id),
+    unique (feed_id, hash),                -- ★ 同一 feed 下条目哈希唯一
+    foreign key (user_id) references users(id) on delete cascade,
+    foreign key (feed_id) references feeds(id) on delete cascade
+);
+```
+
+**关键约束**：`UNIQUE (feed_id, hash)` — 条目去重基于 `(feed_id, hash)` 组合，而不是 `(user_id, hash)`。这意味着同一用户的不同 feed 即使有相同 hash 的条目，也会各自存储。
+
+## 十七、多用户共享同一 Feed 时的缓存数据隔离机制
+
+当多个用户订阅同一个外部 feed URL 时（如 `https://example.com/feed.xml`），Miniflux 为每个用户创建**完全独立的 feed 记录**。本节分析这种设计对缓存数据隔离的影响。
+
+### 17.1 数据模型：每用户一份 Feed 记录
+
+#### 17.1.1 核心设计
+
+```
+外部 Feed URL: https://example.com/feed.xml
+
+┌─────────────────────────────────────┐
+│            feeds 表                  │
+├──────┬─────────┬────────────────────┤
+│  id  │ user_id │ feed_url           │ etag_header │ last_modified_header │
+├──────┼─────────┼────────────────────┼─────────────┼──────────────────────┤
+│  1   │   100   │ https://example... │ "abc123"    │ "Wed, 01 Jun..."     │
+│  2   │   200   │ https://example... │ ""          │ ""                   │
+│  3   │   300   │ https://example... │ "abc123"    │ "Wed, 01 Jun..."     │
+└──────┴─────────┴────────────────────┴─────────────┴──────────────────────┘
+```
+
+- 用户 100 和 300 的 ETag 相同（都已成功刷新过）
+- 用户 200 的 ETag 为空（刚订阅，尚未首次刷新）
+- 三条记录**完全独立**，互不影响
+
+#### 17.1.2 唯一约束的作用域
+
+```sql
+UNIQUE (user_id, feed_url)
+```
+
+此约束**只保证同一用户下 feed_url 不重复**，不阻止不同用户订阅相同 URL。这意味着：
+- 用户 A 订阅 `https://example.com/feed.xml` → feed id=1
+- 用户 B 也订阅 `https://example.com/feed.xml` → feed id=2
+- 两条记录**独立存储** ETag、Last-Modified、NextCheckAt 等所有字段
+
+### 17.2 缓存隔离的完整影响
+
+#### 17.2.1 ETag / Last-Modified 隔离
+
+每个用户的 feed 记录有**独立的缓存协商状态**：
+
+| 维度 | 隔离效果 | 说明 |
+|------|---------|------|
+| ETag | ✅ 完全隔离 | 用户 A 的 ETag 可能与用户 B 不同（如果刷新时机不同） |
+| Last-Modified | ✅ 完全隔离 | 同上 |
+| IgnoreHTTPCache | ✅ 完全隔离 | 用户 A 可以忽略缓存，用户 B 正常使用缓存 |
+| NextCheckAt | ✅ 完全隔离 | 用户 A 可能在 T1 刷新，用户 B 可能在 T2 刷新 |
+| ParsingErrorCount | ✅ 完全隔离 | 用户 A 的 feed 可能报错，用户 B 正常 |
+
+**场景示例**：
+
+```
+T0: 用户 A 和用户 B 都订阅了 https://example.com/feed.xml
+
+T1: 调度器触发用户 A 的 feed 刷新
+    → 发送 HTTP 请求，携带 If-None-Match: "abc123"
+    → 服务器返回 304 Not Modified
+    → 用户 A 的 etag_header 保持 "abc123"
+
+T2: 用户 B 手动点击"强制刷新"
+    → 发送 HTTP 请求，不携带缓存头（forceRefresh=true）
+    → 服务器返回 200 + 新 ETag: "xyz789"
+    → 用户 B 的 etag_header 更新为 "xyz789"
+
+此时:
+  用户 A: etag_header = "abc123"
+  用户 B: etag_header = "xyz789"
+  两者完全独立，互不干扰
+```
+
+#### 17.2.2 条目数据隔离
+
+条目通过 `(feed_id, hash)` 唯一约束去重，**不是** `(user_id, hash)`：
+
+```sql
+-- internal/storage/entry.go:212-217
+func (s *Storage) entryExists(tx *sql.Tx, entry *model.Entry) (bool, error) {
+    // Note: This query uses entries_feed_id_hash_key index
+    // (filtering on user_id is not necessary).
+    err := tx.QueryRow(
+        `SELECT true FROM entries WHERE feed_id=$1 AND hash=$2 LIMIT 1`,
+        entry.FeedID, entry.Hash,
+    ).Scan(&result)
+}
+```
+
+**这意味着**：
+- 用户 A 的 feed（id=1）和用户 B 的 feed（id=2）可以有**相同 hash 的条目**
+- 各自独立存储，互不干扰
+- 同一条文章在两个用户下是完全独立的记录
+
+**数据层面**：
+```
+┌──────────────────────────────────────────────────┐
+│              entries 表                           │
+├──────┬─────────┬─────────┬──────────┬────────────┤
+│  id  │ user_id │ feed_id │   hash   │   title    │
+├──────┼─────────┼─────────┼──────────┼────────────┤
+│ 101  │   100   │    1    │ h_sha256 │ Article X  │ ← 用户 A 的条目
+│ 102  │   200   │    2    │ h_sha256 │ Article X  │ ← 用户 B 的条目（相同 hash，不同 feed_id）
+└──────┴─────────┴─────────┴──────────┴────────────┘
+```
+
+#### 17.2.3 条目状态隔离
+
+每个用户的条目有独立的状态（read/unread/removed）：
+
+```
+用户 A: Article X → status = "read"     （已读）
+用户 B: Article X → status = "unread"   （未读）
+```
+
+状态字段存储在 `entries` 表中，与 `user_id` 直接关联。
+
+### 17.3 缓存隔离的代价：重复 HTTP 请求
+
+由于每个用户有独立的 feed 记录，**同一外部 URL 会被多次请求**：
+
+```
+调度器批处理:
+  → 选中 feed(id=1, user_id=100, feed_url="https://example.com/feed.xml")
+  → 选中 feed(id=2, user_id=200, feed_url="https://example.com/feed.xml")
+
+Worker 1 处理 feed#1:
+  → HTTP GET https://example.com/feed.xml (If-None-Match: "abc123")
+  → 304 Not Modified
+
+Worker 2 处理 feed#2:
+  → HTTP GET https://example.com/feed.xml (If-None-Match: "xyz789")
+  → 200 OK (因为 ETag 不同)
+```
+
+**问题**：
+1. 相同 URL 被请求两次（或更多次，取决于订阅用户数）
+2. 不同用户的 ETag 可能不一致（如上例），导致一个获得 304、另一个获得 200
+3. 200 响应需要完整下载和解析，但内容实际与另一个用户的 304 内容相同
+
+**缓解机制**：`POLLING_LIMIT_PER_HOST` 限制了同一批次中同一主机的 feed 数量，间接限制了重复请求的并发度。但不同批次或不同调度周期仍会产生重复。
+
+### 17.4 缓存隔离的收益：用户级定制
+
+完全隔离的设计也为用户级定制提供了基础：
+
+| 定制维度 | 代码位置 | 说明 |
+|---------|---------|------|
+| **IgnoreHTTPCache** | `model/feed.go:50` | 用户 A 可忽略缓存强制刷新，用户 B 正常缓存 |
+| **UserAgent** | `handler/handler.go:225` | 不同用户可设置不同 UA，可能导致服务器返回不同内容 |
+| **Cookie** | `handler/handler.go:226` | 不同用户的 Cookie 不同，可能影响个性化 feed 内容 |
+| **Username/Password** | `handler/handler.go:224` | 认证信息不同，可能看到不同的私密 feed |
+| **FetchViaProxy** | `model/feed.go:52` | 用户 A 走代理，用户 B 直连，源站可能返回不同内容 |
+| **ProxyURL** | `model/feed.go:64` | 每个用户可配置独立代理 |
+| **ScraperRules/RewriteRules** | `model/feed.go:38-39` | 条目处理规则不同 |
+| **DisableHTTP2** | `model/feed.go:54` | 传输层差异可能影响 CDN 行为 |
+| **AllowSelfSignedCertificates** | `model/feed.go:51` | TLS 验证差异可能导致不同的响应链路 |
+
+**关键认识**：由于以上定制维度的存在，即使两个用户订阅了相同的 feed URL，他们实际收到的内容可能**不同**（例如带认证的 feed、个性化推荐 feed、基于 Cookie 的内容过滤等）。因此缓存隔离不是冗余，而是**功能正确性的必要条件**。
+
+### 17.5 调度层面的隔离
+
+#### 17.5.1 批次查询的 user_id 作用域
+
+手动刷新（UI/API）时，批次查询限定在特定用户：
+
+```go
+// internal/ui/feed_refresh.go (refreshAllFeeds)
+jobs, err := h.store.NewBatchBuilder().
+    WithoutDisabledFeeds().
+    WithUserID(userID).              // ← 限定当前用户
+    WithLimitPerHost(config.Opts.PollingLimitPerHost()).
+    FetchJobs()
+```
+
+后台调度时，批次查询**不限定用户**（处理所有用户的 feed）：
+
+```go
+// internal/cli/scheduler.go (feedScheduler)
+jobs, err := store.NewBatchBuilder().
+    WithBatchSize(batchSize).
+    WithErrorLimit(errorLimit).
+    WithoutDisabledFeeds().
+    WithNextCheckExpired().
+    WithLimitPerHost(limitPerHost).
+    // 注意：没有 WithUserID()，处理所有用户
+    FetchJobs()
+```
+
+#### 17.5.2 刷新操作的 user_id 校验
+
+`RefreshFeed` 函数接收 `userID` 和 `feedID` 参数，并通过 `FeedByID` 查询确保 feed 归属该用户：
+
+```go
+// internal/reader/handler/handler.go:202
+originalFeed, storeErr := store.FeedByID(userID, feedID)
+
+// internal/storage/feed.go:200-213
+func (s *Storage) FeedByID(userID, feedID int64) (*model.Feed, error) {
+    feed, err := s.NewFeedQueryBuilder(userID).  // ← user_id 作为查询条件
+        WithFeedID(feedID).
+        GetFeed()
+    // ...
+}
+
+// feedQueryBuilder 默认条件:
+// conditions: []string{"f.user_id = $1"}
+```
+
+**安全保证**：用户 A 无法通过 `RefreshFeed` 访问或修改用户 B 的 feed 缓存数据，因为 SQL 查询始终包含 `user_id = $1` 条件。
+
+#### 17.5.3 UpdateFeed 的 user_id 双重校验
+
+```sql
+-- internal/storage/feed.go:373-374
+UPDATE feeds SET ...
+WHERE id=$40 AND user_id=$41
+```
+
+即使应用层传入了错误的 feed 对象，`WHERE user_id=$41` 条件确保不会跨用户更新缓存字段。
+
+### 17.6 隔离模型总结
+
+```
+                    外部 Feed URL
+                   https://example.com/feed.xml
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+         ┌────────┐   ┌────────┐   ┌────────┐
+         │ User A │   │ User B │   │ User C │
+         │ feed#1 │   │ feed#2 │   │ feed#3 │
+         ├────────┤   ├────────┤   ├────────┤
+         │ ETag   │   │ ETag   │   │ ETag   │  ← 各自独立
+         │ LastMo │   │ LastMo │   │ LastMo │  ← 各自独立
+         │ NextCh │   │ NextCh │   │ NextCh │  ← 各自独立
+         │ Errors │   │ Errors │   │ Errors │  ← 各自独立
+         │ Cookie │   │ Cookie │   │ Cookie │  ← 可能不同
+         │ UA     │   │ UA     │   │ UA     │  ← 可能不同
+         │ Proxy  │   │ Proxy  │   │ Proxy  │  ← 可能不同
+         ├────────┤   ├────────┤   ├────────┤
+         │entries │   │entries │   │entries │  ← 各自独立
+         │ A-101  │   │ B-201  │   │ C-301  │
+         │ A-102  │   │ B-202  │   │ C-302  │
+         └────────┘   └────────┘   └────────┘
+              │             │             │
+              ▼             ▼             ▼
+         同一外部 URL 被请求 3 次（无共享缓存）
+```
+
+**隔离的维度**：
+
+| 维度 | 隔离 | 共享 | 说明 |
+|------|------|------|------|
+| Feed 记录 | ✅ 每用户独立 | ❌ | 每用户一条 feed 记录 |
+| ETag / Last-Modified | ✅ 每用户独立 | ❌ | 缓存协商状态独立 |
+| NextCheckAt | ✅ 每用户独立 | ❌ | 调度时间独立 |
+| HTTP 请求 | ❌ 重复发送 | ❌ | 同一 URL 被多次请求 |
+| 响应内容 | ✅ 可能不同 | ❌ | Cookie/UA/认证差异 |
+| 条目数据 | ✅ 每用户独立 | ❌ | 条目存储和状态独立 |
+| Feed Icon | ❌ | ✅ 共享 | `icons` 表按 URL hash 全局去重 |
+| Feed Icon 检查 | ❌ | ✅ 共享 | `icon.NewIconChecker` 跨用户共享图标 |
+
+### 17.7 潜在改进：共享缓存层
+
+如果需要减少重复 HTTP 请求，可以考虑在应用层添加一个**共享缓存层**（类似 HTTP 共享缓存 / RFC 9111 第 3.1 节的 "shared cache"）：
+
+```
+┌─────────┐     ┌───────────────┐     ┌──────────┐
+│ User A  │     │               │     │          │
+│ feed#1  │────▶│  共享缓存层   │────▶│  源站    │
+│         │     │  (内存/Redis) │     │          │
+├─────────┤     │               │     │          │
+│ User B  │     │  key: URL     │     │          │
+│ feed#2  │────▶│  val: ETag,   │     │          │
+│         │     │       body,   │     │          │
+├─────────┤     │       TTL     │     │          │
+│ User C  │     │               │     │          │
+│ feed#3  │────▶│               │     │          │
+└─────────┘     └───────────────┘     └──────────┘
+```
+
+**注意事项**：
+- 共享缓存只适用于**无认证、无 Cookie、无个性化**的公共 feed
+- 对于带认证或个性化的 feed，缓存键必须包含 `(URL, Cookie, Username)` 等上下文
+- 需要处理 `Vary` 头语义（如 `Vary: Cookie` 时，不同 Cookie 值需要不同缓存条目）
+- 当前 Miniflux **没有**实现此优化
+
+---
+
+## 十八、相关文件清单
 
 | 文件路径 | 作用 |
 |----------|------|
-| `internal/model/feed.go` | Feed 数据模型，包含缓存字段、ScheduleNextCheck 调度逻辑和错误计数 |
+| `internal/model/feed.go` | Feed 数据模型，缓存字段定义、ScheduleNextCheck 调度逻辑、错误计数、WithTranslatedErrorMessage |
+| `internal/model/feed_creation_request.go` | Feed 创建请求模型，包含 ETag/LastModified 传递（订阅发现路径） |
 | `internal/model/job.go` | Job 数据模型，用于刷新任务队列 |
 | `internal/model/web_session.go` | Web 会话管理，包含 ForceRefreshInterval 防刷机制 |
-| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，Accept-Encoding 设置（br,gzip），三级代理配置，Transport 配置 |
+| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，Accept-Encoding 设置（br,gzip）、三级代理配置、Transport 配置 |
 | `internal/reader/fetcher/response_handler.go` | HTTP 响应处理，gzip/br 解码器、ETag/Last-Modified 解析、错误分类、Cloudflare 挑战检测 |
 | `internal/reader/fetcher/response_handler_test.go` | 响应处理测试，包含 Cloudflare 挑战、IsModified 测试用例 |
 | `internal/reader/fetcher/readclosers.go` | 自定义 Brotli/Gzip ReadCloser 解码器实现 |
-| `internal/reader/handler/handler.go` | Feed 刷新业务逻辑，NextCheckAt 前置更新、429 限流处理、错误持久化出口 |
+| `internal/reader/handler/handler.go` | Feed 创建/刷新业务逻辑，ETag 写入、NextCheckAt 前置更新、429 限流处理、错误持久化出口 |
 | `internal/reader/rss/rss.go` | RSS XML 结构定义，包含 TTL 字段 |
 | `internal/reader/rss/adapter.go` | RSS 适配器，TTL 字段解析转换 |
 | `internal/reader/processor/processor.go` | Feed 条目处理逻辑 |
-| `internal/storage/feed.go` | Feed 数据持久化，UpdateFeedError 只更新错误相关字段 |
-| `internal/storage/batch.go` | 批次构建，BATCH_SIZE 限制、WithErrorLimit 错误过滤、WithLimitPerHost 主机限流 |
-| `internal/storage/entry.go` | 条目数据操作，包含 FOR UPDATE SKIP LOCKED 行锁示例 |
+| `internal/reader/icon/checker.go` | Feed Icon 检查器，跨用户共享图标 |
+| `internal/reader/opml/handler.go` | OPML 导入，FeedURLExists 去重检查 |
+| `internal/storage/feed.go` | Feed 数据持久化，CreateFeed/UpdateFeed/UpdateFeedError 三条路径 |
+| `internal/storage/feed_query_builder.go` | Feed 查询构建器，user_id 条件注入 |
+| `internal/storage/batch.go` | 批次构建，BATCH_SIZE 限制、WithUserID 用户隔离、WithErrorLimit 错误过滤、WithLimitPerHost 主机限流 |
+| `internal/storage/entry.go` | 条目数据操作，entryExists (feed_id,hash) 去重、RefreshFeedEntries 条目刷新、FOR UPDATE SKIP LOCKED 行锁 |
 | `internal/storage/nav_metadata.go` | 导航元数据，错误 feed 计数统计 |
-| `internal/database/migrations.go` | 数据库表结构定义 |
+| `internal/database/migrations.go` | 数据库表结构定义，UNIQUE(user_id,feed_url) 和 UNIQUE(feed_id,hash) 约束 |
+| `internal/validator/feed.go` | Feed 验证，FeedURLExists/AnotherFeedURLExists 去重校验 |
 | `internal/cli/refresh_feeds.go` | CLI 批量刷新调度入口，Worker Pool 推送任务 |
 | `internal/cli/scheduler.go` | 后台调度器，time.Tick 固定间隔触发，传递 BATCH_SIZE/LIMIT_PER_HOST 等配置 |
 | `internal/worker/pool.go` | Worker 池管理，WORKER_POOL_SIZE 并发上限、channel 任务队列 |
