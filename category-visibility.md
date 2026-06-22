@@ -1077,3 +1077,365 @@ func (s *Storage) CreateFeed(feed *model.Feed) error {
 2. **导入时间长**：OPML 导入需要抓取 feed，可能耗时很久，长事务会占用数据库连接
 3. **幂等性**：`FeedURLExists` 检查保证重复导入不会重复创建，支持断点续导
 4. **feed 创建可能失败**：网络抓取可能失败，不应该因为一个 feed 失败导致全部回滚
+
+---
+
+## 十四、移动大量订阅到新分类的事务隔离与锁竞争
+
+### 14.1 移动订阅的三种路径
+
+代码中存在三种不同的"移动订阅到分类"的操作路径，事务和锁行为差异很大：
+
+| 路径 | 触发方式 | 单次移动数量 | 事务范围 |
+|------|---------|-------------|---------|
+| UpdateFeed | UI 编辑 feed / REST API / Google Reader | 1 个 feed | 单条 SQL，无显式事务 |
+| RemoveAndReplaceCategoriesByName | Google Reader API 删除标签 | 多个 feed（分类下所有） | 一个事务包裹移动 + 删除 |
+| 批量移动（无） | - | - | 不存在批量移动接口 |
+
+### 14.2 路径一：UpdateFeed 单 feed 移动
+
+**核心代码**：`internal/storage/feed.go:329-424`
+
+```go
+func (s *Storage) UpdateFeed(feed *model.Feed) (err error) {
+    query := `
+        UPDATE feeds
+        SET ... category_id=$4 ...
+        WHERE id=$40 AND user_id=$41
+    `
+    _, err = s.db.Exec(query, ..., feed.Category.ID, ..., feed.ID, feed.UserID)
+}
+```
+
+**事务与锁分析**：
+
+1. **无显式事务**：整条 `UPDATE` 是单条 SQL 语句，在数据库隐式事务内执行
+2. **行级锁**：PostgreSQL 对 `feeds` 表中 `id=? AND user_id=?` 的单行加排他锁
+3. **原子性**：要么成功要么失败，不会出现中间状态
+4. **无分类表锁**：只更新 `feeds` 表的 `category_id` 字段，不修改 `categories` 表
+
+**调用链示例（Google Reader API move）**：
+
+文件：`internal/googlereader/handler.go:488-516`
+
+```go
+func move(feedStream Stream, labelStream Stream, store *storage.Storage, userID int64) error {
+    feed, _ := getFeed(feedStream, store, userID)      // 1. SELECT feeds（读，无锁）
+    category, _ := getOrCreateCategory(labelStream, store, userID)  // 2. SELECT / INSERT categories
+    feedModification := model.FeedModificationRequest{
+        CategoryID: &category.ID,
+    }
+    feedModification.Patch(feed)
+    return store.UpdateFeed(feed)                     // 3. UPDATE feeds（行级锁）
+}
+```
+
+**锁竞争风险**：
+
+- 🔴 **读-写竞态**：`getFeed` 和 `UpdateFeed` 之间没有事务包裹，feed 可能在读取后被其他请求修改
+- 🟢 **影响很小**：因为 `UpdateFeed` 用的是完整字段覆盖，即使有竞态，最后一次写会胜出
+- 🟢 **无死锁风险**：单条 UPDATE，只锁一行
+
+### 14.3 路径二：RemoveAndReplaceCategoriesByName 批量移动
+
+**核心代码**：`internal/storage/category.go:244-290`
+
+这是目前代码中**唯一的批量移动分类**操作，发生在删除分类/标签时。
+
+```go
+func (s *Storage) RemoveAndReplaceCategoriesByName(userid int64, titles []string) error {
+    tx, err := s.db.Begin()                          // 开启事务
+    
+    // 1. 检查剩余分类数（SELECT ... count）
+    // 2. 移动 feed 到第一个剩余分类（UPDATE feeds ...）
+    // 3. 删除分类（DELETE FROM categories ...）
+    
+    return tx.Commit()
+}
+```
+
+**完整 SQL 流程**（在一个事务内）：
+
+```sql
+-- 语句 1: 检查至少保留一个分类（共享锁）
+SELECT count(*) FROM categories 
+WHERE user_id = $1 AND title != ANY($2);
+
+-- 语句 2: 批量移动 feed（写锁，影响多行）
+WITH d_cats AS (SELECT id FROM categories WHERE user_id = $1 AND title = ANY($2))
+UPDATE feeds
+SET category_id = (
+    SELECT id FROM categories 
+    WHERE user_id = $1 AND id NOT IN (SELECT id FROM d_cats)
+    ORDER BY title ASC LIMIT 1
+)
+WHERE user_id = $1 AND category_id IN (SELECT id FROM d_cats);
+
+-- 语句 3: 删除分类
+DELETE FROM categories WHERE user_id = $1 AND title = ANY($2);
+```
+
+**事务与锁分析**：
+
+1. **显式事务**：三条 SQL 在一个事务内，原子性保证
+2. **行级锁范围**：
+   - 语句 2 会对所有被移动的 feed 行加排他锁
+   - 语句 3 会对被删除的分类行加排他锁
+3. **锁顺序**：先锁 feeds，再锁 categories（DELETE 时）
+4. **一致性**：事务保证"移动 feed"和"删除分类"要么都成功要么都失败
+
+**锁竞争与潜在死锁**：
+
+- 🔴 **死锁风险**：如果两个请求同时执行删除分类操作，且分类顺序不同，可能出现死锁
+  - 请求 A：删除分类 X → 锁 feeds → 锁 categories X
+  - 请求 B：删除分类 Y → 锁 feeds → 锁 categories Y
+  - 但因为都是 `DELETE FROM categories WHERE ... title = ANY(...)`，PostgreSQL 会按相同顺序加锁吗？实际上取决于执行计划
+- 🟢 **实际风险低**：同一用户同时删除多个分类的场景很少见
+- 🔴 **长时间锁**：如果分类下 feed 很多，`UPDATE feeds` 会锁很多行，持续时间较长
+
+### 14.4 路径三：OPML 导入的隐式移动
+
+OPML 导入时，如果 feed 已存在则直接跳过（`FeedURLExists` 检查），**不会**因为分类名不同而移动 feed。
+
+文件：`internal/reader/opml/handler.go:72-76`
+
+```go
+if h.store.FeedURLExists(userID, subscription.FeedURL) {
+    continue  // 已存在则跳过，不修改分类
+}
+```
+
+**结论**：OPML 导入是"只新增、不修改"的语义，已存在的 feed 分类保持不变。
+
+### 14.5 批量移动的缺失与影响
+
+**现状**：Miniflux 没有"批量移动 N 个 feed 到指定分类"的 API 或 UI 操作。
+
+**如果需要实现批量移动，锁竞争考量**：
+
+```
+方案 A: 循环调用 UpdateFeed
+  ├─ 优点: 简单，每行一个短事务
+  ├─ 缺点: 不是原子操作，可能部分成功部分失败
+  └─ 锁粒度: 单行锁，竞争小
+
+方案 B: 单条 SQL 批量 UPDATE
+  ├─ 优点: 原子性好，一个事务搞定
+  ├─ 缺点: 锁太多行，可能阻塞其他操作
+  └─ 锁粒度: 多行锁，竞争大
+
+方案 C: 分批 + 小事务
+  ├─ 优点: 平衡原子性和并发性
+  └─ 缺点: 实现复杂
+```
+
+### 14.6 关键结论
+
+1. **单 feed 移动**：无显式事务，单行级锁，几乎无锁竞争
+2. **删除分类时的批量移动**：有事务包裹，锁多行，理论上有死锁风险但实际罕见
+3. **没有专门的批量移动接口**：所有批量移动都是删除分类的副作用
+4. **OPML 导入不移动已有 feed**：只新增不修改，避免了复杂的分类变更事务
+
+---
+
+## 十五、OPML 导入导出下分类与可见度规则的兼容性
+
+### 15.1 OPML 格式扩展：Miniflux 命名空间
+
+Miniflux 在标准 OPML 基础上扩展了自定义命名空间，用于导出/导入额外的 feed 属性。
+
+文件：`internal/reader/opml/serializer.go:37`
+
+```go
+opmlDocument.MinifluxNamespace = minifluxOPMLNamespace
+```
+
+OPML 中的分类用两级 `<outline>` 表示：
+- 第一级 outline：分类（text 属性为分类名）
+- 第二级 outline：feed 订阅
+
+### 15.2 导出：哪些信息被导出
+
+**导出代码**：`internal/reader/opml/serializer.go:48-79`
+
+#### 15.2.1 分类级别的导出
+
+只导出**分类名称**字符串，不导出分类的任何属性。
+
+```go
+for _, categoryName := range categories {
+    category := opmlOutline{Text: categoryName, Outlines: ...}  // 只有名称！
+    // ...
+}
+```
+
+**分类级别导出的信息**：
+| 属性 | 是否导出 | 说明 |
+|------|---------|------|
+| 分类名称（title） | ✅ 是 | 作为 outline 的 text 属性 |
+| 分类 ID | ❌ 否 | 不导出，导入时按名称匹配 |
+| 分类 hide_globally | ❌ 否 | **完全不导出** |
+| 分类创建时间 | ❌ 否 | 不导出 |
+
+#### 15.2.2 Feed 级别的导出
+
+Feed 的属性导出比较完整，包括可见度设置。
+
+```go
+opmlOutline{
+    Title:       subscription.Title,
+    FeedURL:     subscription.FeedURL,
+    // ... 标准 OPML字段 ...
+    
+    // Miniflux 扩展字段
+    HideGlobally: subscription.HideGlobally,  // ✅ 导出
+    // ... 其他扩展字段 ...
+}
+```
+
+**Feed 级别导出的可见度相关信息**：
+| 属性 | 是否导出 | 说明 |
+|------|---------|------|
+| feed 的 hide_globally | ✅ 是 | Miniflux 命名空间扩展字段 |
+| 所属分类名称 | ✅ 是 | 通过 outline 层级关系体现 |
+| 所属分类 ID | ❌ 否 | 不导出 |
+| 分类的 hide_globally | ❌ 否 | 不在 feed 级别，也不在分类级别 |
+
+### 15.3 导入：哪些信息被使用
+
+**导入代码**：`internal/reader/opml/parser.go:30-65`
+
+#### 15.3.1 分类的导入行为
+
+分类名称通过 outline 层级解析出来，然后在 `resolveCategory` 中处理：
+
+```go
+func getSubscriptionsFromOutlines(outlines ..., category string) []subcription {
+    for _, outline := range outlines {
+        if outline.IsSubscription() {
+            subscriptions = append(subscriptions, subcription{
+                CategoryName: category,  // 分类名称
+                // ...
+                HideGlobally: outline.HideGlobally,  // feed 的 hide_globally
+            })
+        } else if outline.Outlines.HasChildren() {
+            // 递归，分类名 = outline.GetTitle()
+            subscriptions = append(subscriptions, 
+                getSubscriptionsFromOutlines(outline.Outlines, outline.GetTitle())...)
+        }
+    }
+}
+```
+
+**`resolveCategory` 的匹配规则**（`internal/reader/opml/handler.go:97-119`）：
+
+| 场景 | 行为 |
+|------|------|
+| 分类名为空 | 使用用户的第一个分类 |
+| 分类名已存在 | 复用现有分类（按标题精确匹配） |
+| 分类名不存在 | 创建新分类，使用默认设置（`hide_globally=false`） |
+
+#### 15.3.2 Feed 的导入行为
+
+Feed 级别的 `hide_globally` 会被正确导入。
+
+**应用设置的代码**：`internal/reader/opml/handler.go:82-94`
+
+```go
+feed := &model.Feed{
+    FeedURL:      subscription.FeedURL,
+    Category: &model.Category{ID: category.ID},
+    // ...
+}
+applySubscriptionSettings(feed, subscription)  // 应用包括 HideGlobally 在内的设置
+```
+
+`applySubscriptionSettings` 函数会设置：
+- `HideGlobally`
+- `Crawler`
+- `Disabled`
+- `ScraperRules` / `RewriteRules` 等各种规则
+
+### 15.4 可见度规则的兼容性矩阵
+
+| 维度 | 导出 | 导入 | 兼容性说明 |
+|------|------|------|-----------|
+| 分类名称 | ✅ 导出 | ✅ 导入 | 完全兼容，按名称匹配 |
+| 分类 hide_globally | ❌ 不导出 | ❌ 不导入 | 不兼容，新建分类默认为 false |
+| 分类 ID | ❌ 不导出 | ❌ 不适用 | 设计如此，避免 ID 冲突 |
+| Feed 的 hide_globally | ✅ 导出 | ✅ 导入 | 完全兼容，Miniflux 扩展字段 |
+| 标准 OPML 阅读器 | ✅ 兼容 | ✅ 兼容 | 扩展字段会被忽略 |
+
+### 15.5 实际场景分析
+
+#### 场景一：用户 A 导出 → 用户 B 导入
+
+```
+用户 A 的分类结构：
+  科技资讯 (hide_globally = false)
+    ├── TechCrunch (hide_globally = false)
+    └── 36氪 (hide_globally = true)
+  摸鱼 (hide_globally = true)
+    └── 知乎日报 (hide_globally = false)
+
+          │
+          ▼  导出 OPML
+          │
+  导出内容包含：
+  - 分类名："科技资讯"、"摸鱼"
+  - feed 属性：TechCrunch(false)、36氪(true)、知乎日报(false)
+  - 不包含：分类的 hide_globally 属性
+
+          │
+          ▼  用户 B 导入
+          │
+用户 B 的结果：
+  科技资讯 (hide_globally = false)  ← 新建，默认为 false
+    ├── TechCrunch (hide_globally = false)  ← 正确导入
+    └── 36氪 (hide_globally = true)         ← 正确导入
+  摸鱼 (hide_globally = false)      ← 新建，默认为 false！丢失了隐藏属性
+    └── 知乎日报 (hide_globally = false)    ← 正确导入
+```
+
+**关键发现**：
+- ✅ Feed 级别的 `hide_globally` 完整保留
+- ❌ 分类级别的 `hide_globally` **丢失**，新分类默认为 `false`
+- 🔍 原因：OPML 的分类 outline 上没有 Miniflux 扩展属性，只有 feed outline 上有
+
+#### 场景二：用户自己备份恢复
+
+```
+用户原始分类：
+  工作 (hide_globally = true)
+    └── 公司内网 RSS (hide_globally = false)
+
+          │
+          ▼  导出备份
+          ▼  重新导入
+          │
+结果：
+  工作 (hide_globally = false)  ← 从隐藏变成可见了！
+    └── 公司内网 RSS (hide_globally = false)
+```
+
+**影响**：用户备份恢复后，原来隐藏的分类会变成可见的，全局未读数会突然增加。
+
+### 15.6 为什么分类 hide_globally 不导出？技术原因分析
+
+**代码层面**：
+1. OPML 序列化时，分类只有 `Text: categoryName` 一个属性（`serializer.go:49`）
+2. `subcription` 结构体有 `HideGlobally` 字段，但它是 feed 的属性
+3. 分类级别的 OPML outline 没有对应的 Miniflux 扩展属性
+
+**设计层面的可能原因**：
+1. **OPML 标准限制**：OPML 的 outline 原本是为 feed 设计的，分类只是分组层级
+2. **优先级低**：分类的 hide_globally 不如 feed 的重要，很少有人设置
+3. **兼容性**：在分类 outline 上加自定义属性可能导致某些 OPML 阅读器解析出错
+
+### 15.7 关键结论
+
+1. **Feed 级可见度完整兼容**：`hide_globally` 在导出导入时完整保留，依赖 Miniflux 自定义命名空间
+2. **分类级可见度不兼容**：分类的 `hide_globally` 属性在 OPML 中不导出也不导入，新分类默认为 `false`
+3. **分类按名称匹配**：导入时通过分类名查找或创建，不使用 ID
+4. **已有 feed 不受影响**：导入时已存在的 feed 会被跳过，其分类和可见度设置保持不变
+5. **备份恢复有信息丢失**：用户自己备份恢复时，分类的隐藏属性会丢失
