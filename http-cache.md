@@ -1522,34 +1522,577 @@ if r.ETag() != "" {
 - 即使中间层改变了响应状态码（如 200 → 304 或 304 → 200），通过 ETag/Last-Modified 的**事后比较**仍能维持正确的业务语义
 - 最坏情况是**效率降低**（多下载完整内容），但不会出现**数据错误**（漏看新内容或显示旧内容）
 
-## 十四、相关文件清单
+## 十四、高并发下 Thundering Herd（惊群效应）防护
+
+Thundering Herd（惊群效应）是指大量 feed 同时到期需要刷新时，在同一时刻触发大规模并发请求，导致：
+- 内部 worker 池瞬间打满，正常用户请求被阻塞
+- 对源站/CDN 发起瞬时流量洪峰，可能触发 429 限流或封禁
+- 数据库连接池耗尽，读写事务阻塞
+
+### 14.1 惊群效应的触发场景
+
+#### 14.1.1 典型触发条件
+
+```
+场景 1：大量 feed 使用相同的 min_interval（如默认 1 小时）
+  → 在某一整点时刻，成百上千个 feed 的 next_check_at 同时到期
+  → 同一批次中集中出现大量相同主机的 feed
+
+场景 2：CDN/源站从故障中恢复
+  → 之前因 4xx/5xx 被 WithErrorLimit 过滤的 feed
+  → 用户手动点击"全部刷新"按钮
+  → 所有 feed 的 next_check_at 被重置为 now()（ResetNextCheckAt）
+  → 瞬间产生海量待处理任务
+
+场景 3：应用重启后首次调度
+  → 重启前大量 feed 的 next_check_at 已经过期
+  → 调度器启动后第一批次包含最多的待刷新 feed
+  → 形成"冷启动峰值"
+
+场景 4：热门内容源批量更新
+  → 某新闻平台、博客聚合站在固定时间发布内容
+  → 订阅该站的所有 feed 同时检测到内容修改
+  → 虽然 HTTP 层面各自独立，但业务层（条目标识、集成推送）同时处理
+```
+
+### 14.2 Miniflux 的实际防护机制
+
+Miniflux **没有专门的惊群效应防护模块**（如显式 jitter、sliding window、漏桶/令牌桶等），但通过多种设计的组合效应实现了一定程度的缓解。
+
+#### 14.2.1 防线一：批次大小限制
+
+**机制**：`BATCH_SIZE` 配置项（默认值视部署而定）限制每个调度周期内进入 worker 池的任务数上限。
+
+**代码位置** (`internal/storage/batch.go:61-69, 134`)：
+```go
+func (b *batchBuilder) WithBatchSize(batchSize int) *batchBuilder {
+    if batchSize > 0 {
+        b.batchSize = batchSize
+    }
+    return b
+}
+
+// FetchJobs 中：
+query += " ORDER BY next_check_at ASC"
+if b.batchSize > 0 {
+    query += " LIMIT " + strconv.Itoa(b.batchSize)
+}
+```
+
+**防护效果**：
+- 即使有 10,000 个 feed 同时到期，每个调度周期也只取前 `BATCH_SIZE` 个进入队列
+- 剩余 feed 顺延到下个周期（`POLLING_FREQUENCY` 间隔后）
+- 相当于一个天然的**固定窗口限流**
+
+**局限性**：
+- 批次内的 feed 仍然在同一时刻被处理
+- 不能缓解批次内部的峰值
+
+#### 14.2.2 防线二：NextCheckAt 前置更新 + 排序
+
+**机制**：
+1. **刷新开始时就更新** (`internal/reader/handler/handler.go:220-221`)：
+```go
+originalFeed.CheckedNow()
+originalFeed.ScheduleNextCheck(weeklyEntryCount, time.Duration(0))
+```
+- 在发起 HTTP 请求前就将 `next_check_at` 推远到下次
+- 即使当前刷新还未完成，下一批次查询也不会重复选中此 feed
+- 避免了批次间的任务重复
+
+2. **按 next_check_at 升序排列** (`internal/storage/batch.go:134`)：
+```go
+query += " ORDER BY next_check_at ASC"
+```
+- 最紧急（过期最久）的 feed 优先被处理
+- 避免"饿死效应"——某些 feed 永远排不到
+
+#### 14.2.3 防线三：主机级并发限制
+
+**机制**：`POLLING_LIMIT_PER_HOST`（默认 5）限制同一批次中相同主机（域名）的 feed 数量。
+
+**代码位置** (`internal/storage/batch.go:107-120`)：
+```go
+hosts := make(map[string]int)
+for rows.Next() {
+    // ...
+    if b.limitPerHost > 0 {
+        feedHostname := urllib.Domain(job.FeedURL)
+        if hosts[feedHostname] >= b.limitPerHost {
+            nbSkippedFeeds++
+            continue
+        }
+        hosts[feedHostname]++
+    }
+    jobs = append(jobs, job)
+}
+```
+
+**防护效果**：
+- 假设 1,000 个 feed 都来自 `blogger.google.com`
+- 同一批次中只处理 5 个，其余 995 个被跳过（顺延到后续批次）
+- **保护了源站**：避免对单一域名发起瞬时上百次请求
+- **保护了内部 worker**：避免 worker 被同一主机的慢响应阻塞
+
+#### 14.2.4 防线四：Worker 池大小限制
+
+**机制**：`WORKER_POOL_SIZE` 限制同时执行 HTTP 请求的最大 goroutine 数。
+
+**代码位置** (`internal/worker/pool.go:35-43`)：
+```go
+for i := range nbWorkers {
+    workerPool.wg.Add(1)
+    worker := &worker{id: i, store: store}
+    go worker.Run(workerPool.queue, &workerPool.wg)
+}
+```
+
+**防护效果**：
+- 即使批次有 500 个任务，也只有 `WORKER_POOL_SIZE` 个在同时请求
+- 其余任务在 channel 队列中排队，等待空闲 worker
+- 本质上是**并发度的硬上限**
+
+#### 14.2.5 防线五：差异化调度间隔（Entry Frequency 策略）
+
+**机制**：`entry_frequency` 调度策略根据每个 feed 的更新频率动态计算间隔，使各 feed 的刷新时间**天然错开**。
+
+**代码位置** (`internal/model/feed.go:126-134`)：
+```go
+if config.Opts.PollingScheduler() == SchedulerEntryFrequency {
+    if weeklyCount <= 0 {
+        interval = config.Opts.SchedulerEntryFrequencyMaxInterval()
+    } else {
+        interval = (7 * 24 * time.Hour) / time.Duration(weeklyCount*config.Opts.SchedulerEntryFrequencyFactor())
+        interval = min(interval, config.Opts.SchedulerEntryFrequencyMaxInterval())
+        interval = max(interval, config.Opts.SchedulerEntryFrequencyMinInterval())
+    }
+}
+```
+
+**原理**：
+- 假设 A 类 feed 每周更新 168 次（每小时 1 次），B 类 feed 每周只更新 1 次
+- A 类间隔 ≈ (7×24h) / 168 = 1 小时
+- B 类间隔 = MaxInterval（可能是数小时甚至一天）
+- 不同 feed 的 next_check_at 自然分布在不同时间点，不会集中
+
+#### 14.2.6 防线六：HTTP 超时 + 响应体限制
+
+**机制**：防止单个 feed 长时间占用 worker。
+
+- **`HTTP_CLIENT_TIMEOUT`**（默认 20 秒）：单个请求的最大执行时间
+- **`HTTP_CLIENT_MAX_BODY_SIZE`**：限制响应体大小，防止大文件下载阻塞 worker
+
+**效果**：即使惊群发生，每个 worker 的占用时间有上界，队列会逐渐清空。
+
+### 14.3 缺少的防护机制与潜在风险
+
+#### 14.3.1 缺失：调度间隔的随机抖动（Jitter）
+
+**现状**：`ScheduleNextCheck` 完全是确定性的，没有任何随机化：
+```go
+// internal/model/feed.go:147
+f.NextCheckAt = time.Now().Add(interval)
+```
+
+**问题**：假设 1,000 个 feed 使用相同的 `min_interval=1h`，且在同一秒内创建或刷新：
+```
+T0:    所有 feed 的 next_check_at = T0 + 1h = T0+3600s（完全相同）
+T0+60m: 1,000 个 feed 同时到期 → 惊群
+T0+120m: 又是 1,000 个 feed 同时到期 → 周期性惊群
+```
+**因为所有 feed 的 interval 相同且起点相同，它们的 next_check_at 永远对齐。**
+
+**业界标准做法**：添加 ±5%~25% 的随机抖动：
+```go
+// 伪代码
+jitter := time.Duration(rand.Int63n(int64(interval / 4))) // ±12.5%
+if rand.Intn(2) == 0 {
+    interval = interval + jitter
+} else {
+    interval = interval - jitter
+}
+f.NextCheckAt = time.Now().Add(interval)
+```
+添加后，原本对齐的 1,000 个 feed 的 next_check_at 会均匀分散在 52.5 分钟 ~ 67.5 分钟的窗口内，峰值被削平。
+
+#### 14.3.2 缺失：Sliding Window 或 Token Bucket
+
+`BATCH_SIZE` + `POLLING_FREQUENCY` 本质上是**固定窗口限流**，存在"窗口边缘问题"：
+```
+T=0:   批次 A 取 500 个 feed
+T=0.5m: 全部处理完成，系统空闲
+T=1m:   批次 B 又取 500 个 feed → 在 T=1m 附近瞬时 1000 请求的"双批次重叠"
+```
+如果使用 Sliding Window，每分钟的请求数会被更精确地限制。
+
+#### 14.3.3 缺失：手动刷新的全局限流
+
+`ForceRefreshInterval` 是**单会话级**（per-user per-web-session）的，不是全局的：
+```go
+// internal/model/web_session.go
+if time.Since(sess.LastForceRefresh()) < config.Opts.ForceRefreshInterval() {
+    // 阻止此用户刷新
+}
+```
+如果 100 个用户同时点击"全部刷新"，即使每个用户都通过了会话级检查，**系统仍然会被 100×N 个任务淹没**。
+
+### 14.4 惊群效应防护总览
+
+| 防线 | 机制 | 作用域 | 缓解程度 | 代码位置 |
+|------|------|--------|---------|---------|
+| 1 | `BATCH_SIZE` | 批次级 | ⭐⭐⭐ | `internal/storage/batch.go` |
+| 2 | `NextCheckAt` 前置更新 + 排序 | 跨批次 | ⭐⭐ | `internal/reader/handler/handler.go:220` |
+| 3 | `POLLING_LIMIT_PER_HOST` | 主机级 | ⭐⭐⭐⭐ | `internal/storage/batch.go:107-120` |
+| 4 | `WORKER_POOL_SIZE` | 应用全局 | ⭐⭐⭐⭐ | `internal/worker/pool.go` |
+| 5 | `entry_frequency` 差异化间隔 | feed 级 | ⭐⭐⭐ | `internal/model/feed.go:126-134` |
+| 6 | 超时/响应体限制 | 请求级 | ⭐⭐ | `internal/reader/fetcher/request_builder.go` |
+| ❌ 缺失 | 调度间隔随机抖动 (Jitter) | feed 级 | - | N/A |
+| ❌ 缺失 | 手动刷新全局限流 | 应用全局 | - | N/A |
+| ❌ 缺失 | 分布式锁/单飞模式 (single-flight) | feed 级 | - | N/A |
+
+### 14.5 Single-Flight 模式建议（潜在改进）
+
+对于并发拉取同一 feed（第 11 章分析的竞态场景与惊群效应的交叉点），业界标准做法是 **single-flight 模式**：
+
+**实现思路**：
+```go
+// 伪代码：应用级 in-flight 跟踪
+type FeedRefreshCoordinator struct {
+    mu      sync.Mutex
+    inFlight map[int64]chan struct{} // feed_id → 正在执行的信号
+}
+
+func (c *FeedRefreshCoordinator) Do(feedID int64, refreshFn func()) {
+    c.mu.Lock()
+    if ch, ok := c.inFlight[feedID]; ok {
+        c.mu.Unlock()
+        <-ch // 已有刷新在执行，等待其完成
+        return
+    }
+    // 第一个请求，登记并执行
+    ch := make(chan struct{})
+    c.inFlight[feedID] = ch
+    c.mu.Unlock()
+
+    defer func() {
+        c.mu.Lock()
+        delete(c.inFlight, feedID)
+        close(ch) // 通知等待者
+        c.mu.Unlock()
+    }()
+
+    refreshFn() // 执行实际刷新
+}
+```
+
+**效果**：10 个 worker 同时触发同一 feed 的刷新，最终只有 1 个真正执行 HTTP 请求，其余 9 个等待其结果。
+
+## 十五、响应内容编码（gzip / br）切换对缓存命中的影响
+
+HTTP 协议支持通过 `Accept-Encoding` 协商内容编码（压缩方式），常见的有 `gzip` 和 `br` (Brotli)。编码切换可能影响缓存协商的有效性。
+
+### 15.1 Miniflux 的编码请求策略
+
+#### 15.1.1 Accept-Encoding 请求头设置
+
+**代码位置** (`internal/reader/fetcher/request_builder.go:257-262`)：
+```go
+req.Header = r.headers
+if r.disableCompression {
+    req.Header.Set("Accept-Encoding", "identity")
+} else {
+    req.Header.Set("Accept-Encoding", "br,gzip")
+}
+```
+
+**策略说明**：
+
+| 配置 | Accept-Encoding 头 | 说明 |
+|------|-------------------|------|
+| 默认（压缩启用） | `br,gzip` | 优先使用 Brotli (br)，回退到 gzip |
+| `WithoutCompression()` 调用后 | `identity` | 明确要求不压缩（原始字节） |
+
+**编码优先级**：`br` > `gzip` > `identity`。服务器会根据自身支持情况选择最优编码，并在 `Content-Encoding` 响应头中声明实际使用的编码。
+
+#### 15.1.2 Go http.Transport 的自动解压与 Miniflux 的选择
+
+**关键点**：Go 标准库的 `http.Transport` 有一个特性——当请求**没有手动设置 `Accept-Encoding`** 时，Transport 会：
+1. 自动添加 `Accept-Encoding: gzip`
+2. 对 `Content-Encoding: gzip` 的响应自动解压
+3. 自动从响应头中移除 `Content-Length`（因为解压后长度改变）
+
+但 Miniflux **手动设置了 `Accept-Encoding` 头**（`br,gzip` 或 `identity`），这触发了 Go 的**"用户接管编码处理"**语义：
+- Transport **不会**自动解压任何内容
+- `Content-Length` 和 `Content-Encoding` 头按原样保留
+- 解压责任完全交给 Miniflux 代码
+
+### 15.2 响应解码实现
+
+#### 15.2.1 按需解码器
+
+**代码位置** (`internal/reader/fetcher/response_handler.go:133-150`)：
+```go
+func (r *ResponseHandler) getReader(maxBodySize int64) io.ReadCloser {
+    contentEncoding := strings.ToLower(r.httpResponse.Header.Get("Content-Encoding"))
+    slog.Debug("Request response",
+        slog.String("content_encoding", contentEncoding),
+        // ...
+    )
+
+    reader := r.httpResponse.Body
+    switch contentEncoding {
+    case "br":
+        reader = NewBrotliReadCloser(reader)
+    case "gzip":
+        reader = NewGzipReadCloser(reader)
+    }
+    return http.MaxBytesReader(nil, reader, maxBodySize)
+}
+```
+
+**解码流程**：
+1. 读取 `Content-Encoding` 响应头（小写化）
+2. 根据值选择解码器：
+   - `br` → Brotli 解压流
+   - `gzip` → gzip 解压流
+   - 其他（包括空、`identity`、`deflate` 等）→ 不解压，原样读取
+3. 外层再包一层 `MaxBytesReader` 限制体积（防止压缩炸弹）
+
+> **注意**：只支持 `br` 和 `gzip` 两种。如果服务器返回 `Content-Encoding: deflate` 或 `zstd`，Miniflux 不会解压，解析器会收到压缩后的二进制数据并**报解析错误**。
+
+### 15.3 缓存协商与编码的交互
+
+**核心问题**：当服务器切换编码（例如第一次返回 gzip，第二次返回 br）时，ETag 和 Last-Modified 是否会变化？这直接影响缓存命中率。
+
+#### 15.3.1 理想情况：ETag 基于原始内容（不区分编码）
+
+**符合 RFC 9110 的正确实现**：
+- 服务器对**压缩前的原始内容**计算哈希生成 ETag
+- 不同编码（gzip / br / identity）共享同一个 ETag
+- `Last-Modified` 也是内容的修改时间，与编码无关
+
+**时间线示例**：
+```
+T0: 第一次请求
+   Accept-Encoding: br,gzip
+   ↓
+   响应: Content-Encoding: br, ETag: "abc123"
+   Miniflux 保存: EtagHeader = "abc123"
+
+T1: 第二次请求（编码协商保持 br,gzip 不变）
+   If-None-Match: "abc123"
+   Accept-Encoding: br,gzip
+   ↓
+   服务器比较 ETag → 匹配 → 304 Not Modified ✅
+   带宽节省成功
+```
+
+**编码切换但 ETag 不变的场景**（服务器调整了内部编码优先级）：
+```
+T0: Accept-Encoding: br,gzip
+   响应: Content-Encoding: gzip, ETag: "abc123"
+         （服务器暂时不支持 br，或负载均衡路由到了不同后端）
+   Miniflux 保存: EtagHeader = "abc123"
+
+T1: Accept-Encoding: br,gzip
+   响应: Content-Encoding: br, ETag: "abc123"
+         （这次路由到支持 br 的后端）
+   
+   IsModified() 比较:
+     r.ETag() = "abc123" == lastEtagValue = "abc123"
+     → 返回 false（内容未修改）
+   
+   Miniflux: 走 304 分支，不读取响应体，不处理条目 ✅
+   即使编码从 gzip 切到 br，业务逻辑正确！
+```
+
+> **结论**：只要服务器正确实现 ETag（基于原始内容），编码切换**完全不影响缓存命中**。这是 Miniflux 设计上的关键假设。
+
+#### 15.3.2 糟糕情况：ETag 基于压缩后的字节（区分编码）
+
+**某些服务器/CDN 的错误实现**：
+- 对压缩后的实际传输字节计算哈希
+- gzip、br、identity 各自有独立的 ETag 值
+- 相同内容不同编码 → 不同 ETag
+
+**时间线示例**：
+```
+T0: Accept-Encoding: br,gzip
+   服务器选 gzip
+   ETag: SHA256(gzip_bytes) = "gzip_v1_hash"
+   Miniflux 保存: EtagHeader = "gzip_v1_hash"
+
+T1: 服务器配置变更，优先 br
+   Accept-Encoding: br,gzip
+   If-None-Match: "gzip_v1_hash"
+   服务器选 br
+   ETag: SHA256(br_bytes) = "br_v1_hash"
+   
+   304 判定失败（ETag 不匹配）→ 返回 200
+   
+   IsModified() 比较:
+     r.ETag() = "br_v1_hash" != lastEtagValue = "gzip_v1_hash"
+     → 返回 true（认为内容修改）
+   
+   后果:
+     - Miniflux 解压响应体（br → 原始内容）
+     - parser.ParseFeed 解析（XML 内容实际上与 T0 相同）
+     - 所有条目比较后发现没有新内容
+     - 浪费了完整内容下载的带宽 ❌
+     - 但数据仍然一致（不会出错）
+```
+
+#### 15.3.3 Last-Modified 的编码无关性
+
+`Last-Modified` 头的语义是"资源的最后修改时间"，**天然与编码无关**。因此：
+
+- 切换编码不会改变 `Last-Modified` 的值
+- 在 ETag 不可用时（某些服务器仅提供 Last-Modified），编码切换不影响缓存协商
+
+**代码验证** (`internal/reader/fetcher/response_handler.go:48-54`)：
+```go
+func (r *ResponseHandler) LastModified() string {
+    if r.httpResponse.Header.Get("Expires") == "0" {
+        return ""
+    }
+    return r.httpResponse.Header.Get("Last-Modified")
+}
+```
+Last-Modified 的读取和比较完全不涉及 Content-Encoding。
+
+### 15.4 Vary: Accept-Encoding 的影响（再讨论）
+
+在第 13.3 节中，我们分析了 Miniflux **完全忽略 Vary 头**。对于内容编码的场景，这实际上可能导致缓存不命中。
+
+**正确但被忽略的语义**：
+```
+T0: 请求 1
+   Accept-Encoding: br,gzip
+   → 响应: Vary: Accept-Encoding, ETag: "abc123", Content-Encoding: br
+   → 缓存键应为: (URL, Accept-Encoding="br,gzip") → ETag="abc123"
+
+T1: 用户修改了 DisableHTTP2（某些服务器根据 HTTP/2 调整编码支持）
+   或 DisableHTTP2 引发行为变化（间接影响传输路径）
+   
+   新请求:
+   Accept-Encoding: br,gzip（实际上没变）
+   If-None-Match: "abc123"
+   → 304 ✅ （因为 Accept-Encoding 本身没变化）
+```
+
+**实际风险场景（极小概率）**：
+
+只有当 Miniflux 在两次请求之间**主动改变了 Accept-Encoding** 时，忽略 Vary 才会有问题。但实际上：
+- Miniflux 的 `Accept-Encoding` 在 feed 生命周期内是**固定的**（始终是 `br,gzip` 或 `identity`）
+- `disableCompression` 选项在创建 feed 时确定，运行时不改变
+- 用户无法通过 UI 修改压缩偏好
+
+**因此，Vary: Accept-Encoding 的缺失在实际部署中几乎不会造成影响。**
+
+### 15.5 压缩编码的完整链路总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                       请求构建 (RequestBuilder)                     │
+│                                                                     │
+│  disableCompression = false → Accept-Encoding: "br,gzip"           │
+│  disableCompression = true  → Accept-Encoding: "identity"          │
+│  （注意：手动设置后 Go Transport 不自动解压）                        │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       网络传输（可能经过 CDN/代理）                 │
+│                                                                     │
+│  CDN/源站根据 Accept-Encoding 选择编码:                             │
+│  - 支持 br → Content-Encoding: br + Brotli 压缩字节                │
+│  - 只支持 gzip → Content-Encoding: gzip + gzip 压缩字节            │
+│  - 返回 ETag / Last-Modified / Vary: Accept-Encoding               │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       缓存协商判断 (IsModified)                    │
+│                                                                     │
+│  1. 状态码 == 304 → 未修改（跳过编码处理）                          │
+│  2. 否则，比较 ETag:                                                │
+│     ├─ 理想服务器 → ETag 不区分编码 → 切换编码也命中 304 ✅         │
+│     └─ 糟糕服务器 → ETag 基于压缩字节 → 切换编码可能失配 ❌ → 200   │
+│  3. 无 ETag 时比较 Last-Modified → 天然不区分编码 ✅                │
+└──────────────────────────────┬──────────────────────────────────────┘
+                               │
+             ┌─────────────────┴─────────────────┐
+             ▼                                   ▼
+   内容未修改（304 / ETag 相同）          内容已修改（需要处理）
+   - 不读取响应体                        - ReadBody → getReader 解码:
+   - 不处理条目                            Content-Encoding: br → Brotli 解压器
+   - 仅更新 NextCheckAt / 清零错误计数     Content-Encoding: gzip → gzip 解压器
+   - ✅ 带宽最省                           其他 → 原样读取
+                                           - parser.ParseFeed 解析 XML/JSON
+                                           - 比较条目哈希，只处理更新
+                                           - ⚠️ 可能浪费带宽（编码切换误判）
+```
+
+### 15.6 编码切换对缓存命中的影响矩阵
+
+| 场景 | ETag 策略 | Accept-Encoding 是否变化 | Last-Modified 是否可用 | 缓存命中结果 | 业务正确性 |
+|------|----------|------------------------|---------------------|------------|----------|
+| 编码保持不变 | 任何策略 | 否 | 任何 | ✅ 命中 304 | ✅ 正确 |
+| gzip ↔ br 切换 | 基于原始内容（RFC 合规） | 否（始终 br,gzip） | 任何 | ✅ ETag 相同 → 未修改 | ✅ 正确 |
+| gzip ↔ br 切换 | 基于压缩字节（错误实现） | 否 | 是 | ⚠️ ETag 失配，但 Last-Modified 兜底 | ✅ 正确 |
+| gzip ↔ br 切换 | 基于压缩字节（错误实现） | 否 | 否 | ❌ 误判为修改，下载完整内容 | ✅ 数据一致，浪费带宽 |
+| 启用 → 禁用压缩（`WithoutCompression`） | 任何策略 | 是（`br,gzip` → `identity`） | 任何 | ❌ Vary 被忽略，但实际上 Feed 级选项不变化 | N/A（不发生） |
+| 禁用 → 启用压缩 | 任何策略 | 是（`identity` → `br,gzip`） | 任何 | ❌ 同上 | N/A（不发生） |
+
+### 15.7 潜在改进点
+
+#### 15.7.1 添加编码感知的缓存键（如果需要支持 Vary）
+
+```go
+// 伪代码：扩展 feed 表或缓存结构
+type FeedCacheKey struct {
+    FeedID         int64
+    AcceptEncoding string // 记录协商时的 Accept-Encoding 值
+    ETag           string
+    LastModified   string
+}
+```
+
+#### 15.7.2 检测误判并记录指标
+
+在解析完内容后，比较条目数量和哈希值与上次是否相同，如果完全相同但 ETag 不同，记录一条警告，提示用户该 feed 的服务器可能存在编码相关的 ETag 问题。
+
+---
+
+## 十六、相关文件清单
 
 | 文件路径 | 作用 |
 |----------|------|
-| `internal/model/feed.go` | Feed 数据模型，包含缓存字段、调度逻辑和错误计数 |
+| `internal/model/feed.go` | Feed 数据模型，包含缓存字段、ScheduleNextCheck 调度逻辑和错误计数 |
 | `internal/model/job.go` | Job 数据模型，用于刷新任务队列 |
-| `internal/model/web_session.go` | Web 会话管理，包含强制刷新防刷机制 |
-| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，设置缓存协商头，三级代理配置 |
-| `internal/reader/fetcher/response_handler.go` | HTTP 响应处理，解析缓存头、错误分类、Cloudflare 挑战检测 |
-| `internal/reader/fetcher/response_handler_test.go` | 响应处理测试，包含 Cloudflare 挑战和 IsModified 测试用例 |
-| `internal/reader/handler/handler.go` | Feed 刷新业务逻辑，429 限流处理、错误持久化出口 |
+| `internal/model/web_session.go` | Web 会话管理，包含 ForceRefreshInterval 防刷机制 |
+| `internal/reader/fetcher/request_builder.go` | HTTP 请求构建，Accept-Encoding 设置（br,gzip），三级代理配置，Transport 配置 |
+| `internal/reader/fetcher/response_handler.go` | HTTP 响应处理，gzip/br 解码器、ETag/Last-Modified 解析、错误分类、Cloudflare 挑战检测 |
+| `internal/reader/fetcher/response_handler_test.go` | 响应处理测试，包含 Cloudflare 挑战、IsModified 测试用例 |
+| `internal/reader/fetcher/readclosers.go` | 自定义 Brotli/Gzip ReadCloser 解码器实现 |
+| `internal/reader/handler/handler.go` | Feed 刷新业务逻辑，NextCheckAt 前置更新、429 限流处理、错误持久化出口 |
 | `internal/reader/rss/rss.go` | RSS XML 结构定义，包含 TTL 字段 |
 | `internal/reader/rss/adapter.go` | RSS 适配器，TTL 字段解析转换 |
 | `internal/reader/processor/processor.go` | Feed 条目处理逻辑 |
 | `internal/storage/feed.go` | Feed 数据持久化，UpdateFeedError 只更新错误相关字段 |
-| `internal/storage/batch.go` | 批次构建，WithErrorLimit 错误过滤、WithLimitPerHost 主机限流 |
+| `internal/storage/batch.go` | 批次构建，BATCH_SIZE 限制、WithErrorLimit 错误过滤、WithLimitPerHost 主机限流 |
 | `internal/storage/entry.go` | 条目数据操作，包含 FOR UPDATE SKIP LOCKED 行锁示例 |
 | `internal/storage/nav_metadata.go` | 导航元数据，错误 feed 计数统计 |
 | `internal/database/migrations.go` | 数据库表结构定义 |
-| `internal/cli/refresh_feeds.go` | CLI 批量刷新调度入口 |
-| `internal/cli/scheduler.go` | 后台调度器，传递 POLLING_PARSING_ERROR_LIMIT 配置 |
-| `internal/worker/pool.go` | Worker 池管理，channel 任务队列 |
+| `internal/cli/refresh_feeds.go` | CLI 批量刷新调度入口，Worker Pool 推送任务 |
+| `internal/cli/scheduler.go` | 后台调度器，time.Tick 固定间隔触发，传递 BATCH_SIZE/LIMIT_PER_HOST 等配置 |
+| `internal/worker/pool.go` | Worker 池管理，WORKER_POOL_SIZE 并发上限、channel 任务队列 |
 | `internal/worker/worker.go` | Worker 执行逻辑，调用 RefreshFeed |
 | `internal/ui/feed_refresh.go` | Web UI 刷新接口（单个/全部），ForceRefreshInterval 防刷 |
 | `internal/ui/category_refresh.go` | Web UI 分类刷新接口 |
 | `internal/api/feed_handlers.go` | API 刷新接口 |
 | `internal/proxyrotator/proxyrotator.go` | 代理轮换池实现，HTTP_CLIENT_PROXIES 处理 |
-| `internal/config/options.go` | 配置选项，POLLING_PARSING_ERROR_LIMIT、三级代理等配置定义 |
+| `internal/config/options.go` | 配置选项，BATCH_SIZE/WORKER_POOL_SIZE/POLLING_PARSING_ERROR_LIMIT/HTTP_CLIENT_TIMEOUT 等配置定义 |
 | `internal/config/options_parsing_test.go` | 配置解析测试，包含 PARSING_ERROR_LIMIT 测试用例 |
 | `internal/http/server/middleware.go` | HTTP 服务器中间件，X-Forwarded-Proto 处理 |
 | `internal/http/response/builder.go` | HTTP 响应构建，Miniflux 作为服务端的 Vary: Accept-Encoding 设置 |
